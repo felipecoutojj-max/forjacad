@@ -1,0 +1,24 @@
+// Ícones em SVG inline (traço simples, herdam a cor do botão).
+const w = (body: string) => `<svg viewBox="0 0 24 24">${body}</svg>`;
+export const icons = {
+  select: w('<path d="M5 3l14 8-6 2-3 6z"/>'),
+  draw: w('<path d="M4 20c3-8 6-10 9-9s2 5 7-4"/>'),
+  line: w('<path d="M4 20L20 4"/><circle cx="4" cy="20" r="1.5"/><circle cx="20" cy="4" r="1.5"/>'),
+  rect: w('<rect x="4" y="6" width="16" height="12" rx="1"/>'),
+  circle: w('<circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="0.8"/>'),
+  dimension: w('<path d="M4 16h16M4 12v8M20 12v8M8 16l-3 0M16 16l3 0"/><path d="M9 7h6" stroke-dasharray="1 2"/>'),
+  erase: w('<path d="M4 15l8-8 8 8-4 4H8z"/><path d="M8 19h12"/>'),
+  undo: w('<path d="M8 7H4v4"/><path d="M4 11a8 8 0 1 1 3 6"/>'),
+  redo: w('<path d="M16 7h4v4"/><path d="M20 11a8 8 0 1 0-3 6"/>'),
+  done: w('<path d="M5 12l5 5L20 7"/>'),
+  extrude: w('<path d="M4 16l8 4 8-4V8l-8-4-8 4z"/><path d="M4 8l8 4 8-4M12 12v8"/>'),
+  sketch: w('<path d="M3 17l6-12 6 12 6-12"/>'),
+  fit: w('<path d="M4 9V4h5M15 4h5v5M20 15v5h-5M9 20H4v-5"/>'),
+  touch: w('<path d="M9 11V5a2 2 0 1 1 4 0v6"/><path d="M13 10a2 2 0 1 1 4 0v4a6 6 0 0 1-6 6h-1a6 6 0 0 1-5-3l-2-4a1.5 1.5 0 0 1 2.6-1.5L9 14"/>'),
+  menu: w('<path d="M4 7h16M4 12h16M4 17h16"/>'),
+  view: w('<path d="M12 5c5 0 9 7 9 7s-4 7-9 7-9-7-9-7 4-7 9-7z"/><circle cx="12" cy="12" r="3"/>'),
+  trash: w('<path d="M5 7h14M9 7V4h6v3M7 7l1 13h8l1-13"/>'),
+  plus: w('<path d="M12 5v14M5 12h14"/>'),
+  construction: w('<path d="M4 20L20 4" stroke-dasharray="3 3"/>'),
+};
+export type IconName = keyof typeof icons;
