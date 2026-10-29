@@ -20,8 +20,8 @@ canvas { display: block; touch-action: none; user-select: none; -webkit-user-sel
 
 /* Área de trabalho */
 .workspace { position: relative; overflow: hidden; }
-.workspace canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
-.overlay { position: absolute; inset: 0; pointer-events: none; }
+.workspace canvas { position: absolute; inset: 0; width: 100%; height: 100%; z-index: 1; }
+.overlay { position: absolute; inset: 0; pointer-events: none; z-index: 2; }
 .dim-label { position: absolute; transform: translate(-50%, -50%); background: var(--panel); color: var(--fg); border: 1px solid var(--border); border-radius: 6px; padding: 2px 6px; font-size: 12px; font-variant-numeric: tabular-nums; pointer-events: auto; cursor: pointer; white-space: nowrap; }
 .dim-label.selected { border-color: var(--sel); color: var(--sel); }
 .dim-label.driven { color: var(--accent-2); }

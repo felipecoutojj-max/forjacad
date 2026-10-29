@@ -89,6 +89,10 @@ export class Viewport {
 
   setBodies(meshes: BodyMesh[], selected: string | null): void {
     this.bodies.clear();
+    // A grade vira piso: fica logo abaixo do ponto mais baixo dos corpos.
+    let minY = 0;
+    for (const b of meshes) { b.geometry.computeBoundingBox(); const bb = b.geometry.boundingBox; if (bb) minY = Math.min(minY, bb.min.y); }
+    if (this.grid) this.grid.position.y = minY - 0.5;
     for (const b of meshes) {
       const mesh = new THREE.Mesh(b.geometry, b.feature.id === selected ? this.bodySelMaterial : this.bodyMaterial);
       mesh.userData.featureId = b.feature.id;

@@ -208,7 +208,7 @@ export class App {
         p.append(h3(`Restrições (${s.constraints.length})`));
         const list = el('div', 'list');
         for (const k of s.constraints) {
-          const it = el('div', 'item'); it.innerHTML = `<span class="name">${constraintName(k.kind)}</span><span class="mini">×</span>`;
+          const it = listItem(constraintName(k.kind), '×');
           it.addEventListener('click', () => { this.pushUndo(); M.removeConstraint(s, k.id); this.solve(); this.refreshAll(); });
           list.append(it);
         }
@@ -219,8 +219,8 @@ export class App {
       const list = el('div', 'list');
       if (!doc.sketches.length) { const d = el('div', 'hint'); d.textContent = 'Nenhum esboço ainda. Toque em "Esboço" e escolha um plano, ou toque direto num plano.'; list.append(d); }
       for (const s of doc.sketches) {
-        const it = el('div', 'item'); const pl = getPlane(doc, s.plane);
-        it.innerHTML = `<span class="name">${s.name}</span><span class="mini">${pl.name}</span>`;
+        const pl = getPlane(doc, s.plane);
+        const it = listItem(s.name, pl.name);
         it.addEventListener('click', () => this.enterSketch(s.id));
         list.append(it);
       }
@@ -229,8 +229,8 @@ export class App {
       const flist = el('div', 'list');
       if (!doc.features.length) { const d = el('div', 'hint'); d.textContent = 'Extrude um esboço fechado para criar o primeiro corpo.'; flist.append(d); }
       for (const f of doc.features) {
-        const it = el('div', `item ${this.selectedFeature === f.id ? 'active' : ''}`);
-        it.innerHTML = `<span class="name">${f.name}</span><span class="mini">${fmtDim('distance', f.depth)} mm</span>`;
+        const it = listItem(f.name, `${fmtDim('distance', f.depth)} mm`);
+        if (this.selectedFeature === f.id) it.classList.add('active');
         it.addEventListener('click', () => { this.selectedFeature = this.selectedFeature === f.id ? null : f.id; this.refreshAll(); });
         flist.append(it);
       }
@@ -772,7 +772,7 @@ export class App {
   }
   private confirm(title: string, text: string, onYes: () => void): void {
     const back = el('div', 'dialog-backdrop'); const d = el('div', 'dialog');
-    d.innerHTML = `<h2>${title}</h2><div>${text}</div>`;
+    const hh = document.createElement('h2'); hh.textContent = title; const tx = el('div'); tx.textContent = text; d.append(hh, tx);
     const acts = el('div', 'actions'); acts.append(this.button('Cancelar', () => back.remove()), this.button('Confirmar', () => { back.remove(); onYes(); }, 'btn primary')); d.append(acts);
     back.append(d); this.overlay.append(back);
   }
@@ -803,6 +803,9 @@ export class App {
 
 function el(tag: string, cls = ''): HTMLElement { const e = document.createElement(tag); if (cls) e.className = cls; return e; }
 function h3(text: string): HTMLElement { const h = document.createElement('h3'); h.textContent = text; return h; }
+function listItem(name: string, mini: string): HTMLElement {
+  const it = el('div', 'item'); const n = el('span', 'name'); n.textContent = name; const m = el('span', 'mini'); m.textContent = mini; it.append(n, m); return it;
+}
 function constraintName(k: ConstraintKind): string {
   return ({ horizontal: 'Horizontal', vertical: 'Vertical', parallel: 'Paralelas', perpendicular: 'Perpendiculares', equal: 'Iguais', tangent: 'Tangentes', concentric: 'Concêntricos', pointOnLine: 'Ponto na linha', pointOnCircle: 'Ponto no círculo', midpoint: 'Ponto médio', fixed: 'Fixo' } as Record<ConstraintKind, string>)[k];
 }

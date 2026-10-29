@@ -47,7 +47,13 @@ export function deserialize(text: string): ForjaDocument {
   const d = JSON.parse(text);
   if (d?.format !== 'forja') throw new Error('Arquivo não é um documento ForjaCAD.');
   if (typeof d.version !== 'number' || d.version > FORJA_VERSION) throw new Error(`Versão de arquivo ${d.version} não suportada por este ForjaCAD.`);
-  const doc: ForjaDocument = { ...createDocument(d.name ?? 'Peça'), ...d };
+  const str = (v: unknown, fallback: string) => (typeof v === 'string' ? v.slice(0, 200) : fallback);
+  const num = (v: unknown, fallback: number) => (typeof v === 'number' && Number.isFinite(v) ? v : fallback);
+  const doc: ForjaDocument = { ...createDocument(str(d.name, 'Peça')), ...d, name: str(d.name, 'Peça') };
+  if (!Array.isArray(doc.planes)) doc.planes = []; if (!Array.isArray(doc.sketches)) doc.sketches = []; if (!Array.isArray(doc.features)) doc.features = [];
+  doc.planes = doc.planes.filter((p) => p && Array.isArray(p.origin) && Array.isArray(p.u) && Array.isArray(p.v)).map((p) => ({ ...p, name: str(p.name, 'Plano') }));
+  doc.sketches = doc.sketches.filter((s) => s && typeof s.id === 'string').map((s) => ({ ...s, name: str(s.name, 'Esboço'), points: Array.isArray(s.points) ? s.points : [], entities: Array.isArray(s.entities) ? s.entities : [], constraints: Array.isArray(s.constraints) ? s.constraints : [], dimensions: Array.isArray(s.dimensions) ? s.dimensions : [] }));
+  doc.features = doc.features.filter((f) => f && f.type === 'extrude' && typeof f.sketch === 'string').map((f) => ({ ...f, name: str(f.name, 'Extrusão'), depth: num(f.depth, 10) || 10 }));
   // Planos base sempre existem, mesmo que o arquivo venha sem eles.
   for (const bp of BASE_PLANES) if (!doc.planes.some((p) => p.id === bp.id)) doc.planes.push({ ...bp });
   return doc;

@@ -136,9 +136,13 @@ function constraintAnchor(s: Sketch, refs: Id[], kind: string): Vec2 | null {
   const r0 = refs[0];
   const e = findEntity(s, r0); const p = findPoint(s, r0);
   if (kind === 'pointOnLine' || kind === 'pointOnCircle' || kind === 'midpoint' || kind === 'fixed') { if (p) return v2(p.x, p.y); }
+  const midOf = (ent: Entity): Vec2 => {
+    if (ent.type === 'line') { const a = getPoint(s, ent.a), b = getPoint(s, ent.b); return v2((a.x + b.x) / 2, (a.y + b.y) / 2); }
+    const pts = SketchRenderer.sample(s, ent, 16); return pts[Math.floor(pts.length / 2)];
+  };
   if (e) {
-    const pts = SketchRenderer.sample(s, e, 16); const m = pts[Math.floor(pts.length / 2)];
-    if (refs.length > 1) { const e2 = findEntity(s, refs[1]); if (e2) { const pts2 = SketchRenderer.sample(s, e2, 16); const m2 = pts2[Math.floor(pts2.length / 2)]; if (kind === 'concentric' || kind === 'tangent') return v2((m.x + m2.x) / 2, (m.y + m2.y) / 2); } }
+    const m = midOf(e);
+    if (refs.length > 1) { const e2 = findEntity(s, refs[1]); if (e2 && (kind === 'concentric' || kind === 'tangent')) { const m2 = midOf(e2); return v2((m.x + m2.x) / 2, (m.y + m2.y) / 2); } }
     return m;
   }
   if (p) return v2(p.x, p.y);
