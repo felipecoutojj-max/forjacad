@@ -7,13 +7,13 @@ import { icons, type IconName } from './icons';
 import {
   createDocument, serialize, deserialize, getPlane, getSketch, addExtrude, addRevolve, addFillet, addBoolean, addFacePlane, pruneFacePlanes, addPushPull,
   bodyIds, bodyName, featuresOfBody, planeNormal,
-  type ForjaDocument, type Plane, type Feature, type ExtrudeFeature, type ExtrudeOp, type V3, type SketchAxis,
+  type ForjaDocument, type Plane, type Feature, type ExtrudeFeature, type RevolveFeature, type ExtrudeOp, type V3, type SketchAxis,
 } from '../core/document';
 import * as M from '../core/sketch/model';
 import type { Sketch, Entity, Id, ConstraintKind, DimensionKind } from '../core/sketch/model';
 import { solveSketch, type SolveResult, type SolveOptions } from '../core/sketch/solver';
 import { recognizeStroke, type Primitive } from '../core/sketch/recognizer';
-import { buildAllBodies, buildExtrude, extractProfiles, profileInnerPoint, profileToShape, planeMatrix } from '../core/kernel/preview';
+import { buildAllBodies, buildExtrude, extractProfiles, profileInnerPoint, profileContainsPoint, profileToShape, planeMatrix } from '../core/kernel/preview';
 import { KernelClient, SupersededError } from '../core/kernel/occ/client';
 import type { BodyData, FeatureError, RebuildResult } from '../core/kernel/occ/types';
 import { toSTL, toOBJ, fromBody, fromGeometry, type MeshData } from '../core/export/mesh';
@@ -215,7 +215,13 @@ export class App {
     for (const s of doc.sketches) {
       let plane: Plane; try { plane = getPlane(doc, s.plane); } catch { continue; }
       const m = planeMatrix(plane).multiply(new THREE.Matrix4().makeTranslation(0, 0, 0.05));
-      extractProfiles(s).forEach((prof, i) => { try { const g = new THREE.ShapeGeometry(profileToShape(s, prof), 24); g.applyMatrix4(m); out.push({ sketch: s.id, index: i, geometry: g }); } catch { /* perfil ruim: ignora */ } });
+      // Regiões já viradas em extrusão ou revolução somem: a face do corpo passa a responder à caneta.
+      const users = doc.features.filter((f): f is ExtrudeFeature | RevolveFeature => (f.type === 'extrude' || f.type === 'revolve') && f.sketch === s.id);
+      extractProfiles(s).forEach((prof, i) => {
+        const consumed = users.some((f) => f.type === 'revolve' || !f.profilePoint || profileContainsPoint(s, prof, { x: f.profilePoint[0], y: f.profilePoint[1] }));
+        if (consumed) return;
+        try { const g = new THREE.ShapeGeometry(profileToShape(s, prof), 24); g.applyMatrix4(m); out.push({ sketch: s.id, index: i, geometry: g }); } catch { /* perfil ruim: ignora */ }
+      });
     }
     return out;
   }
@@ -242,7 +248,7 @@ export class App {
       const r = await this.kernel.rebuild(doc);
       this.bodies = r.bodies; this.featureErrors = r.errors;
       this.pruneSel3d();
-      this.vp.setBodies(this.bodies.map(toRenderBody), this.sel3d);
+      this.vp.setBodies(this.bodies.map(toRenderBody), this.sel3d); this.updateFaceHandle();
       this.renderSidePanel(); this.renderToolbar();
       return r;
     } catch (e) {
@@ -362,7 +368,7 @@ export class App {
     const frame = fd ? frameFromFace(fd) : null; const planar = fd?.type === 'plane';
     if (this.jointFlow) {
       if (!frame) return this.toast('Use uma face plana ou cilíndrica para a junta.', 'err');
-      if (!this.jointFlow.moving) { this.jointFlow.moving = { inst, frame, planar }; this.sel3d = { body: renderId, face: { body: renderId, index: faceIndex }, edges: [] }; this.vp.setSelection(this.sel3d); this.toast('Agora toque na face da peça base.'); this.renderStatus(); return; }
+      if (!this.jointFlow.moving) { this.jointFlow.moving = { inst, frame, planar }; this.sel3d = { body: renderId, face: { body: renderId, index: faceIndex }, edges: [] }; this.vp.setSelection(this.sel3d); this.updateFaceHandle(); this.toast('Agora toque na face da peça base.'); this.renderStatus(); return; }
       if (this.jointFlow.moving.inst === inst) return this.toast('Escolha uma face de outra peça.', 'err');
       const { type, moving } = this.jointFlow;
       try {
@@ -376,7 +382,7 @@ export class App {
     const same = this.selectedInstance === inst && this.sel3d.face?.body === renderId && this.sel3d.face.index === faceIndex;
     this.selectedInstance = inst;
     this.sel3d = same ? { body: renderId, face: null, edges: [] } : { body: renderId, face: { body: renderId, index: faceIndex }, edges: [] };
-    this.vp.setSelection(this.sel3d); this.renderSidePanel(); this.renderToolbar();
+    this.vp.setSelection(this.sel3d); this.updateFaceHandle(); this.renderSidePanel(); this.renderToolbar();
     if (!same && frame && asm.instances.length > 1) {
       const items = (['fixed', 'revolute', 'slider', 'cylindrical'] as JointType[]).map((t) => ({ label: `${JOINT_NAMES[t]} a partir desta face`, action: () => this.startJoint(t, { inst, frame, planar }) }));
       this.menu(x + 10, y + 10, items);
@@ -442,7 +448,7 @@ export class App {
     for (const i of asm.instances) {
       const j = jointOf(asm, i.id);
       const it = listItem(i.name, j ? JOINT_NAMES[j.type] : 'livre'); if (this.selectedInstance === i.id) it.classList.add('active');
-      it.addEventListener('click', () => { this.selectedInstance = this.selectedInstance === i.id ? null : i.id; this.sel3d = emptySel3D(); const c = this.asmCache.get(i.part); if (this.selectedInstance && c?.bodies[0]) this.sel3d.body = `${i.id}/${c.bodies[0].id}`; this.vp.setSelection(this.sel3d); this.renderSidePanel(); this.renderToolbar(); });
+      it.addEventListener('click', () => { this.selectedInstance = this.selectedInstance === i.id ? null : i.id; this.sel3d = emptySel3D(); const c = this.asmCache.get(i.part); if (this.selectedInstance && c?.bodies[0]) this.sel3d.body = `${i.id}/${c.bodies[0].id}`; this.vp.setSelection(this.sel3d); this.updateFaceHandle(); this.renderSidePanel(); this.renderToolbar(); });
       ilist.append(it);
     }
     p.append(ilist);
@@ -598,7 +604,7 @@ export class App {
     // ----- Modo vista -----
     this.renderSelectionPanel(p);
     if (!this.sel3d.body && !this.sel3d.face && !this.sel3d.edges.length && this.bodies.length) {
-      const d = el('div', 'hint'); d.textContent = 'Caneta: risque numa face para esboçar nela. Arraste uma região sombreada do esboço para extrudar (para fora adiciona, para dentro corta). Toque numa face e arraste para puxar ou empurrar. Arraste uma aresta para filete ou chanfro.'; p.append(d);
+      const d = el('div', 'hint'); d.textContent = 'Caneta: risque numa face para esboçar nela. Arraste uma região sombreada do esboço para extrudar (para fora adiciona, para dentro corta). Toque numa face e arraste a seta laranja para puxar ou empurrar. Arraste uma aresta para filete ou chanfro.'; p.append(d);
     }
 
     p.append(h3('Esboços'));
@@ -620,7 +626,7 @@ export class App {
       const it = listItem(`${err ? '⚠ ' : ''}${f.name}`, featureMini(f));
       if (err) it.title = err.message;
       if (this.selectedFeature === f.id) it.classList.add('active');
-      it.addEventListener('click', () => { this.selectedFeature = this.selectedFeature === f.id ? null : f.id; this.sel3d = emptySel3D(); if (this.selectedFeature) this.sel3d.body = bodyOfFeature(f); this.vp.setSelection(this.sel3d); this.renderSidePanel(); this.renderToolbar(); });
+      it.addEventListener('click', () => { this.selectedFeature = this.selectedFeature === f.id ? null : f.id; this.sel3d = emptySel3D(); if (this.selectedFeature) this.sel3d.body = bodyOfFeature(f); this.vp.setSelection(this.sel3d); this.updateFaceHandle(); this.renderSidePanel(); this.renderToolbar(); });
       flist.append(it);
     }
     p.append(flist);
@@ -740,7 +746,12 @@ export class App {
   private deleteBody(body: Id): void {
     const f = this.doc.current.features.find((x) => x.id === body); if (f) this.deleteFeature(f);
   }
-  private clearSel3d(): void { this.sel3d = emptySel3D(); this.vp.setSelection(this.sel3d); this.renderSidePanel(); this.renderToolbar(); }
+  private clearSel3d(): void { this.sel3d = emptySel3D(); this.vp.setSelection(this.sel3d); this.updateFaceHandle(); this.renderSidePanel(); this.renderToolbar(); }
+  /** Seta de puxar acompanha a face plana selecionada (modo peça). */
+  private updateFaceHandle(): void {
+    const f = this.sel3d.face; const fd = f && !this.isAssembly ? this.bodyOf(f.body)?.faces[f.index] : undefined;
+    if (fd?.type === 'plane' && fd.normal && this.mode === 'view') this.vp.setFaceHandle(new THREE.Vector3(...fd.center), new THREE.Vector3(...fd.normal)); else this.vp.setFaceHandle(null);
+  }
 
   // ---------- Rótulos (HTML sobre a cena) ----------
   private placeLabels(): void {
@@ -787,7 +798,7 @@ export class App {
   enterSketch(id: Id, perspective?: boolean): void {
     this.activeSketch = id; this.mode = 'sketch'; this.tool = 'draw'; this.sel = emptySelection(); this.pendingDimRefs = []; this.selectedFeature = null; this.sel3d = emptySel3D();
     const p = this.plane!; const persp = perspective ?? (p.kind === 'face' && this.vp.mode === 'view');
-    this.vp.enterSketch(p, persp); this.vp.setSelection(this.sel3d);
+    this.vp.enterSketch(p, persp); this.vp.setSelection(this.sel3d); this.updateFaceHandle();
     this.solve(); this.refreshAll(false); if (!persp) this.vp.fitAll();
   }
   exitSketch(removeEmpty: boolean): void {
@@ -988,6 +999,11 @@ export class App {
   /** Caneta (ou botão esquerdo) tocou a cena: decide o que vai ser arrastado. */
   private viewDown(info: PointerInfo): void {
     const doc = this.doc.current; const { x, y } = info;
+    // Seta da face selecionada: arrastar puxa ou empurra a face.
+    if (this.sel3d.face && this.vp.handleDistancePx(x, y) < (info.type === 'touch' ? 26 : 18)) {
+      const fd = this.bodyOf(this.sel3d.face.body)?.faces[this.sel3d.face.index];
+      if (fd?.type === 'plane' && fd.normal) { this.drag = { kind: 'pull', body: this.sel3d.face.body, index: this.sel3d.face.index, fd, origin: new THREE.Vector3(...fd.center), normal: new THREE.Vector3(...fd.normal), dist: 0 }; return; }
+    }
     const faceHit = this.vp.pickFace(x, y);
     let regionHit = this.vp.pickRegion(x, y); if (regionHit && faceHit && regionHit.distance > faceHit.distance + 0.5) regionHit = null;
     const tol = info.type === 'touch' ? 18 : info.type === 'pen' ? 12 : 9;
@@ -1001,13 +1017,7 @@ export class App {
     if (edgeHit) { this.drag = { kind: 'edge', body: edgeHit.body, index: edgeHit.index, created: null, radius: 0 }; return; }
     if (faceHit && faceHit.index >= 0) {
       const fd = this.bodyOf(faceHit.body)?.faces[faceHit.index];
-      if (fd?.type === 'plane' && fd.normal) {
-        const selected = !!this.sel3d.face && this.sel3d.face.body === faceHit.body && this.sel3d.face.index === faceHit.index;
-        this.drag = selected
-          ? { kind: 'pull', body: faceHit.body, index: faceHit.index, fd, origin: new THREE.Vector3(...fd.center), normal: new THREE.Vector3(...fd.normal), dist: 0 }
-          : { kind: 'draw', body: faceHit.body, index: faceHit.index, started: false };
-        return;
-      }
+      if (fd?.type === 'plane' && fd.normal) { this.drag = { kind: 'draw', body: faceHit.body, index: faceHit.index, started: false }; return; }
     }
     info.role = 'nav';
   }
@@ -1059,14 +1069,14 @@ export class App {
       const faceBody = d.plane.kind === 'face' && d.plane.body && bodyIds(doc).includes(d.plane.body) ? d.plane.body : null;
       const op: ExtrudeOp = faceBody ? (t > 0 ? 'add' : 'cut') : 'new';
       void this.tryFeature(() => addExtrude(doc, d.sketch, Math.abs(t), { op, target: faceBody ?? undefined, flip: t < 0, profilePoint: d.profilePoint }), (f) => {
-        this.selectedFeature = f.id; this.sel3d = emptySel3D(); this.sel3d.body = bodyOfFeature(f); this.vp.setSelection(this.sel3d); this.renderSidePanel();
+        this.selectedFeature = f.id; this.sel3d = emptySel3D(); this.sel3d.body = bodyOfFeature(f); this.vp.setSelection(this.sel3d); this.updateFaceHandle(); this.renderSidePanel();
         this.showChip(info.x, info.y, `${fmtDim('distance', Math.abs(t))} mm ✎`, () => this.valuePopover(info.x, info.y, Math.abs(t), 'mm', (v) => { void this.tryFeature(() => { (f as ExtrudeFeature).depth = v; return f; }); }));
       });
     } else if (d.kind === 'pull') {
       const t = d.dist; if (Math.abs(t) < 0.3) return;
       const ref = { center: d.fd.center, normal: d.fd.normal!, area: d.fd.area };
       void this.tryFeature(() => addPushPull(doc, d.body, ref, t), (f) => {
-        this.selectedFeature = f.id; this.sel3d = emptySel3D(); this.sel3d.body = d.body; this.vp.setSelection(this.sel3d); this.renderSidePanel();
+        this.selectedFeature = f.id; this.sel3d = emptySel3D(); this.sel3d.body = d.body; this.vp.setSelection(this.sel3d); this.updateFaceHandle(); this.renderSidePanel();
         this.showChip(info.x, info.y, `${t >= 0 ? '+' : '−'}${fmtDim('distance', Math.abs(t))} mm ✎`, () => this.valuePopover(info.x, info.y, Math.abs(t), 'mm', (v) => { void this.tryFeature(() => { if (f.type === 'pushpull') f.distance = Math.sign(t) * v; return f; }); }));
       });
     } else if (d.kind === 'edge') {
@@ -1140,7 +1150,7 @@ export class App {
       const i = this.sel3d.edges.findIndex((e) => e.body === edgeHit.body && e.index === edgeHit.index);
       if (i >= 0) this.sel3d.edges.splice(i, 1); else this.sel3d.edges.push({ body: edgeHit.body, index: edgeHit.index });
       this.sel3d.face = null; this.sel3d.body = this.sel3d.edges.length ? edgeHit.body : null; this.selectedFeature = null;
-      this.vp.setSelection(this.sel3d); this.renderSidePanel(); this.renderToolbar();
+      this.vp.setSelection(this.sel3d); this.updateFaceHandle(); this.renderSidePanel(); this.renderToolbar();
       if (this.sel3d.edges.length) this.menu(info.x + 10, info.y + 10, [
         { label: `Filete nas ${this.sel3d.edges.length} aresta${this.sel3d.edges.length > 1 ? 's' : ''}…`, action: () => this.filletSelected('fillet') },
         { label: 'Chanfro…', action: () => this.filletSelected('chamfer') },
@@ -1163,7 +1173,7 @@ export class App {
           this.menu(info.x + 10, info.y + 10, items);
         }
       }
-      this.vp.setSelection(this.sel3d); this.renderSidePanel(); this.renderToolbar();
+      this.vp.setSelection(this.sel3d); this.updateFaceHandle(); this.renderSidePanel(); this.renderToolbar();
       return;
     }
     const plane = this.vp.pickPlane(info.x, info.y);
@@ -1474,7 +1484,7 @@ export class App {
       if (!isFinite(depth) || depth <= 0) { this.toast('Profundidade inválida.', 'err'); return; }
       back.remove();
       void this.tryFeature(() => addExtrude(doc, sketchId, depth, { op: state.op, target: state.op === 'new' ? undefined : state.target, symmetric: state.symmetric, flip: state.flip, throughAll: state.op === 'cut' && state.throughAll }),
-        (f) => { this.selectedFeature = f.id; this.sel3d = emptySel3D(); this.sel3d.body = bodyOfFeature(f); this.vp.setSelection(this.sel3d); this.renderSidePanel(); this.vp.fitAll(); });
+        (f) => { this.selectedFeature = f.id; this.sel3d = emptySel3D(); this.sel3d.body = bodyOfFeature(f); this.vp.setSelection(this.sel3d); this.updateFaceHandle(); this.renderSidePanel(); this.vp.fitAll(); });
     };
     acts.append(this.button('Cancelar', () => back.remove()), this.button('Extrudar', ok, 'btn primary')); d.append(acts);
     depthInp.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') ok(); if (ev.key === 'Escape') back.remove(); });
@@ -1543,7 +1553,7 @@ export class App {
       const axis = axes.find((a) => a.key === state.axisKey)?.axis ?? axes[0].axis;
       back.remove();
       void this.tryFeature(() => addRevolve(doc, sketchId, axis, angle, { op: state.op, target: state.op === 'new' ? undefined : state.target, flip: state.flip }),
-        (f) => { this.selectedFeature = f.id; this.sel3d = emptySel3D(); this.sel3d.body = bodyOfFeature(f); this.vp.setSelection(this.sel3d); this.renderSidePanel(); this.vp.fitAll(); });
+        (f) => { this.selectedFeature = f.id; this.sel3d = emptySel3D(); this.sel3d.body = bodyOfFeature(f); this.vp.setSelection(this.sel3d); this.updateFaceHandle(); this.renderSidePanel(); this.vp.fitAll(); });
     };
     acts.append(this.button('Cancelar', () => back.remove()), this.button('Revolucionar', ok, 'btn primary')); d.append(acts);
     angInp.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') ok(); if (ev.key === 'Escape') back.remove(); });
@@ -1559,7 +1569,7 @@ export class App {
     const minLen = Math.min(...refs.map((r) => r.len));
     const def = Math.max(0.5, Math.min(kind === 'fillet' ? 2 : 1, round(minLen / 4, 1)));
     this.valuePopover(this.vp.width / 2, this.vp.height / 2, def, 'mm', (r) => {
-      void this.tryFeature(() => addFillet(this.doc.current, kind, body.id, refs, r), (f) => { this.sel3d = emptySel3D(); this.sel3d.body = body.id; this.selectedFeature = f.id; this.vp.setSelection(this.sel3d); this.renderSidePanel(); this.renderToolbar(); });
+      void this.tryFeature(() => addFillet(this.doc.current, kind, body.id, refs, r), (f) => { this.sel3d = emptySel3D(); this.sel3d.body = body.id; this.selectedFeature = f.id; this.vp.setSelection(this.sel3d); this.updateFaceHandle(); this.renderSidePanel(); this.renderToolbar(); });
     });
   }
 
@@ -1577,7 +1587,7 @@ export class App {
     this.menu(ev.clientX, ev.clientY, items);
   }
   private addBooleanFeature(op: 'union' | 'subtract' | 'intersect', body: Id, tool: Id): void {
-    void this.tryFeature(() => addBoolean(this.doc.current, op, body, tool), (f) => { this.selectedFeature = f.id; this.sel3d = emptySel3D(); this.sel3d.body = body; this.vp.setSelection(this.sel3d); this.renderSidePanel(); this.renderToolbar(); });
+    void this.tryFeature(() => addBoolean(this.doc.current, op, body, tool), (f) => { this.selectedFeature = f.id; this.sel3d = emptySel3D(); this.sel3d.body = body; this.vp.setSelection(this.sel3d); this.updateFaceHandle(); this.renderSidePanel(); this.renderToolbar(); });
   }
 
   // ---------- Arquivos ----------
@@ -1656,7 +1666,7 @@ export class App {
     this.anim.t = t;
     const T = computeTransformsAt(asm, t); const map = new Map<Id, number[]>();
     for (const inst of asm.instances) { const m = T.get(inst.id); const c = this.asmCache.get(inst.part); if (!m || !c) continue; for (const b of c.bodies) map.set(`${inst.id}/${b.id}`, m); }
-    this.vp.updateMatrices(map); this.vp.setSelection(this.sel3d);
+    this.vp.updateMatrices(map); this.vp.setSelection(this.sel3d); this.updateFaceHandle();
     const dur = asm.animation?.duration ?? 4;
     const slider = this.timeline.querySelector('input[type=range]') as HTMLInputElement | null; if (slider && document.activeElement !== slider) slider.value = String(Math.round(t * 1000));
     const time = this.timeline.querySelector('.time'); if (time) time.textContent = `${(t * dur).toFixed(1).replace('.', ',')} s / ${String(dur).replace('.', ',')} s`;
@@ -1731,7 +1741,7 @@ export class App {
       for (const h of this.anim.hits) {
         const a = asm.instances[h.a], b = asm.instances[h.b]; const t = this.anim.hitSteps > 1 ? h.step / (this.anim.hitSteps - 1) : 0;
         const it = listItem(`${a?.name ?? '?'} × ${b?.name ?? '?'}`, `${Math.round(t * 100)}% · ${fmtMm3(h.volume)}`);
-        it.addEventListener('click', () => { this.pause(); this.applyAnimT(t); this.selectedInstance = a?.id ?? null; const c = a && this.asmCache.get(a.part); this.sel3d = emptySel3D(); if (a && c?.bodies[0]) this.sel3d.body = `${a.id}/${c.bodies[0].id}`; this.vp.setSelection(this.sel3d); });
+        it.addEventListener('click', () => { this.pause(); this.applyAnimT(t); this.selectedInstance = a?.id ?? null; const c = a && this.asmCache.get(a.part); this.sel3d = emptySel3D(); if (a && c?.bodies[0]) this.sel3d.body = `${a.id}/${c.bodies[0].id}`; this.vp.setSelection(this.sel3d); this.updateFaceHandle(); });
         list.append(it);
       }
       p.append(list);

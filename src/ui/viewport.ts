@@ -46,6 +46,9 @@ export class Viewport {
   readonly regions = new THREE.Group();
   readonly hoverGroup = new THREE.Group();
   readonly ghostGroup = new THREE.Group();
+  readonly handleGroup = new THREE.Group();
+  private handleMat = new THREE.MeshBasicMaterial({ color: 0xf0542b, depthTest: false, transparent: true, opacity: 0.95 });
+  private handleTip: THREE.Vector3 | null = null; private handleBase: THREE.Vector3 | null = null;
   private regionMeshes: THREE.Mesh[] = [];
   private regionMat = new THREE.MeshBasicMaterial({ color: 0xe9a825, transparent: true, opacity: 0.12, side: THREE.DoubleSide, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2 });
   private regionHotMat = new THREE.MeshBasicMaterial({ color: 0xf0542b, transparent: true, opacity: 0.35, side: THREE.DoubleSide, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2 });
@@ -83,7 +86,8 @@ export class Viewport {
     this.persp = new THREE.PerspectiveCamera(40, 1, 0.5, 20000);
     this.persp.position.set(160, 120, 200); this.persp.up.set(0, 1, 0); this.persp.lookAt(this.target);
     this.ortho = new THREE.OrthographicCamera(-1, 1, 1, -1, -5000, 5000);
-    this.scene.add(this.bodies, this.sketches, this.helpers, this.regions, this.highlights, this.hoverGroup, this.ghostGroup);
+    this.scene.add(this.bodies, this.sketches, this.helpers, this.regions, this.highlights, this.hoverGroup, this.ghostGroup, this.handleGroup);
+    this.handleGroup.renderOrder = 8;
     this.highlights.renderOrder = 5;
     this.hemi = new THREE.HemisphereLight(0xffffff, 0x9aa0a8, 1.6); this.scene.add(this.hemi);
     this.keyLight = new THREE.DirectionalLight(0xffffff, 1.1); this.keyLight.position.set(200, 300, 250); this.scene.add(this.keyLight);
@@ -114,7 +118,7 @@ export class Viewport {
     this.bodyMaterial.color.setHex(t.body); this.bodySelMaterial.color.setHex(t.bodySel); this.faceSelMaterial.color.setHex(t.faceSel);
     this.edgeMaterial.color.setHex(t.edge); this.edgeSelMaterial.color.setHex(t.edgeSel);
     this.hoverFaceMat.color.setHex(t.hover); this.hoverEdgeMat.color.setHex(t.hover); this.regionMat.color.setHex(t.region); this.regionHotMat.color.setHex(t.regionHot);
-    this.ghostMat.color.setHex(t.ghost); this.ghostEdgeMat.color.setHex(t.ghostEdge);
+    this.ghostMat.color.setHex(t.ghost); this.ghostEdgeMat.color.setHex(t.ghostEdge); this.handleMat.color.setHex(t.faceSel);
     this.planeMat.color.setHex(t.plane); this.planeEdgeMat.color.setHex(t.plane);
     this.hemi.color.setHex(t.hemiSky); this.hemi.groundColor.setHex(t.hemiGround); this.keyLight.intensity = t.key; this.fillLight.intensity = t.fill;
     this.buildHelpers();
@@ -211,6 +215,32 @@ export class Viewport {
       if (ed) { const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.Float32BufferAttribute(ed.points, 3)); g.applyMatrix4(this.bodyMatrixOf(h.body)); const line = new THREE.Line(g, this.hoverEdgeMat); line.renderOrder = 6; this.hoverGroup.add(line); }
     }
     this.requestRender();
+  }
+
+  /** Seta de puxar/empurrar na face selecionada: do centro da face ao longo da normal. */
+  setFaceHandle(center: THREE.Vector3 | null, normal?: THREE.Vector3): void {
+    this.handleGroup.clear(); this.handleTip = null; this.handleBase = null;
+    if (!center || !normal) { this.requestRender(); return; }
+    const px = this.worldPerPixel(); const L = px * 46, R = px * 2.2, coneL = px * 14, coneR = px * 6.5;
+    const n = normal.clone().normalize();
+    const shaft = new THREE.Mesh(new THREE.CylinderGeometry(R, R, L - coneL, 12), this.handleMat);
+    const cone = new THREE.Mesh(new THREE.ConeGeometry(coneR, coneL, 16), this.handleMat);
+    const q = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, 1, 0), n);
+    shaft.position.copy(center).add(n.clone().multiplyScalar((L - coneL) / 2 + px * 3)); shaft.quaternion.copy(q);
+    cone.position.copy(center).add(n.clone().multiplyScalar(L - coneL / 2 + px * 3)); cone.quaternion.copy(q);
+    const knob = new THREE.Mesh(new THREE.SphereGeometry(px * 4, 12, 8), this.handleMat); knob.position.copy(center);
+    for (const m of [shaft, cone, knob]) m.renderOrder = 8;
+    this.handleGroup.add(shaft, cone, knob);
+    this.handleBase = center.clone(); this.handleTip = center.clone().add(n.multiplyScalar(L + px * 3));
+    this.requestRender();
+  }
+  /** Distância em pixels do cursor até a seta de puxar (ou Infinity se não há seta). */
+  handleDistancePx(x: number, y: number): number {
+    if (!this.handleTip || !this.handleBase) return Infinity;
+    const a = this.worldToScreen(this.handleBase), b = this.worldToScreen(this.handleTip);
+    const dx = b.x - a.x, dy = b.y - a.y; const L2 = dx * dx + dy * dy;
+    const t = L2 > 0 ? Math.max(0, Math.min(1, ((x - a.x) * dx + (y - a.y) * dy) / L2)) : 0;
+    return Math.hypot(a.x + t * dx - x, a.y + t * dy - y);
   }
 
   /** Prévia fantasma durante um arrasto (extrusão, puxar face). */
