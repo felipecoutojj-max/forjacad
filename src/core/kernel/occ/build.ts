@@ -76,8 +76,8 @@ function profileToFace(oc: OC, s: Sketch, plane: Plane, prof: Profile): TopoDS_F
 }
 
 /** Faces planas (uma por perfil fechado) de um esboço, no espaço 3D. */
-export function sketchFaces(oc: OC, doc: ForjaDocument, sketchId: Id, profilePoint?: [number, number]): { faces: TopoDS_Face[]; plane: Plane } {
-  const sk = getSketch(doc, sketchId); const plane = getPlane(doc, sk.plane);
+export function sketchFaces(oc: OC, doc: ForjaDocument, sketchId: Id, profilePoint?: [number, number], planeOverride?: Plane): { faces: TopoDS_Face[]; plane: Plane } {
+  const sk = getSketch(doc, sketchId); const plane = planeOverride ?? getPlane(doc, sk.plane);
   let profiles = extractProfiles(sk);
   if (!profiles.length) throw new Error('o esboço não tem contorno fechado');
   if (profilePoint) { const pt = { x: profilePoint[0], y: profilePoint[1] }; profiles = profiles.filter((p) => profileContainsPoint(sk, p, pt)); if (!profiles.length) throw new Error('a região escolhida não existe mais no esboço'); }
@@ -220,7 +220,7 @@ export function applyFillet(oc: OC, f: FilletFeature, shape: TopoDS_Shape): Topo
   return result;
 }
 
-interface FaceInfo { face: TopoDS_Face; center: V3; normal: V3; area: number; }
+interface FaceInfo { face: TopoDS_Face; center: V3; normal: V3; area: number; u: V3; v: V3; }
 
 /** Faces planas de uma forma com centro, normal para fora e área. */
 export function planarFaces(oc: OC, shape: TopoDS_Shape): FaceInfo[] {
@@ -232,10 +232,11 @@ export function planarFaces(oc: OC, shape: TopoDS_Shape): FaceInfo[] {
     const surf = new oc.BRepAdaptor_Surface_2(face, true);
     if (enumVal(surf.GetType()) !== PLANE) { surf.delete(); continue; }
     const sgn = enumVal(face.Orientation_1()) === REVERSED ? -1 : 1;
-    const pln = surf.Plane(); const n = pln.Axis().Direction();
+    const pln = surf.Plane(); const n = pln.Axis().Direction(); const ux = pln.XAxis().Direction();
     const props = new oc.GProp_GProps_1(); oc.BRepGProp.SurfaceProperties_1(face, props, false, false); const c = props.CentreOfMass();
-    out.push({ face, center: [c.X(), c.Y(), c.Z()], normal: [sgn * n.X(), sgn * n.Y(), sgn * n.Z()], area: props.Mass() });
-    c.delete(); props.delete(); n.delete(); pln.delete(); surf.delete();
+    const normal: V3 = [sgn * n.X(), sgn * n.Y(), sgn * n.Z()]; const u: V3 = [ux.X(), ux.Y(), ux.Z()]; const v = cross3(normal, u);
+    out.push({ face, center: [c.X(), c.Y(), c.Z()], normal, area: props.Mass(), u, v });
+    c.delete(); props.delete(); n.delete(); ux.delete(); pln.delete(); surf.delete();
   }
   fmap.delete();
   return out;
@@ -293,6 +294,19 @@ export function rebuildDocument(oc: OC, doc: ForjaDocument): RebuildShapes {
           tool = revolveFaces(oc, faces, ax.p, f.flip ? neg(ax.d) : ax.d, f.angle);
         }
         if (f.pattern) tool = applyPattern(oc, tool, f.pattern);
+        // Mesmo esboço em outras faces do corpo alvo: o perfil vai para o plano de cada face (origem no centro dela).
+        if (f.type === 'extrude' && f.onFaces?.length && target) {
+          const infos = planarFaces(oc, target);
+          for (const ref of f.onFaces) {
+            const fi = matchFace(infos, ref); if (!fi) throw new Error('uma das faces do rasgo não foi encontrada');
+            const facePlane: Plane = { id: 'tmp', name: '', origin: fi.center, u: fi.u, v: fi.v };
+            const { faces: ff } = sketchFaces(oc, doc, f.sketch, f.profilePoint, facePlane);
+            let depth = f.depth; if (f.throughAll) { const [mn, mx] = bbox(oc, target); depth = dist3(mn, mx) * 2 + depth; }
+            const dir = f.op === 'cut' ? neg(fi.normal) : fi.normal;
+            let t2 = extrudeFaces(oc, ff, dir, depth, !!f.symmetric); if (f.pattern) t2 = applyPattern(oc, t2, f.pattern);
+            tool = boolOp(oc, 'fuse', tool, t2);
+          }
+        }
         place(f.op, f.target, tool);
       } else if (f.type === 'sweep') {
         const wire = sketchWire(oc, doc, f.paths?.length ? f.paths : [f.path]);

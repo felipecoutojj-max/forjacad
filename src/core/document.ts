@@ -36,6 +36,8 @@ export interface ExtrudeFeature {
   /** Extruda só o perfil fechado que contém este ponto (u, v) do esboço; sem ele, todos os perfis. */
   profilePoint?: [number, number];
   pattern?: PatternSpec;
+  /** Repete o mesmo esboço (relativo à origem do plano dele) nestas outras faces planas do corpo alvo. */
+  onFaces?: FaceRef[];
   color?: string;
   visible?: boolean;
 }
@@ -164,7 +166,8 @@ function fromObject(d: Record<string, unknown> & { [k: string]: any }, depth: nu
       let op: ExtrudeOp = f.op === 'cut' ? 'cut' : f.op === 'add' && fileVersion >= 2 ? 'add' : 'new';
       if (op !== 'new' && typeof f.target !== 'string') op = 'new';
       const pp = f.profilePoint as unknown; const profilePoint = Array.isArray(pp) && pp.length === 2 && pp.every((x) => typeof x === 'number' && Number.isFinite(x)) ? (pp as [number, number]) : undefined;
-      features.push({ id: f.id, type: 'extrude', name: str(f.name, 'Extrusão'), sketch: f.sketch, depth: Math.abs(num(f.depth, 10)) || 10, op, target: op === 'new' ? undefined : id(f.target), symmetric: !!f.symmetric, flip: !!f.flip, throughAll: !!f.throughAll, profilePoint, pattern: pattern(f.pattern), visible: f.visible !== false });
+      const onFaces = (Array.isArray(f.onFaces) ? f.onFaces : []).map(faceRef).filter((x): x is FaceRef => !!x);
+      features.push({ id: f.id, type: 'extrude', name: str(f.name, 'Extrusão'), sketch: f.sketch, depth: Math.abs(num(f.depth, 10)) || 10, op, target: op === 'new' ? undefined : id(f.target), symmetric: !!f.symmetric, flip: !!f.flip, throughAll: !!f.throughAll, profilePoint, pattern: pattern(f.pattern), onFaces: onFaces.length ? onFaces : undefined, visible: f.visible !== false });
     } else if (f.type === 'pushpull' && typeof f.body === 'string') {
       const fr = f.face as Partial<FaceRef> | undefined;
       if (fr && isV3(fr.center) && isV3(fr.normal) && typeof fr.area === 'number') features.push({ id: f.id, type: 'pushpull', name: str(f.name, 'Puxar face'), body: f.body, face: { center: fr.center, normal: fr.normal, area: fr.area }, faces: (Array.isArray(f.faces) ? f.faces : []).map(faceRef).filter((x): x is FaceRef => !!x), distance: num(f.distance, 1) || 1 });
@@ -305,7 +308,7 @@ export function addExtrude(doc: ForjaDocument, sketch: Id, depth: number, opts: 
   const op = opts.op ?? 'new';
   const n = doc.features.filter((f) => f.type === 'extrude' && f.op === op).length + 1;
   const base = op === 'cut' ? 'Corte' : op === 'add' ? 'Adição' : 'Extrusão';
-  const f: ExtrudeFeature = { id: newId('f'), type: 'extrude', name: `${base} ${n}`, sketch, depth: Math.abs(depth), op, target: op === 'new' ? undefined : opts.target, symmetric: !!opts.symmetric, flip: !!opts.flip, throughAll: !!opts.throughAll, visible: true };
+  const f: ExtrudeFeature = { id: newId('f'), type: 'extrude', name: `${base} ${n}${opts.onFaces?.length ? ` em ${opts.onFaces.length + 1} faces` : ''}`, sketch, depth: Math.abs(depth), op, target: op === 'new' ? undefined : opts.target, symmetric: !!opts.symmetric, flip: !!opts.flip, throughAll: !!opts.throughAll, onFaces: opts.onFaces?.length ? opts.onFaces : undefined, visible: true };
   doc.features.push(f); return f;
 }
 

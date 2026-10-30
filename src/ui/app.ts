@@ -696,7 +696,7 @@ export class App {
       p.append(row);
     } else if (s3.face && body) {
       const f = body.faces[s3.face.index]; const extra = s3.faces?.length ?? 0;
-      const d = el('div', 'hint'); d.textContent = f ? `${extra ? `${extra + 1} faces de ${body.name}. Arraste a seta para puxar todas juntas.` : `Face ${faceTypeName(f.type)} de ${body.name}, ${f.area.toFixed(0)} mm². Toque em outras faces para somar.`}` : body.name; p.append(d);
+      const d = el('div', 'hint'); d.textContent = f ? `${extra ? `${extra + 1} faces de ${body.name}. Arraste a seta para puxar todas juntas, ou use Extrudar ▸ Furo passante com um esboço para repetir o mesmo rasgo nelas.` : `Face ${faceTypeName(f.type)} de ${body.name}, ${f.area.toFixed(0)} mm². Toque em outras faces para somar.`}` : body.name; p.append(d);
       const row = el('div', 'row');
       if (f?.type === 'plane') row.append(this.button('Esboçar nesta face', () => this.createSketchOnFace(body.id, s3.face!.index), 'btn primary'));
       row.append(this.button('Limpar', () => this.clearSel3d()));
@@ -743,6 +743,7 @@ export class App {
       checkRow('Inverter sentido', !!f.flip, (v) => edit(() => { f.flip = v; }));
       if (f.op === 'cut') checkRow('Atravessar tudo', !!f.throughAll, (v) => edit(() => { f.throughAll = v; }));
       this.renderPatternRows(p, f, edit);
+      if (f.onFaces?.length) { const fr = el('div', 'row'); const fh = el('div', 'hint'); fh.style.flex = '1'; fh.textContent = `Repetido em mais ${f.onFaces.length} face${f.onFaces.length > 1 ? 's' : ''}.`; fr.append(fh, this.button('Só a original', () => edit(() => { delete f.onFaces; }))); p.append(fr); }
       const row3 = el('div', 'row');
       row3.append(this.button('Editar esboço', () => this.enterSketch(f.sketch)));
       row3.append(this.button('Apagar', () => this.deleteFeature(f), 'btn danger'));
@@ -1699,7 +1700,10 @@ export class App {
     const doc = this.doc.current; const plane = getPlane(doc, getSketch(doc, sketchId).plane); const bodies = bodyIds(doc);
     if (!bodies.length) return this.toast('Não há corpo para furar.', 'err');
     const fromFace = plane.kind === 'face' && !!plane.body && bodies.includes(plane.body);
-    const go = (target: Id) => void this.tryFeature(() => addExtrude(doc, sketchId, 10, { op: 'cut', target, throughAll: true, flip: fromFace, symmetric: !fromFace }), (f) => { this.selectedFeature = f.id; this.sel3d = emptySel3D(); this.sel3d.body = target; this.vp.setSelection(this.sel3d); this.updateFaceHandle(); this.renderSidePanel(); });
+    const go = (target: Id) => {
+      const extra = this.extraFacesFor(target, plane);
+      void this.tryFeature(() => addExtrude(doc, sketchId, 10, { op: 'cut', target, throughAll: true, flip: fromFace, symmetric: !fromFace, onFaces: extra }), (f) => { this.selectedFeature = f.id; this.sel3d = emptySel3D(); this.sel3d.body = target; this.vp.setSelection(this.sel3d); this.updateFaceHandle(); this.renderSidePanel(); if (extra.length) this.toast(`Rasgo aplicado em ${extra.length + 1} faces.`); });
+    };
     if (fromFace) go(plane.body!); else if (bodies.length === 1) go(bodies[0]);
     else this.menu(this.vp.width / 2, this.vp.height / 2, bodies.map((b) => ({ label: `Furar ${bodyName(doc, b)}`, action: () => go(b) })));
   }
@@ -1711,7 +1715,8 @@ export class App {
     const bodies = bodyIds(doc);
     const faceBody = plane.kind === 'face' && plane.body && bodies.includes(plane.body) ? plane.body : null;
     const kernelOk = this.kernel.state === 'ready';
-    const state = { op: (faceBody && kernelOk ? 'cut' : 'new') as ExtrudeOp, depth: 10, target: faceBody ?? bodies[0] ?? '', symmetric: false, flip: !!faceBody, throughAll: false, flipTouched: false };
+    const state = { op: (faceBody && kernelOk ? 'cut' : 'new') as ExtrudeOp, depth: 10, target: faceBody ?? bodies[0] ?? '', symmetric: false, flip: !!faceBody, throughAll: false, flipTouched: false, onFaces: true };
+    const extraFaces = this.extraFacesFor(state.target, plane);
 
     const back = el('div', 'dialog-backdrop'); const d = el('div', 'dialog');
     const hh = document.createElement('h2'); hh.textContent = `Extrudar ${sk.name}`; d.append(hh);
@@ -1737,12 +1742,13 @@ export class App {
     const symRow = el('div', 'row'); const sl = document.createElement('label'); sl.textContent = 'Simétrico ao plano'; const symChk = document.createElement('input'); symChk.type = 'checkbox'; symChk.addEventListener('change', () => { state.symmetric = symChk.checked; }); symRow.append(sl, symChk); d.append(symRow);
     const flipRow = el('div', 'row'); const fl = document.createElement('label'); fl.textContent = 'Inverter sentido'; const flipChk = document.createElement('input'); flipChk.type = 'checkbox'; flipChk.addEventListener('change', () => { state.flip = flipChk.checked; state.flipTouched = true; }); flipRow.append(fl, flipChk); d.append(flipRow);
     const throughRow = el('div', 'row'); const trl = document.createElement('label'); trl.textContent = 'Atravessar tudo'; const thrChk = document.createElement('input'); thrChk.type = 'checkbox'; thrChk.addEventListener('change', () => { state.throughAll = thrChk.checked; }); throughRow.append(trl, thrChk); d.append(throughRow);
+    if (extraFaces.length) { const fr2 = el('div', 'row'); const fl2 = document.createElement('label'); fl2.textContent = `Repetir nas ${extraFaces.length} outras faces selecionadas`; const fc = document.createElement('input'); fc.type = 'checkbox'; fc.checked = true; fc.addEventListener('change', () => { state.onFaces = fc.checked; }); fr2.append(fl2, fc); d.append(fr2); }
     const acts = el('div', 'actions');
     const ok = () => {
       const depth = parseFloat(depthInp.value.replace(',', '.'));
       if (!isFinite(depth) || depth <= 0) { this.toast('Profundidade inválida.', 'err'); return; }
       back.remove();
-      void this.tryFeature(() => addExtrude(doc, sketchId, depth, { op: state.op, target: state.op === 'new' ? undefined : state.target, symmetric: state.symmetric, flip: state.flip, throughAll: state.op === 'cut' && state.throughAll }),
+      void this.tryFeature(() => addExtrude(doc, sketchId, depth, { op: state.op, target: state.op === 'new' ? undefined : state.target, symmetric: state.symmetric, flip: state.flip, throughAll: state.op === 'cut' && state.throughAll, onFaces: state.op !== 'new' && state.onFaces ? extraFaces : undefined }),
         (f) => { this.selectedFeature = f.id; this.sel3d = emptySel3D(); this.sel3d.body = bodyOfFeature(f); this.vp.setSelection(this.sel3d); this.updateFaceHandle(); this.renderSidePanel(); this.vp.fitAll(); });
     };
     acts.append(this.button('Cancelar', () => back.remove()), this.button('Extrudar', ok, 'btn primary')); d.append(acts);
@@ -1865,6 +1871,17 @@ export class App {
     this.menu(ev.clientX, ev.clientY, items);
   }
   private selectedFeatureObj(): Feature | undefined { return this.doc.current.features.find((f) => f.id === this.selectedFeature); }
+  /** Faces planas selecionadas no corpo `body`, fora a face onde o esboço foi desenhado: recebem o mesmo rasgo. */
+  private extraFacesFor(body: Id, sketchPlane: Plane): FaceRef[] {
+    const all = [...(this.sel3d.face ? [this.sel3d.face] : []), ...(this.sel3d.faces ?? [])].filter((f) => f.body === body);
+    const n = planeNormal(sketchPlane); const out: FaceRef[] = [];
+    for (const f of all) {
+      const ref = this.faceRefOf(f); if (!ref) continue;
+      const same = v3dot(ref.normal, n) > 0.99 && Math.abs(v3dot(v3sub(ref.center, sketchPlane.origin), n)) < 0.5;
+      if (!same && !out.some((o) => v3dot(o.normal, ref.normal) > 0.999 && Math.hypot(...v3sub(o.center, ref.center)) < 1e-6)) out.push(ref);
+    }
+    return out;
+  }
   private faceRefOf(ref: { body: Id; index: number } | null): FaceRef | null { const fd = ref ? this.bodyOf(ref.body)?.faces[ref.index] : undefined; return fd?.type === 'plane' && fd.normal ? { center: fd.center, normal: fd.normal, area: fd.area } : null; }
   /** Plano escolhido num diálogo: face plana selecionada ou um dos planos do mundo, com deslocamento. */
   private planeChoices(): [string, string][] { const out: [string, string][] = []; if (this.faceRefOf(this.sel3d.face)) out.push(['face', 'Face selecionada']); out.push(['xy', 'Plano XY (frente)'], ['xz', 'Plano XZ (topo)'], ['yz', 'Plano YZ (lateral)']); return out; }

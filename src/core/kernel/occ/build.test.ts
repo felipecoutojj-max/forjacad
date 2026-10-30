@@ -304,6 +304,15 @@ describe('kernel OpenCASCADE', () => {
     const r = rebuildDocument(oc, doc); expect(r.errors).toEqual([]); expect(Math.abs(tessellate(oc, r.bodies[0], 'c').volume - length * ring) / (length * ring)).toBeLessThan(0.08);
   });
 
+  it('mesmo rasgo em várias faces: bolsa redonda no topo replicada na frente e na direita', () => {
+    const doc = createDocument(); const body = addExtrude(doc, rectSketch(doc, 'plane-xy', 0, 0, 100, 60).id, 20);
+    const topPlane = addFacePlane(doc, 'topo', [50, 30, 20], [1, 0, 0], [0, 1, 0], body.id); // origem no centro da face de cima
+    const hole = circleSketch(doc, topPlane.id, 0, 0, 5);
+    addExtrude(doc, hole.id, 5, { op: 'cut', target: body.id, flip: true, onFaces: [{ center: [50, 30, 0], normal: [0, 0, -1], area: 6000 }, { center: [100, 30, 10], normal: [1, 0, 0], area: 1200 }] });
+    const r = rebuildDocument(oc, doc); expect(r.errors).toEqual([]);
+    expect(tessellate(oc, r.bodies[0], 'c').volume).toBeCloseTo(120000 - 3 * Math.PI * 25 * 5, 0);
+  });
+
   it('exporta STEP com os corpos', () => {
     const doc = createDocument(); addExtrude(doc, rectSketch(doc, 'plane-xy', 0, 0, 10, 10).id, 10);
     const r = rebuildDocument(oc, doc);

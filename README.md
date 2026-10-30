@@ -31,7 +31,9 @@ Abre em `http://localhost:5173`. Para abrir no iPad na mesma rede, use o endere�
   linha ou círculo para ver a medida e cotá-la; arraste o que está selecionado para mover, alongar ou mudar
   o raio. "Concluir esboço" fica fixo na tela e "Furo passante" corta atravessando com um toque. Uma linha
   selecionada num esboço sobre face pode dividir o corpo.
-- **Várias faces.** Toque soma faces à seleção; a seta puxa ou empurra todas juntas.
+- **Várias faces.** Toque soma faces à seleção; a seta puxa ou empurra todas juntas. Para repetir um rasgo:
+  desenhe-o numa face, conclua, toque nas outras faces e use "Furo passante com Esboço N" (ou Extrudar com
+  "Repetir nas outras faces"): o mesmo desenho sai em cada face, centrado nela.
 - **Tubo.** Em "Corpo ▸ Tubo", desenhe o caminho com linhas e arcos (em um ou mais esboços emendados, em planos
   diferentes para curvas em 3D), informe diâmetro e parede: sai o tubo seguindo as curvas. A varredura
   também aceita caminho em vários esboços; cantos vivos viram cotovelos.
