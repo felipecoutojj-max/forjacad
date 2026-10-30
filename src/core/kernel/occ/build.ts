@@ -306,6 +306,10 @@ export function tessellate(oc: OC, body: BuiltBody, name: string, quality = 1): 
       fd.origin = [o.X(), o.Y(), o.Z()]; fd.normal = [sgn * n.X(), sgn * n.Y(), sgn * n.Z()];
       fd.u = [ux.X(), ux.Y(), ux.Z()]; fd.v = [sgn * vy.X(), sgn * vy.Y(), sgn * vy.Z()];
       o.delete(); n.delete(); ux.delete(); vy.delete(); pln.delete();
+    } else if (fd.type === 'cylinder') {
+      const cyl = surf.Cylinder(); const ax = cyl.Axis(); const o = ax.Location(), dn = ax.Direction();
+      fd.axisOrigin = [o.X(), o.Y(), o.Z()]; fd.axisDir = [dn.X(), dn.Y(), dn.Z()]; fd.radius = cyl.Radius();
+      o.delete(); dn.delete(); ax.delete(); cyl.delete();
     }
     const props = new oc.GProp_GProps_1(); oc.BRepGProp.SurfaceProperties_1(face, props, false, false); fd.area = props.Mass(); props.delete();
     surf.delete(); trsf.delete(); loc.delete();
@@ -427,4 +431,28 @@ export function projectViews(oc: OC, shapes: TopoDS_Shape[], specs: ViewSpec[]):
     const circlesClean = circles.filter((c, i) => !circles.some((o, j) => j < i && Math.abs(o.cx - c.cx) < 1e-4 && Math.abs(o.cy - c.cy) < 1e-4 && Math.abs(o.r - c.r) < 1e-4));
     return { name: spec.name, visible, hidden: hiddenClean, tangent, circles: circlesClean, bbox: bb as [number, number, number, number] };
   });
+}
+
+// ---------- Montagens ----------
+
+/** Aplica uma matriz 4×4 (linha-maior) a uma forma. */
+export function transformShape(oc: OC, shape: TopoDS_Shape, m: number[]): TopoDS_Shape {
+  const t = new oc.gp_Trsf_1();
+  t.SetValues(m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11]);
+  const out = new oc.BRepBuilderAPI_Transform_2(shape, t, true).Shape(); t.delete();
+  return out;
+}
+
+/** Recalcula cada peça uma vez (com cache por conteúdo) e devolve as formas de todas as instâncias no mundo. */
+export function assemblyShapes(oc: OC, parts: { id: Id; doc: ForjaDocument }[], instances: { part: Id; matrix: number[] }[], cache: Map<string, TopoDS_Shape[]>): TopoDS_Shape[] {
+  const byPart = new Map<Id, TopoDS_Shape[]>();
+  for (const p of parts) {
+    const key = JSON.stringify({ s: p.doc.sketches, f: p.doc.features, p: p.doc.planes });
+    let shapes = cache.get(key);
+    if (!shapes) { shapes = rebuildDocument(oc, p.doc).bodies.map((b) => b.shape); cache.set(key, shapes); }
+    byPart.set(p.id, shapes);
+  }
+  const out: TopoDS_Shape[] = [];
+  for (const inst of instances) for (const sh of byPart.get(inst.part) ?? []) out.push(transformShape(oc, sh, inst.matrix));
+  return out;
 }

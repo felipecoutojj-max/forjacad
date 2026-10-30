@@ -4,6 +4,7 @@
 
 import type { ProjectedView, ViewSpec } from '../kernel/occ/types';
 import type { V3 } from '../document';
+import type { BomRow } from '../assembly/model';
 
 export type SheetSize = 'A4' | 'A3' | 'A2';
 export type Projection = 'first' | 'third';
@@ -35,6 +36,11 @@ export type Primitive =
   | { kind: 'text'; x: number; y: number; text: string; h: number; anchor: 'start' | 'middle' | 'end'; rotate?: number; bold?: boolean };
 
 export interface Drawing { width: number; height: number; scale: number; sheet: SheetSize; primitives: Primitive[]; }
+/** Onde cada vista caiu na folha: X_folha = vx + (X - bbox[0])·scale, Y_folha = vy + (bbox[3] - Y)·scale. */
+export interface ViewPlacement { name: string; vx: number; vy: number; scale: number; bbox: [number, number, number, number]; }
+export interface LayoutResult { drawing: Drawing; placements: ViewPlacement[]; titleBlock: { x: number; y: number; w: number; h: number }; }
+export const placeX = (p: ViewPlacement, X: number) => p.vx + (X - p.bbox[0]) * p.scale;
+export const placeY = (p: ViewPlacement, Y: number) => p.vy + (p.bbox[3] - Y) * p.scale;
 
 export const fmtNum = (v: number): string => {
   const r = Math.round(v * 100) / 100;
@@ -42,6 +48,13 @@ export const fmtNum = (v: number): string => {
 };
 
 const norm3 = (v: V3): V3 => { const L = Math.hypot(v[0], v[1], v[2]) || 1; return [v[0] / L, v[1] / L, v[2] / L]; };
+
+/** Projeta um ponto 3D nas coordenadas (X, Y) de uma vista, como o kernel faz. */
+export function projectPoint(spec: ViewSpec, p: V3): [number, number] {
+  const n = norm3(spec.n); const cr: V3 = [spec.up[1] * n[2] - spec.up[2] * n[1], spec.up[2] * n[0] - spec.up[0] * n[2], spec.up[0] * n[1] - spec.up[1] * n[0]];
+  const r = norm3(cr); const u: V3 = [n[1] * r[2] - n[2] * r[1], n[2] * r[0] - n[0] * r[2], n[0] * r[1] - n[1] * r[0]];
+  return [p[0] * r[0] + p[1] * r[1] + p[2] * r[2], p[0] * u[0] + p[1] * u[1] + p[2] * u[2]];
+}
 
 /** Vistas a pedir ao kernel conforme as opções. A lateral é a esquerda no 1º diedro e a direita no 3º. */
 export function viewSpecsFor(s: DrawingSettings): ViewSpec[] {
@@ -60,11 +73,17 @@ const GAP = 24;     // espaço entre vistas (sobra para cotas)
 const PAD = 14;     // folga em volta do conjunto
 
 export function layoutDrawing(views: ProjectedView[], s: DrawingSettings, meta: { date: string; docName: string }): Drawing {
+  return layoutDrawingEx(views, s, meta).drawing;
+}
+
+export function layoutDrawingEx(views: ProjectedView[], s: DrawingSettings, meta: { date: string; docName: string }, opts: { reserveBottom?: number } = {}): LayoutResult {
   const [W, H] = SHEET_MM[s.sheet];
   const margin = s.sheet === 'A2' ? 10 : 7;
   const frame = { x: 25, y: margin, w: W - 25 - margin, h: H - 2 * margin };
   const titleH = 24, titleW = Math.min(178, frame.w);
-  const area = { x: frame.x + 4, y: frame.y + 4, w: frame.w - 8, h: frame.h - titleH - 8 };
+  const reserve = opts.reserveBottom ?? 0;
+  const area = { x: frame.x + 4, y: frame.y + 4, w: frame.w - 8, h: frame.h - titleH - reserve - 8 };
+  const placements: ViewPlacement[] = [];
   const prims: Primitive[] = [];
 
   // Moldura e legenda.
@@ -102,6 +121,7 @@ export function layoutDrawing(views: ProjectedView[], s: DrawingSettings, meta: 
     const v = c.view; if (!v) continue;
     const cw = colW[c.col] * scale, ch = rowH[c.row] * scale;
     const vx = colX[c.col] + (cw - bw(v) * scale) / 2, vy = rowY[c.row] + (ch - bh(v) * scale) / 2;
+    placements.push({ name: v.name, vx, vy, scale, bbox: v.bbox });
     const tx = (X: number) => vx + (X - v.bbox[0]) * scale;
     const ty = (Y: number) => vy + (v.bbox[3] - Y) * scale;
     const map = (pts: Float32Array) => { const out: number[] = []; for (let i = 0; i + 1 < pts.length; i += 2) out.push(tx(pts[i]), ty(pts[i + 1])); return out; };
@@ -121,7 +141,47 @@ export function layoutDrawing(views: ProjectedView[], s: DrawingSettings, meta: 
   // Legenda.
   const tbX = frame.x + frame.w - titleW, tbY = frame.y + frame.h - titleH;
   titleBlock(prims, tbX, tbY, titleW, titleH, s, scale, meta);
-  return { width: W, height: H, scale, sheet: s.sheet, primitives: prims };
+  return { drawing: { width: W, height: H, scale, sheet: s.sheet, primitives: prims }, placements, titleBlock: { x: tbX, y: tbY, w: titleW, h: titleH } };
+}
+
+export interface BalloonAnchor { item: number; view: string; X: number; Y: number; }
+const BOM_ROW = 7;
+
+/** Desenho de conjunto: vistas da montagem, balões numerados e lista de materiais sobre a legenda. */
+export function layoutAssemblyDrawing(views: ProjectedView[], s: DrawingSettings, meta: { date: string; docName: string }, bom: BomRow[], anchors: BalloonAnchor[]): Drawing {
+  const reserve = BOM_ROW * (bom.length + 1) + 2;
+  const { drawing, placements, titleBlock: tb } = layoutDrawingEx(views, s, meta, { reserveBottom: reserve });
+  const prims = drawing.primitives;
+  // Lista de materiais: cabeçalho encostado na legenda, itens para cima (NBR 13272).
+  const cols = [12, 12, 78, 48, tb.w - 150]; const heads = ['ITEM', 'QTD', 'DENOMINAÇÃO', 'MATERIAL', 'OBS'];
+  const rowRect = (y: number, cells: string[], bold: boolean) => {
+    prims.push({ kind: 'polyline', pts: rect(tb.x, y, tb.w, BOM_ROW), style: 'thin', closed: true });
+    let cx = tb.x;
+    cells.forEach((t, i) => { if (i) prims.push({ kind: 'polyline', pts: [cx, y, cx, y + BOM_ROW], style: 'thin' }); prims.push({ kind: 'text', x: i < 2 ? cx + cols[i] / 2 : cx + 1.5, y: y + BOM_ROW - 2.2, text: t, h: 2.5, anchor: i < 2 ? 'middle' : 'start', bold }); cx += cols[i]; });
+  };
+  rowRect(tb.y - BOM_ROW, heads, true);
+  bom.forEach((r, k) => rowRect(tb.y - BOM_ROW * (k + 2), [String(r.item), String(r.qty), r.name, r.material, ''], false));
+  // Balões: círculo numerado puxado para fora da vista, com linha de chamada até a peça.
+  const placed: { x: number; y: number }[] = [];
+  const byView = new Map<string, ViewPlacement>(); for (const p of placements) byView.set(p.name, p);
+  const R = 4.5;
+  for (const a of anchors) {
+    const p = byView.get(a.view); if (!p) continue;
+    const ax = placeX(p, a.X), ay = placeY(p, a.Y);
+    const cxv = p.vx + ((p.bbox[2] - p.bbox[0]) * p.scale) / 2, cyv = p.vy + ((p.bbox[3] - p.bbox[1]) * p.scale) / 2;
+    let dx = ax - cxv, dy = ay - cyv; const L = Math.hypot(dx, dy); if (L < 1e-6) { dx = 0; dy = -1; } else { dx /= L; dy /= L; }
+    const half = Math.hypot((p.bbox[2] - p.bbox[0]) * p.scale, (p.bbox[3] - p.bbox[1]) * p.scale) / 2;
+    let bx = cxv + dx * (half + 12), by = cyv + dy * (half + 12);
+    for (let guard = 0; guard < 12 && placed.some((q) => Math.hypot(q.x - bx, q.y - by) < 2 * R + 1); guard++) { bx += dx * 6; by += dy * 6; }
+    placed.push({ x: bx, y: by });
+    const ex = bx - dx * R, ey = by - dy * R;
+    prims.push({ kind: 'polyline', pts: [ax, ay, ex, ey], style: 'thin' });
+    const dot: number[] = []; for (let i = 0; i < 8; i++) { const t = (i / 8) * Math.PI * 2; dot.push(ax + 0.8 * Math.cos(t), ay + 0.8 * Math.sin(t)); }
+    prims.push({ kind: 'polygon', pts: dot });
+    prims.push({ kind: 'circle', cx: bx, cy: by, r: R, style: 'thin' });
+    prims.push({ kind: 'text', x: bx, y: by + 1.25, text: String(a.item), h: 3.5, anchor: 'middle' });
+  }
+  return drawing;
 }
 
 function rect(x: number, y: number, w: number, h: number): number[] { return [x, y, x + w, y, x + w, y + h, x, y + h]; }

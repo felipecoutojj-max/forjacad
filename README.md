@@ -2,8 +2,9 @@
 
 CAD para ferramental e melhoria de equipamentos: esboço com caneta ou mouse, cotas e restrições que fecham
 a geometria nas medidas, sólidos de verdade (OpenCASCADE em WebAssembly) com extrusão, corte, união, filete
-e chanfro, revolução, esboço sobre faces, desenho técnico ABNT em PDF e DXF (vistas com linhas ocultas,
-cotas, legenda), exportação para STEP, GLB, STL e OBJ (ZBrush, visualizadores). Roda no iPad e no
+e chanfro, revolução, esboço sobre faces, montagens com juntas (pino, deslizante, cilíndrica, rígida),
+lista de materiais, desenho técnico ABNT em PDF e DXF (vistas com linhas ocultas, cotas, legenda, balões),
+exportação para STEP, GLB, STL e OBJ (ZBrush, visualizadores). Roda no iPad e no
 Mac dentro do navegador, instala como app e funciona off-line.
 
 Referência de interação: Shapr3D. Referência de rigor: SolidWorks.
@@ -27,6 +28,9 @@ Abre em `http://localhost:5173`. Para abrir no iPad na mesma rede, use o endere�
 - Toque numa aresta (ou em várias) e escolha filete ou chanfro. Toque num corpo para combinar com outro.
 - "Desenho" monta a folha ABNT com frente, topo, lateral e isométrica no 1º diedro (ou 3º), escala
   automática, cotas gerais, diâmetros dos furos, linhas de centro e legenda. Prévia ao vivo; sai em PDF ou DXF.
+- "Novo ▸ Nova montagem" abre o modo montagem: importe peças .forja (ou leve a peça atual), insira
+  instâncias e crie juntas tocando numa face da peça móvel e numa face da peça base. Ajuste ângulo ou
+  curso no painel; a lista de materiais aparece embaixo e o "Desenho" sai com balões e tabela.
 - O painel direito lista as features em ordem; mude valores ali e a peça recalcula. Se o kernel reprovar
   uma mudança, ela volta sozinha com o motivo.
 - O kernel (50 MB) baixa só na primeira abertura; enquanto isso, a prévia em malha segura a ponta.
@@ -55,6 +59,8 @@ endereço no Safari e use Compartilhar ▸ Adicionar à Tela de Início.
 - `src/core/kernel/preview.ts` — prévia em malha (three.js) enquanto o kernel carrega.
 - `src/core/export/mesh.ts` — STL binário e OBJ com um grupo por face (polygroups no ZBrush).
 - `src/core/export/glb.ts` — GLB (glTF binário) em metros, para visualizadores e realidade aumentada.
+- `src/core/assembly/model.ts` — montagem: peças embutidas, instâncias, juntas (árvore), matrizes 4×4,
+  lista de materiais.
 - `src/core/drawing/` — desenho técnico: `layout.ts` (folha, vistas, escala, cotas, legenda), `pdf.ts`,
   `dxf.ts` (R12) e `svg.ts` (prévia). As projeções com linhas ocultas vêm de `kernel/occ/build.ts`.
 - `src/ui/` — janela 3D, desenho do esboço, aplicativo.
@@ -66,5 +72,5 @@ endereço no Safari e use Compartilhar ▸ Adicionar à Tela de Início.
 2. Sólidos com OpenCASCADE (WebAssembly): extrusão, corte, união, filete, chanfro, esboço em face, STEP (v0.2, feito).
 3. Revolução e exportação GLB (v0.3, feito). Varredura e empurrar/puxar faces ficam para depois.
 4. Desenho técnico ABNT em PDF e DXF (v0.4, feito). Cortes, detalhes e tolerâncias ficam para depois.
-5. Montagem com juntas, lista de materiais e balões.
+5. Montagem com juntas, lista de materiais e balões (v0.5, feito).
 6. Animação e simulação de movimento simples (v2).

@@ -2,7 +2,7 @@
 import { describe, it, expect, beforeAll } from 'vitest';
 import initOpenCascade from 'opencascade.js/dist/node.js';
 import type { OpenCascadeInstance } from 'opencascade.js';
-import { rebuildDocument, tessellate, exportSTEP, projectViews } from './build';
+import { rebuildDocument, tessellate, exportSTEP, projectViews, assemblyShapes } from './build';
 import { createDocument, addExtrude, addRevolve, addFillet, addBoolean, type ForjaDocument } from '../../document';
 import * as M from '../../sketch/model';
 
@@ -162,6 +162,20 @@ describe('kernel OpenCASCADE', () => {
     // Lateral esquerda: 20×60, o lado da frente (+z) fica à direita (X = z).
     expect(left.bbox[2] - left.bbox[0]).toBeCloseTo(20, 3); expect(left.bbox[3] - left.bbox[1]).toBeCloseTo(60, 3);
     expect(left.bbox[0]).toBeCloseTo(0, 3); expect(left.hidden.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('face cilíndrica traz eixo e raio; montagem com duas instâncias projeta o dobro da largura', () => {
+    const doc = createDocument(); const body = addExtrude(doc, rectSketch(doc, 'plane-xy', 0, 0, 100, 60).id, 20);
+    addExtrude(doc, circleSketch(doc, 'plane-xy', 50, 30, 10).id, 5, { op: 'cut', target: body.id, throughAll: true });
+    const m = tessellate(oc, rebuildDocument(oc, doc).bodies[0], 'c');
+    const cyl = m.faces.find((f) => f.type === 'cylinder')!;
+    expect(cyl.radius).toBeCloseTo(10, 5); expect(Math.abs(cyl.axisDir![2])).toBeCloseTo(1, 6); expect(cyl.axisOrigin![0]).toBeCloseTo(50, 5); expect(cyl.axisOrigin![1]).toBeCloseTo(30, 5);
+    const cache = new Map();
+    const shapes = assemblyShapes(oc, [{ id: 'p', doc }], [{ part: 'p', matrix: [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1] }, { part: 'p', matrix: [1, 0, 0, 120, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1] }], cache);
+    expect(shapes).toHaveLength(2); expect(cache.size).toBe(1);
+    const [front] = projectViews(oc, shapes, [{ name: 'front', n: [0, 0, 1], up: [0, 1, 0] }]);
+    expect(front.bbox[2] - front.bbox[0]).toBeCloseTo(220, 3); expect(front.circles).toHaveLength(2);
+    expect(exportSTEP(oc, shapes.map((shape, i) => ({ id: String(i), shape }))).length).toBeGreaterThan(1000);
   });
 
   it('exporta STEP com os corpos', () => {

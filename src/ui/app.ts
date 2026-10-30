@@ -18,11 +18,13 @@ import { KernelClient, SupersededError } from '../core/kernel/occ/client';
 import type { BodyData, FeatureError, RebuildResult } from '../core/kernel/occ/types';
 import { toSTL, toOBJ, fromBody, fromGeometry, type MeshData } from '../core/export/mesh';
 import { toGLB } from '../core/export/glb';
-import { layoutDrawing, viewSpecsFor, defaultDrawingSettings, SHEET_MM, STANDARD_SCALES, scaleLabel, type DrawingSettings } from '../core/drawing/layout';
+import { layoutDrawing, layoutAssemblyDrawing, projectPoint, viewSpecsFor, defaultDrawingSettings, SHEET_MM, STANDARD_SCALES, scaleLabel, type DrawingSettings, type BalloonAnchor } from '../core/drawing/layout';
+import { createAssemblyDocument } from '../core/document';
+import { addPart, addInstance, removeInstance, addJoint, removeJoint, jointOf, computeTransforms, frameFromFace, applyPoint, bomRows, JOINT_NAMES, type Assembly, type Frame, type JointType, type Mat4 } from '../core/assembly/model';
 import { toPDF } from '../core/drawing/pdf';
 import { toDXF } from '../core/drawing/dxf';
 import { toSVG } from '../core/drawing/svg';
-import type { ProjectedView } from '../core/kernel/occ/types';
+import type { ProjectedView, AssemblyPayload } from '../core/kernel/occ/types';
 import { saveLocal, loadLocal, downloadFile, pickFile, safeFileName } from './storage';
 import { type Vec2, v2, dist, distPointSegment, distPointArc, closestOnSegment, sub, add, scale, norm, angleOf, normAngle, TAU, round } from '../core/geom';
 
@@ -57,6 +59,11 @@ export class App {
   /** Corpos do último recálculo do kernel. */
   bodies: BodyData[] = [];
   featureErrors: FeatureError[] = [];
+  // Montagem
+  selectedInstance: Id | null = null;
+  private asmCache = new Map<Id, { key: string; bodies: BodyData[]; geoms: THREE.BufferGeometry[] }>();
+  private asmTransforms = new Map<Id, Mat4>();
+  private jointFlow: { type: JointType; moving?: { inst: Id; frame: Frame; planar: boolean } } | null = null;
   private busy = 0;
   private pointers = new Map<number, PointerInfo>();
   private pinch: { d0: number; mid: { x: number; y: number } } | null = null;
@@ -105,7 +112,7 @@ export class App {
     top.append(this.iconButton('undo', 'Desfazer', () => this.undo()), this.iconButton('redo', 'Refazer', () => this.redo()));
     const spacer = el('div', 'spacer'); top.append(spacer);
     this.statusEl = el('div', 'status'); top.append(this.statusEl);
-    top.append(this.button('Novo', () => this.newDocument()), this.button('Abrir', () => this.openFile()), this.button('Salvar', () => this.saveFile()), this.button('Exportar', (ev) => this.exportMenu(ev)));
+    top.append(this.button('Novo', (ev) => this.newDocument(ev)), this.button('Abrir', () => this.openFile()), this.button('Salvar', () => this.saveFile()), this.button('Exportar', (ev) => this.exportMenu(ev)));
     this.root.append(top);
     this.workspace = el('div', 'workspace'); this.root.append(this.workspace);
     this.overlay = el('div', 'overlay'); this.workspace.append(this.overlay);
@@ -130,6 +137,17 @@ export class App {
   // ---------- Estado e render ----------
   private get sketch(): Sketch | null { return this.activeSketch ? getSketch(this.doc.current, this.activeSketch) : null; }
   private get plane(): Plane | null { const s = this.sketch; return s ? getPlane(this.doc.current, s.plane) : null; }
+  get isAssembly(): boolean { return this.doc.current.kind === 'assembly' && !!this.doc.current.assembly; }
+  private get asm(): Assembly | null { return this.isAssembly ? this.doc.current.assembly! : null; }
+  /** Dados de malha de um corpo da cena: corpo da peça ou `instancia/corpo` de uma montagem. */
+  private bodyOf(id: Id | null | undefined): BodyData | undefined {
+    if (!id) return undefined;
+    if (!this.isAssembly) return this.bodies.find((b) => b.id === id);
+    const slash = id.indexOf('/'); if (slash < 0) return undefined;
+    const inst = this.asm!.instances.find((i) => i.id === id.slice(0, slash)); const cache = inst && this.asmCache.get(inst.part);
+    return cache?.bodies.find((b) => b.id === id.slice(slash + 1));
+  }
+  private instanceOf(renderId: Id | null | undefined): Id | null { if (!renderId || !this.isAssembly) return null; const i = renderId.indexOf('/'); return i < 0 ? null : renderId.slice(0, i); }
 
   private pushUndo(): void { this.undoStack.push(serialize(this.doc.current)); if (this.undoStack.length > 100) this.undoStack.shift(); this.redoStack = []; }
   undo(): void {
@@ -179,6 +197,7 @@ export class App {
   /** Pede ao kernel os corpos atuais. Enquanto ele não está pronto, mostra a prévia em malha. */
   private async rebuild(): Promise<RebuildResult | null> {
     const doc = this.doc.current;
+    if (this.isAssembly) { await this.rebuildAssembly(); return null; }
     if (this.kernel.state !== 'ready') {
       this.bodies = []; this.featureErrors = [];
       const preview = buildAllBodies(doc).map((b): RenderBody => ({ id: b.feature.id, name: bodyName(doc, b.feature.id), geometry: b.geometry }));
@@ -200,10 +219,209 @@ export class App {
   }
 
   private pruneSel3d(): void {
-    const has = (id: Id | null) => !!id && this.bodies.some((b) => b.id === id);
+    const has = (id: Id | null) => !!this.bodyOf(id);
     if (!has(this.sel3d.body)) this.sel3d.body = null;
-    if (this.sel3d.face && !(has(this.sel3d.face.body) && this.bodies.find((b) => b.id === this.sel3d.face!.body)!.faces.length > this.sel3d.face.index)) this.sel3d.face = null;
-    this.sel3d.edges = this.sel3d.edges.filter((e) => has(e.body) && this.bodies.find((b) => b.id === e.body)!.edges.length > e.index);
+    if (this.sel3d.face && !(has(this.sel3d.face.body) && this.bodyOf(this.sel3d.face.body)!.faces.length > this.sel3d.face.index)) this.sel3d.face = null;
+    this.sel3d.edges = this.sel3d.edges.filter((e) => has(e.body) && this.bodyOf(e.body)!.edges.length > e.index);
+  }
+
+  // ---------- Montagem ----------
+  /** Recalcula cada peça uma vez (cache por conteúdo), posiciona as instâncias pelas juntas e redesenha. */
+  private async rebuildAssembly(): Promise<void> {
+    const asm = this.asm; if (!asm) return;
+    if (this.kernel.state !== 'ready') { this.vp.setBodies([], this.sel3d); return; }
+    this.busy++; this.renderStatus();
+    try {
+      for (const part of asm.parts) {
+        const key = JSON.stringify({ s: part.doc.sketches, f: part.doc.features, p: part.doc.planes });
+        const cached = this.asmCache.get(part.id);
+        if (!cached || cached.key !== key) {
+          const r = await this.kernel.rebuildOnce(part.doc);
+          this.asmCache.set(part.id, { key, bodies: r.bodies, geoms: r.bodies.map((b) => toRenderBody(b).geometry) });
+          if (r.errors.length) this.toast(`${part.name}: ${r.errors.length} feature${r.errors.length > 1 ? 's' : ''} com erro.`, 'err');
+        }
+      }
+      for (const id of [...this.asmCache.keys()]) if (!asm.parts.some((p) => p.id === id)) this.asmCache.delete(id);
+      this.asmTransforms = computeTransforms(asm);
+      const list: RenderBody[] = [];
+      for (const inst of asm.instances) {
+        const cache = this.asmCache.get(inst.part); const m = this.asmTransforms.get(inst.id); if (!cache || !m) continue;
+        cache.bodies.forEach((b, i) => list.push({ id: `${inst.id}/${b.id}`, name: inst.name, geometry: cache.geoms[i], data: b, matrix: m }));
+      }
+      this.bodies = []; this.featureErrors = [];
+      this.pruneSel3d();
+      this.vp.setBodies(list, this.sel3d);
+      this.renderSidePanel(); this.renderToolbar();
+    } catch (e) { this.toast(`Montagem: ${(e as Error).message}`, 'err'); }
+    finally { this.busy--; this.renderStatus(); }
+  }
+
+  private assemblyPayload(): AssemblyPayload {
+    const asm = this.asm!;
+    return { parts: asm.parts.map((p) => ({ id: p.id, doc: p.doc })), instances: asm.instances.map((i) => ({ part: i.part, matrix: this.asmTransforms.get(i.id) ?? [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1] })) };
+  }
+
+  /** Malhas de todas as instâncias já no espaço do mundo (para STL, OBJ e GLB). */
+  private assemblyMeshes(): MeshData[] {
+    const out: MeshData[] = []; const asm = this.asm!;
+    for (const inst of asm.instances) {
+      const cache = this.asmCache.get(inst.part); const m = this.asmTransforms.get(inst.id); if (!cache || !m) continue;
+      for (const b of cache.bodies) {
+        const md = fromBody(b); const pos = new Float32Array(md.positions.length); const nrm = md.normals ? new Float32Array(md.normals.length) : undefined;
+        for (let i = 0; i < pos.length; i += 3) {
+          const p = applyPoint(m, [md.positions[i], md.positions[i + 1], md.positions[i + 2]]); pos[i] = p[0]; pos[i + 1] = p[1]; pos[i + 2] = p[2];
+          if (nrm && md.normals) { const n = md.normals; const d: V3 = [m[0] * n[i] + m[1] * n[i + 1] + m[2] * n[i + 2], m[4] * n[i] + m[5] * n[i + 1] + m[6] * n[i + 2], m[8] * n[i] + m[9] * n[i + 1] + m[10] * n[i + 2]]; nrm[i] = d[0]; nrm[i + 1] = d[1]; nrm[i + 2] = d[2]; }
+        }
+        out.push({ ...md, name: `${inst.name} ${b.name}`, positions: pos, normals: nrm });
+      }
+    }
+    return out;
+  }
+
+  newAssembly(withCurrent: boolean): void {
+    const cur = this.doc.current;
+    const go = () => {
+      const d = createAssemblyDocument(withCurrent ? `Montagem de ${cur.name}` : undefined);
+      if (withCurrent) { const part = addPart(d.assembly!, deserialize(serialize(cur)), cur.name); addInstance(d.assembly!, part.id); }
+      this.doc.current = d; this.undoStack = []; this.redoStack = []; this.activeSketch = null; this.mode = 'view'; this.selectedFeature = null; this.selectedInstance = null; this.sel = emptySelection(); this.sel3d = emptySel3D(); this.asmCache.clear();
+      this.vp.exitSketch(); this.titleEl.value = d.name; this.refreshAll(); this.vp.fitAll();
+    };
+    if (this.isAssembly || cur.features.length || cur.sketches.length) this.confirm('Nova montagem', withCurrent ? 'A peça atual vira a primeira peça da montagem (uma cópia). Salve a peça antes se quiser mantê-la separada.' : 'Descartar o documento atual? O autosave será substituído.', go); else go();
+  }
+
+  async importPart(): Promise<void> {
+    const asm = this.asm; if (!asm) return;
+    const f = await pickFile('.forja,application/json'); if (!f) return;
+    try {
+      const d = deserialize(f.text);
+      if (d.kind === 'assembly') return this.toast('Esse arquivo é uma montagem. Importe arquivos de peça.', 'err');
+      if (!d.features.length) return this.toast('Essa peça não tem corpos.', 'err');
+      this.pushUndo();
+      const part = addPart(asm, d, d.name); const inst = addInstance(asm, part.id, this.freeSpot());
+      this.selectedInstance = inst.id; this.refreshAll(); this.toast(`Peça "${part.name}" inserida.`);
+    } catch (e) { this.toast(`Não abriu: ${(e as Error).message}`, 'err'); }
+  }
+
+  /** Posição livre ao lado das instâncias existentes, para a nova não nascer dentro de outra. */
+  private freeSpot(): V3 {
+    let maxX = 0;
+    for (const inst of this.asm!.instances) { const c = this.asmCache.get(inst.part); const m = this.asmTransforms.get(inst.id); if (!c || !m) continue; for (const b of c.bodies) for (const x of [b.bbox[0][0], b.bbox[1][0]]) for (const y of [b.bbox[0][1], b.bbox[1][1]]) for (const z of [b.bbox[0][2], b.bbox[1][2]]) maxX = Math.max(maxX, applyPoint(m, [x, y, z])[0]); }
+    return [this.asm!.instances.length ? maxX + 30 : 0, 0, 0];
+  }
+
+  insertInstance(partId: Id): void {
+    const asm = this.asm; if (!asm) return;
+    this.pushUndo(); const inst = addInstance(asm, partId, this.freeSpot()); this.selectedInstance = inst.id; this.refreshAll();
+  }
+
+  startJoint(type: JointType, moving?: { inst: Id; frame: Frame; planar: boolean }): void {
+    this.jointFlow = { type, moving }; this.closeMenus();
+    this.toast(moving ? `${JOINT_NAMES[type]}: agora toque na face da peça base.` : `${JOINT_NAMES[type]}: toque na face da peça que vai se mover.`);
+    this.renderStatus(); this.renderToolbar();
+  }
+  private cancelJoint(): void { this.jointFlow = null; this.renderStatus(); this.renderToolbar(); }
+
+  /** Toque numa face em modo montagem: passo do fluxo de junta ou seleção da instância. */
+  private tapAssemblyFace(renderId: Id, faceIndex: number, x: number, y: number): void {
+    const asm = this.asm!; const inst = this.instanceOf(renderId); const fd = this.bodyOf(renderId)?.faces[faceIndex]; if (!inst) return;
+    const frame = fd ? frameFromFace(fd) : null; const planar = fd?.type === 'plane';
+    if (this.jointFlow) {
+      if (!frame) return this.toast('Use uma face plana ou cilíndrica para a junta.', 'err');
+      if (!this.jointFlow.moving) { this.jointFlow.moving = { inst, frame, planar }; this.sel3d = { body: renderId, face: { body: renderId, index: faceIndex }, edges: [] }; this.vp.setSelection(this.sel3d); this.toast('Agora toque na face da peça base.'); this.renderStatus(); return; }
+      if (this.jointFlow.moving.inst === inst) return this.toast('Escolha uma face de outra peça.', 'err');
+      const { type, moving } = this.jointFlow;
+      try {
+        this.pushUndo();
+        const j = addJoint(asm, type, moving.inst, moving.frame, inst, frame, moving.planar && planar);
+        this.jointFlow = null; this.selectedInstance = moving.inst; this.sel3d = emptySel3D();
+        this.refreshAll(); this.toast(`${j.name} criada. Ajuste ângulo ou curso no painel.`);
+      } catch (e) { this.undoStack.pop(); this.toast((e as Error).message, 'err'); }
+      return;
+    }
+    const same = this.selectedInstance === inst && this.sel3d.face?.body === renderId && this.sel3d.face.index === faceIndex;
+    this.selectedInstance = inst;
+    this.sel3d = same ? { body: renderId, face: null, edges: [] } : { body: renderId, face: { body: renderId, index: faceIndex }, edges: [] };
+    this.vp.setSelection(this.sel3d); this.renderSidePanel(); this.renderToolbar();
+    if (!same && frame && asm.instances.length > 1) {
+      const items = (['fixed', 'revolute', 'slider', 'cylindrical'] as JointType[]).map((t) => ({ label: `${JOINT_NAMES[t]} a partir desta face`, action: () => this.startJoint(t, { inst, frame, planar }) }));
+      this.menu(x + 10, y + 10, items);
+    }
+  }
+
+  private deleteInstance(id: Id): void {
+    const asm = this.asm; if (!asm) return;
+    this.pushUndo(); removeInstance(asm, id); if (this.selectedInstance === id) this.selectedInstance = null; this.sel3d = emptySel3D(); this.refreshAll();
+  }
+
+  private renderAssemblyPanel(p: HTMLElement): void {
+    const asm = this.asm!; const doc = this.doc.current;
+    const numRow = (label: string, value: number, onChange: (v: number) => void, step = 1) => {
+      const row = el('div', 'row'); const lab = document.createElement('label'); lab.textContent = label;
+      const inp = document.createElement('input'); inp.type = 'number'; inp.step = String(step); inp.value = String(Math.round(value * 100) / 100); inp.inputMode = 'decimal';
+      inp.addEventListener('change', () => { const v = parseFloat(inp.value.replace(',', '.')); if (!isFinite(v)) return; onChange(v); });
+      row.append(lab, inp); p.append(row);
+    };
+    if (this.jointFlow) {
+      p.append(h3('Nova junta'));
+      const d = el('div', 'hint'); d.textContent = `${JOINT_NAMES[this.jointFlow.type]}: ${this.jointFlow.moving ? 'toque na face da peça base.' : 'toque na face da peça que vai se mover.'} Faces planas encostam; faces cilíndricas alinham o eixo.`; p.append(d);
+      const row = el('div', 'row'); row.append(this.button('Cancelar', () => this.cancelJoint())); p.append(row);
+    }
+    const inst = asm.instances.find((i) => i.id === this.selectedInstance);
+    if (inst) {
+      p.append(h3('Instância'));
+      const nameRow = el('div', 'row'); const nameInp = document.createElement('input'); nameInp.type = 'text'; nameInp.value = inst.name; nameInp.spellcheck = false;
+      nameInp.addEventListener('change', () => { this.pushUndo(); inst.name = nameInp.value.trim().slice(0, 60) || inst.name; this.refreshAll(); }); nameRow.append(nameInp); p.append(nameRow);
+      const j = jointOf(asm, inst.id);
+      if (j) {
+        const base = asm.instances.find((i) => i.id === j.base);
+        const d = el('div', 'hint'); d.textContent = `${j.name}, presa em ${base?.name ?? '?'}.`; p.append(d);
+        if (j.type === 'revolute' || j.type === 'cylindrical') numRow('Ângulo (°)', j.angle, (v) => { this.pushUndo(); j.angle = v; this.refreshAll(); }, 5);
+        if (j.type === 'slider' || j.type === 'cylindrical') numRow('Curso (mm)', j.distance, (v) => { this.pushUndo(); j.distance = v; this.refreshAll(); }, 1);
+        const fr = el('div', 'row'); const fl = document.createElement('label'); fl.textContent = 'Inverter eixo'; const chk = document.createElement('input'); chk.type = 'checkbox'; chk.checked = !!j.flip;
+        chk.addEventListener('change', () => { this.pushUndo(); j.flip = chk.checked; this.refreshAll(); }); fr.append(fl, chk); p.append(fr);
+        const row = el('div', 'row'); row.append(this.button('Remover junta', () => { this.pushUndo(); removeJoint(asm, j.id); this.refreshAll(); }, 'btn danger')); p.append(row);
+      } else {
+        const d = el('div', 'hint'); d.textContent = 'Instância livre. Posicione por números ou crie uma junta tocando numa face.'; p.append(d);
+        (['X', 'Y', 'Z'] as const).forEach((ax, i) => numRow(`Posição ${ax} (mm)`, inst.pos[i], (v) => { this.pushUndo(); inst.pos[i] = v; this.refreshAll(); }));
+        (['X', 'Y', 'Z'] as const).forEach((ax, i) => numRow(`Rotação ${ax} (°)`, inst.rot[i], (v) => { this.pushUndo(); inst.rot[i] = v; this.refreshAll(); }, 15));
+      }
+      const row = el('div', 'row');
+      row.append(this.button('Duplicar', () => this.insertInstance(inst.part)), this.button('Apagar', () => this.deleteInstance(inst.id), 'btn danger'));
+      p.append(row);
+    }
+    p.append(h3(`Peças (${asm.parts.length})`));
+    const plist = el('div', 'list');
+    for (const part of asm.parts) {
+      const n = asm.instances.filter((i) => i.part === part.id).length;
+      const it = listItem(part.name, `${n}× · +`); it.title = 'Toque para inserir mais uma';
+      it.addEventListener('click', () => this.insertInstance(part.id)); plist.append(it);
+    }
+    const imp = this.button('Importar peça (.forja)', () => void this.importPart()); plist.append(imp);
+    if (!asm.parts.length) { const d = el('div', 'hint'); d.textContent = 'Salve cada peça como .forja no modo peça e importe aqui. Ou use "Novo ▸ Nova montagem com esta peça".'; plist.append(d); }
+    p.append(plist);
+    p.append(h3(`Instâncias (${asm.instances.length})`));
+    const ilist = el('div', 'list');
+    for (const i of asm.instances) {
+      const j = jointOf(asm, i.id);
+      const it = listItem(i.name, j ? JOINT_NAMES[j.type] : 'livre'); if (this.selectedInstance === i.id) it.classList.add('active');
+      it.addEventListener('click', () => { this.selectedInstance = this.selectedInstance === i.id ? null : i.id; this.sel3d = emptySel3D(); const c = this.asmCache.get(i.part); if (this.selectedInstance && c?.bodies[0]) this.sel3d.body = `${i.id}/${c.bodies[0].id}`; this.vp.setSelection(this.sel3d); this.renderSidePanel(); this.renderToolbar(); });
+      ilist.append(it);
+    }
+    p.append(ilist);
+    if (asm.joints.length) {
+      p.append(h3(`Juntas (${asm.joints.length})`));
+      const jl = el('div', 'list');
+      for (const j of asm.joints) { const it = listItem(j.name, j.type === 'revolute' ? `${fmtDim('angle', j.angle)}` : j.type === 'slider' ? `${fmtDim('distance', j.distance)} mm` : j.type === 'cylindrical' ? `${fmtDim('angle', j.angle)} · ${fmtDim('distance', j.distance)} mm` : ''); it.addEventListener('click', () => { this.selectedInstance = j.moving; this.renderSidePanel(); }); jl.append(it); }
+      p.append(jl);
+    }
+    const rows = bomRows(asm);
+    if (rows.length) {
+      p.append(h3('Lista de materiais'));
+      const bl = el('div', 'list');
+      for (const r of rows) { const vol = (this.asmCache.get(r.part)?.bodies ?? []).reduce((a, b) => a + b.volume, 0); bl.append(listItem(`${r.item}. ${r.name}`, `${r.qty}× · ${fmtMm3(vol)}${r.material ? ' · ' + r.material : ''}`)); }
+      p.append(bl);
+    }
+    const info = el('div', 'hint'); info.textContent = `Montagem "${doc.name}": as peças ficam embutidas no arquivo .forja. "Desenho" gera o conjunto com balões e lista de materiais.`; p.append(info);
   }
 
   /** Aplica uma mudança de feature e desfaz sozinho se o kernel reprovar. */
@@ -227,6 +445,14 @@ export class App {
 
   private renderStatus(): void {
     const s = this.sketch;
+    if (!s && this.isAssembly) {
+      const asm = this.asm!; let txt: string; let cls = 'status';
+      if (this.jointFlow) { txt = this.jointFlow.moving ? 'Junta: toque na face da peça base' : 'Junta: toque na face da peça móvel'; cls = 'status warn'; }
+      else if (this.busy) txt = 'Calculando…';
+      else if (this.kernel.state !== 'ready') { txt = this.kernel.state === 'loading' ? 'Carregando kernel 3D…' : 'Kernel 3D indisponível'; cls = 'status err'; }
+      else txt = asm.instances.length ? `Montagem: ${asm.instances.length} peça${asm.instances.length > 1 ? 's' : ''}, ${asm.joints.length} junta${asm.joints.length !== 1 ? 's' : ''}` : 'Montagem vazia: importe uma peça';
+      this.statusEl.textContent = txt; this.statusEl.className = cls; return;
+    }
     if (!s) {
       const n = this.bodies.length; const errs = this.featureErrors.length;
       let txt: string; let cls = 'status';
@@ -257,6 +483,15 @@ export class App {
       g3.append(this.iconButton('revolve', 'Revolucionar', () => this.revolveActive()));
       g3.append(this.iconButton('done', 'Concluir', () => this.exitSketch(true)));
       this.toolbar.append(g1, g2, g3);
+    } else if (this.isAssembly) {
+      const asm = this.asm!;
+      g1.append(this.iconButton('plus', 'Inserir', (ev) => { const items = asm.parts.map((p) => ({ label: `Inserir ${p.name}`, action: () => this.insertInstance(p.id) })); items.push({ label: 'Importar peça (.forja)…', action: () => void this.importPart() }); this.menu(ev.clientX, ev.clientY, items); }));
+      const jb = this.iconButton('joint', this.jointFlow ? 'Cancelar junta' : 'Junta', (ev) => { if (this.jointFlow) return this.cancelJoint(); this.menu(ev.clientX, ev.clientY, (['fixed', 'revolute', 'slider', 'cylindrical'] as JointType[]).map((t) => ({ label: JOINT_NAMES[t], action: () => this.startJoint(t) }))); });
+      jb.disabled = asm.instances.length < 2 && !this.jointFlow; if (this.jointFlow) jb.classList.add('active'); g1.append(jb);
+      g2.append(this.iconButton('drawing', 'Desenho', () => void this.drawingDialog()));
+      g2.append(this.iconButton('view', 'Vistas', (ev) => this.viewMenu(ev)));
+      g2.append(this.iconButton('fit', 'Enquadrar', () => this.vp.fitAll()));
+      this.toolbar.append(g1, g2);
     } else {
       g1.append(this.iconButton('sketch', 'Esboço', (ev) => this.newSketchMenu(ev)));
       g1.append(this.iconButton('extrude', 'Extrudar', (ev) => this.extrudeMenu(ev)));
@@ -273,7 +508,7 @@ export class App {
   }
 
   private faceIsPlanar(ref: { body: Id; index: number }): boolean {
-    const f = this.bodies.find((b) => b.id === ref.body)?.faces[ref.index]; return !!f && f.type === 'plane';
+    const f = this.bodyOf(ref.body)?.faces[ref.index]; return !!f && f.type === 'plane';
   }
 
   private renderSidePanel(): void {
@@ -313,6 +548,8 @@ export class App {
       }
       return;
     }
+
+    if (this.isAssembly) { this.renderAssemblyPanel(p); return; }
 
     // ----- Modo vista -----
     this.renderSelectionPanel(p);
@@ -682,6 +919,12 @@ export class App {
   private tapView(info: PointerInfo): void {
     if (this.mode !== 'view') return;
     const faceHit = this.vp.pickFace(info.x, info.y);
+    if (this.isAssembly) {
+      if (faceHit && faceHit.index >= 0) { this.tapAssemblyFace(faceHit.body, faceHit.index, info.x, info.y); return; }
+      if (this.jointFlow) return;
+      if (this.selectedInstance || this.sel3d.body) { this.selectedInstance = null; this.clearSel3d(); }
+      return;
+    }
     const edgeHit = this.vp.pickEdge(info.x, info.y, info.type === 'touch' ? 14 : 9, faceHit);
     if (edgeHit) {
       if (this.sel3d.edges.length && this.sel3d.edges[0].body !== edgeHit.body) this.sel3d.edges = [];
@@ -1085,14 +1328,19 @@ export class App {
   }
 
   // ---------- Arquivos ----------
-  newDocument(): void {
-    this.confirm('Novo documento', 'Descartar o documento atual? O autosave será substituído. Salve antes se precisar.', () => {
-      this.doc.current = createDocument(); this.undoStack = []; this.redoStack = []; this.activeSketch = null; this.mode = 'view'; this.selectedFeature = null; this.sel = emptySelection(); this.sel3d = emptySel3D(); this.vp.exitSketch(); this.titleEl.value = this.doc.current.name; this.refreshAll(); this.vp.fitAll();
-    });
+  newDocument(ev?: MouseEvent): void {
+    const items = [
+      { label: 'Nova peça', action: () => this.confirm('Nova peça', 'Descartar o documento atual? O autosave será substituído. Salve antes se precisar.', () => {
+        this.doc.current = createDocument(); this.undoStack = []; this.redoStack = []; this.activeSketch = null; this.mode = 'view'; this.selectedFeature = null; this.selectedInstance = null; this.sel = emptySelection(); this.sel3d = emptySel3D(); this.asmCache.clear(); this.vp.exitSketch(); this.titleEl.value = this.doc.current.name; this.refreshAll(); this.vp.fitAll();
+      }) },
+      { label: 'Nova montagem vazia', action: () => this.newAssembly(false) },
+    ];
+    if (!this.isAssembly && this.doc.current.features.length) items.push({ label: 'Nova montagem com esta peça', action: () => this.newAssembly(true) });
+    if (ev) this.menu(ev.clientX, ev.clientY, items); else items[0].action();
   }
   async openFile(): Promise<void> {
     const f = await pickFile('.forja,application/json'); if (!f) return;
-    try { const d = deserialize(f.text); this.doc.current = d; this.undoStack = []; this.redoStack = []; this.activeSketch = null; this.mode = 'view'; this.selectedFeature = null; this.sel3d = emptySel3D(); this.vp.exitSketch(); this.titleEl.value = d.name; this.refreshAll(); this.vp.fitAll(); this.toast(`Aberto: ${f.name}`); }
+    try { const d = deserialize(f.text); this.doc.current = d; this.undoStack = []; this.redoStack = []; this.activeSketch = null; this.mode = 'view'; this.selectedFeature = null; this.selectedInstance = null; this.sel3d = emptySel3D(); this.asmCache.clear(); this.jointFlow = null; this.vp.exitSketch(); this.titleEl.value = d.name; this.refreshAll(); this.vp.fitAll(); this.toast(`Aberto: ${f.name}${d.kind === 'assembly' ? ' (montagem)' : ''}`); }
     catch (e) { this.toast(`Não abriu: ${(e as Error).message}`, 'err'); }
   }
   saveFile(): void { downloadFile(`${safeFileName(this.doc.current.name)}.forja`, serialize(this.doc.current), 'application/json'); this.toast('Arquivo .forja gerado.'); }
@@ -1114,6 +1362,7 @@ export class App {
     } catch (e) { this.toast(`GLB falhou: ${(e as Error).message}`, 'err'); }
   }
   private exportMeshes(): MeshData[] {
+    if (this.isAssembly) return this.assemblyMeshes();
     if (this.bodies.length) return this.bodies.map(fromBody);
     return buildAllBodies(this.doc.current).map((b) => fromGeometry(bodyName(this.doc.current, b.feature.id), b.geometry));
   }
@@ -1126,9 +1375,10 @@ export class App {
   }
   private async exportStep(): Promise<void> {
     if (this.kernel.state !== 'ready') return this.toast('O STEP precisa do kernel 3D carregado.', 'err');
-    if (!this.bodies.length) return this.toast('Nenhum corpo para exportar.', 'err');
+    if (!this.isAssembly && !this.bodies.length) return this.toast('Nenhum corpo para exportar.', 'err');
+    if (this.isAssembly && !this.asm!.instances.length) return this.toast('Montagem vazia.', 'err');
     try {
-      const text = await this.kernel.exportStep();
+      const text = this.isAssembly ? await this.kernel.exportStepAssembly(this.assemblyPayload()) : await this.kernel.exportStep();
       downloadFile(`${safeFileName(this.doc.current.name)}.step`, text, 'application/step');
       this.toast('STEP gerado.');
     } catch (e) { this.toast(`STEP falhou: ${(e as Error).message}`, 'err'); }
@@ -1138,9 +1388,10 @@ export class App {
   /** Diálogo do desenho técnico: prévia ao vivo, opções da folha e exportação em PDF ou DXF. */
   private async drawingDialog(): Promise<void> {
     if (this.kernel.state !== 'ready') return this.toast('O desenho técnico precisa do kernel 3D carregado.', 'err');
-    if (!this.bodies.length) return this.toast('Crie um corpo antes de gerar o desenho.', 'err');
+    if (!this.isAssembly && !this.bodies.length) return this.toast('Crie um corpo antes de gerar o desenho.', 'err');
+    if (this.isAssembly && !this.asm!.instances.length) return this.toast('Insira peças na montagem antes de gerar o desenho.', 'err');
     const doc = this.doc.current;
-    const settings: DrawingSettings = doc.drawing ?? defaultDrawingSettings(doc.name);
+    const settings: DrawingSettings = doc.drawing ?? { ...defaultDrawingSettings(doc.name), dimensions: !this.isAssembly };
     doc.drawing = settings;
     const back = el('div', 'dialog-backdrop'); const d = el('div', 'dialog wide');
     const hh = document.createElement('h2'); hh.textContent = 'Desenho técnico'; d.append(hh);
@@ -1158,8 +1409,19 @@ export class App {
       busy = true;
       try {
         const specs = viewSpecsFor(settings); const key = JSON.stringify(specs);
-        if (key !== viewsKey) { status.textContent = 'Projetando vistas…'; views = await this.kernel.project(specs); viewsKey = key; }
-        drawing = layoutDrawing(views, settings, meta());
+        if (key !== viewsKey) { status.textContent = 'Projetando vistas…'; views = this.isAssembly ? await this.kernel.projectAssembly(this.assemblyPayload(), specs) : await this.kernel.project(specs); viewsKey = key; }
+        if (this.isAssembly) {
+          const asm = this.asm!; const rows = bomRows(asm);
+          const balloonView = specs.find((v) => v.name === 'iso') ?? specs[0];
+          const anchors: BalloonAnchor[] = [];
+          if (balloonView) for (const r of rows) for (const instId of r.instances) {
+            const inst = asm.instances.find((i) => i.id === instId); const c = inst && this.asmCache.get(inst.part); const m = inst && this.asmTransforms.get(inst.id); if (!c || !m || !c.bodies.length) continue;
+            let sx = 0, sy = 0, sz = 0, n = 0;
+            for (const b of c.bodies) { const q = applyPoint(m, [(b.bbox[0][0] + b.bbox[1][0]) / 2, (b.bbox[0][1] + b.bbox[1][1]) / 2, (b.bbox[0][2] + b.bbox[1][2]) / 2]); sx += q[0]; sy += q[1]; sz += q[2]; n++; }
+            const [X, Y] = projectPoint(balloonView, [sx / n, sy / n, sz / n]); anchors.push({ item: r.item, view: balloonView.name, X, Y });
+          }
+          drawing = layoutAssemblyDrawing(views, settings, meta(), rows, anchors);
+        } else drawing = layoutDrawing(views, settings, meta());
         const svgDoc = new DOMParser().parseFromString(toSVG(drawing), 'image/svg+xml');
         preview.innerHTML = ''; preview.append(document.importNode(svgDoc.documentElement, true));
         status.textContent = `${settings.sheet} paisagem · escala ${scaleLabel(drawing.scale)} · ${settings.projection === 'first' ? '1º' : '3º'} diedro · ${views.reduce((a, v) => a + v.visible.length + v.hidden.length, 0)} arestas projetadas`;

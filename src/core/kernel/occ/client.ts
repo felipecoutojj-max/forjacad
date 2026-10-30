@@ -2,15 +2,15 @@
 // (se chegam vários pedidos enquanto um roda, só o último vale).
 
 import type { ForjaDocument } from '../../document';
-import type { KernelRequest, KernelResponse, RebuildResult, ViewSpec, ProjectedView } from './types';
+import type { KernelRequest, KernelResponse, RebuildResult, ViewSpec, ProjectedView, AssemblyPayload } from './types';
 
-type RequestBody = { type: 'rebuild'; doc: ForjaDocument } | { type: 'export'; format: 'step' } | { type: 'project'; views: ViewSpec[] };
+type RequestBody = { type: 'rebuild'; doc: ForjaDocument } | { type: 'export'; format: 'step' } | { type: 'project'; views: ViewSpec[] } | { type: 'projectAssembly'; assembly: AssemblyPayload; views: ViewSpec[] } | { type: 'exportAssembly'; assembly: AssemblyPayload };
 
 export type KernelState = 'loading' | 'ready' | 'failed';
 
 export class SupersededError extends Error { constructor() { super('recálculo substituído por outro mais novo'); this.name = 'SupersededError'; } }
 
-interface Pending { resolve: (v: never) => void; reject: (e: Error) => void; kind: KernelRequest['type']; }
+interface Pending { resolve: (v: never) => void; reject: (e: Error) => void; kind: KernelRequest['type']; coalesced?: boolean; }
 
 export class KernelClient {
   state: KernelState = 'loading';
@@ -42,24 +42,35 @@ export class KernelClient {
     if (m.type === 'ready') { this.state = 'ready'; this.loadMs = m.ms; this.onState?.(this.state); return; }
     if (m.type === 'failed') { this.fail(m.message); return; }
     const p = this.pending.get(m.id); if (!p) return; this.pending.delete(m.id);
-    if (p.kind === 'rebuild') { this.rebuildInFlight = false; }
+    if (p.coalesced) { this.rebuildInFlight = false; }
     if (m.type === 'error') p.reject(new Error(m.message));
     else if (m.type === 'rebuilt') p.resolve(m.result as never);
     else if (m.type === 'exported') p.resolve(m.data as never);
     else if (m.type === 'projected') p.resolve(m.views as never);
-    if (p.kind === 'rebuild' && this.queued) { const q = this.queued; this.queued = null; this.startRebuild(q.doc, q.resolve, q.reject); }
+    if (p.coalesced && this.queued) { const q = this.queued; this.queued = null; this.startRebuild(q.doc, q.resolve, q.reject); }
   }
 
-  private send(req: RequestBody, resolve: (v: never) => void, reject: (e: Error) => void): void {
+  private send(req: RequestBody, resolve: (v: never) => void, reject: (e: Error) => void, coalesced = false): void {
     if (!this.worker || this.state === 'failed') { reject(new Error(this.failure || 'kernel indisponível')); return; }
     const id = this.seq++;
-    this.pending.set(id, { resolve, reject, kind: req.type });
+    this.pending.set(id, { resolve, reject, kind: req.type, coalesced });
     const msg: KernelRequest = { ...req, id }; this.worker.postMessage(msg);
   }
 
   private startRebuild(doc: ForjaDocument, resolve: (v: RebuildResult) => void, reject: (e: Error) => void): void {
     this.rebuildInFlight = true;
-    this.send({ type: 'rebuild', doc }, resolve as (v: never) => void, reject);
+    this.send({ type: 'rebuild', doc }, resolve as (v: never) => void, reject, true);
+  }
+
+  /** Recálculo avulso (peça de uma montagem): não entra na fila coalescida do documento principal. */
+  rebuildOnce(doc: ForjaDocument): Promise<RebuildResult> {
+    return new Promise((resolve, reject) => this.send({ type: 'rebuild', doc }, resolve as (v: never) => void, reject));
+  }
+  projectAssembly(assembly: AssemblyPayload, views: ViewSpec[]): Promise<ProjectedView[]> {
+    return new Promise((resolve, reject) => this.send({ type: 'projectAssembly', assembly, views }, resolve as (v: never) => void, reject));
+  }
+  exportStepAssembly(assembly: AssemblyPayload): Promise<string> {
+    return new Promise((resolve, reject) => this.send({ type: 'exportAssembly', assembly }, resolve as (v: never) => void, reject));
   }
 
   /** Recalcula o documento. Um pedido anterior ainda na fila é rejeitado com SupersededError. */

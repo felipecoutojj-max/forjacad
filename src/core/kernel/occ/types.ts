@@ -11,6 +11,8 @@ export interface FaceData {
   triStart: number; triCount: number;
   /** Para faces planas: origem, normal para fora e eixos do plano. */
   origin?: V3; normal?: V3; u?: V3; v?: V3;
+  /** Para cilindros: eixo e raio. */
+  axisOrigin?: V3; axisDir?: V3; radius?: number;
   /** Centro geométrico aproximado (média dos vértices da malha). */
   center: V3;
 }
@@ -48,10 +50,15 @@ export interface ProjectedView {
 
 export interface RebuildResult { bodies: BodyData[]; errors: FeatureError[]; ms: number; }
 
+/** Conjunto para projeção/exportação: peças (documentos) e instâncias com matriz 4×4 em linha-maior. */
+export interface AssemblyPayload { parts: { id: Id; doc: ForjaDocument }[]; instances: { part: Id; matrix: number[] }[]; }
+
 export type KernelRequest =
   | { id: number; type: 'rebuild'; doc: ForjaDocument }
   | { id: number; type: 'export'; format: 'step' }
-  | { id: number; type: 'project'; views: ViewSpec[] };
+  | { id: number; type: 'project'; views: ViewSpec[] }
+  | { id: number; type: 'projectAssembly'; assembly: AssemblyPayload; views: ViewSpec[] }
+  | { id: number; type: 'exportAssembly'; assembly: AssemblyPayload };
 
 export type KernelResponse =
   | { id: 0; type: 'ready'; ms: number }

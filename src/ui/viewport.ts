@@ -11,7 +11,7 @@ import type { Id } from '../core/sketch/model';
 export type ViewMode = 'view' | 'sketch';
 
 /** Corpo para desenhar: malha do kernel (com `data`) ou prévia (só geometria). */
-export interface RenderBody { id: Id; name: string; geometry: THREE.BufferGeometry; data?: BodyData; }
+export interface RenderBody { id: Id; name: string; geometry: THREE.BufferGeometry; data?: BodyData; /** 4×4 em linha-maior (instância de montagem). */ matrix?: number[]; }
 
 /** Seleção em modo vista. Arestas selecionadas pertencem sempre a um único corpo. */
 export interface Sel3D { body: Id | null; face: { body: Id; index: number } | null; edges: { body: Id; index: number }[]; }
@@ -34,6 +34,7 @@ export class Viewport {
   private planeMeshes = new Map<string, THREE.Mesh>();
   private bodyMeshes = new Map<Id, THREE.Mesh>();
   private bodyData = new Map<Id, BodyData>();
+  private bodyMatrix = new Map<Id, THREE.Matrix4>();
   private grid: THREE.Object3D | null = null;
   private axes: THREE.Object3D | null = null;
   private pending = false;
@@ -108,14 +109,20 @@ export class Viewport {
 
   /** Substitui os corpos da cena e aplica a seleção (corpo, face, arestas). */
   setBodies(list: RenderBody[], sel: Sel3D): void {
-    this.bodies.clear(); this.bodyMeshes.clear(); this.bodyData.clear();
+    this.bodies.clear(); this.bodyMeshes.clear(); this.bodyData.clear(); this.bodyMatrix.clear();
     // A grade vira piso: fica logo abaixo do ponto mais baixo dos corpos.
     let minY = 0;
-    for (const b of list) { b.geometry.computeBoundingBox(); const bb = b.geometry.boundingBox; if (bb) minY = Math.min(minY, bb.min.y); }
+    for (const b of list) {
+      b.geometry.computeBoundingBox(); const bb = b.geometry.boundingBox?.clone(); if (!bb) continue;
+      if (b.matrix) bb.applyMatrix4(new THREE.Matrix4().fromArray(b.matrix).transpose());
+      minY = Math.min(minY, bb.min.y);
+    }
     if (this.grid) this.grid.position.y = minY - 0.5;
     for (const b of list) {
       const mesh = new THREE.Mesh(b.geometry, b.id === sel.body ? this.bodySelMaterial : this.bodyMaterial);
       mesh.userData.bodyId = b.id;
+      const mat = b.matrix ? new THREE.Matrix4().fromArray(b.matrix).transpose() : new THREE.Matrix4();
+      mesh.matrixAutoUpdate = false; mesh.matrix.copy(mat); this.bodyMatrix.set(b.id, mat);
       if (b.data) {
         this.bodyData.set(b.id, b.data);
         const segs: number[] = [];
@@ -126,8 +133,11 @@ export class Viewport {
       }
       this.bodies.add(mesh); this.bodyMeshes.set(b.id, mesh);
     }
+    this.bodies.updateMatrixWorld(true);
     this.setSelection(sel);
   }
+
+  bodyMatrixOf(id: Id): THREE.Matrix4 { return this.bodyMatrix.get(id) ?? new THREE.Matrix4(); }
 
   /** Redesenha só os destaques de face e aresta. */
   setSelection(sel: Sel3D): void {
@@ -140,17 +150,18 @@ export class Viewport {
         const g = new THREE.BufferGeometry();
         g.setAttribute('position', mesh.geometry.getAttribute('position'));
         g.setIndex(new THREE.BufferAttribute(data.indices.slice(f.triStart * 3, (f.triStart + f.triCount) * 3), 1));
-        const hl = new THREE.Mesh(g, this.faceSelMaterial); hl.renderOrder = 5; this.highlights.add(hl);
+        const hl = new THREE.Mesh(g, this.faceSelMaterial); hl.renderOrder = 5; hl.matrixAutoUpdate = false; hl.matrix.copy(mesh.matrix); this.highlights.add(hl);
       }
     }
     for (const e of sel.edges) {
       const data = this.bodyData.get(e.body); const ed = data?.edges[e.index]; if (!ed) continue;
-      const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.Float32BufferAttribute(ed.points, 3));
+      const mat = this.bodyMatrixOf(e.body);
+      const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.Float32BufferAttribute(ed.points, 3)); g.applyMatrix4(mat);
       const line = new THREE.Line(g, this.edgeSelMaterial); line.renderOrder = 6; this.highlights.add(line);
       // Pontas marcadas para a aresta ficar visível mesmo fininha.
       for (const k of [0, ed.points.length - 3]) {
         const s = new THREE.Mesh(new THREE.SphereGeometry(this.worldPerPixel() * 3, 8, 6), this.edgeSelMaterial as unknown as THREE.Material);
-        s.position.set(ed.points[k], ed.points[k + 1], ed.points[k + 2]); s.renderOrder = 6; this.highlights.add(s);
+        s.position.set(ed.points[k], ed.points[k + 1], ed.points[k + 2]).applyMatrix4(mat); s.renderOrder = 6; this.highlights.add(s);
       }
     }
     this.requestRender();
@@ -311,10 +322,11 @@ export class Viewport {
     const cam = this.camera; const camPos = new THREE.Vector3().setFromMatrixPosition(cam.matrixWorld);
     const a = new THREE.Vector3(), b = new THREE.Vector3(), q = new THREE.Vector3();
     for (const [body, data] of this.bodyData) {
+      const mat = this.bodyMatrixOf(body);
       for (const e of data.edges) {
         const pts = e.points;
         for (let i = 0; i + 5 < pts.length; i += 3) {
-          a.set(pts[i], pts[i + 1], pts[i + 2]); b.set(pts[i + 3], pts[i + 4], pts[i + 5]);
+          a.set(pts[i], pts[i + 1], pts[i + 2]).applyMatrix4(mat); b.set(pts[i + 3], pts[i + 4], pts[i + 5]).applyMatrix4(mat);
           const sa = this.worldToScreen(a), sb = this.worldToScreen(b);
           const dx = sb.x - sa.x, dy = sb.y - sa.y; const L2 = dx * dx + dy * dy;
           const t = L2 > 0 ? Math.max(0, Math.min(1, ((x - sa.x) * dx + (y - sa.y) * dy) / L2)) : 0;

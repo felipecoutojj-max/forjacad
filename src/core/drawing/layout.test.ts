@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { layoutDrawing, defaultDrawingSettings, viewSpecsFor, STANDARD_SCALES, scaleLabel } from './layout';
+import { layoutDrawing, layoutAssemblyDrawing, projectPoint, defaultDrawingSettings, viewSpecsFor, STANDARD_SCALES, scaleLabel } from './layout';
 import { toPDF } from './pdf';
 import { toDXF } from './dxf';
 import { toSVG } from './svg';
@@ -52,6 +52,19 @@ describe('layout do desenho', () => {
     expect(d.primitives.some((p) => p.kind === 'polyline' && p.style === 'hidden')).toBe(false);
     expect(d.primitives.some((p) => p.kind === 'text' && p.text === 'Ø20')).toBe(false);
     expect(d.primitives.some((p) => p.kind === 'text' && p.text === '3º DIEDRO')).toBe(true);
+  });
+
+  it('desenho de conjunto: balões e lista de materiais sobre a legenda', () => {
+    const s = defaultDrawingSettings('Conjunto'); s.dimensions = false;
+    const bom = [{ item: 1, part: 'a', name: 'Base', qty: 1, material: 'SAE 1020', instances: ['i1'] }, { item: 2, part: 'b', name: 'Pino', qty: 2, material: '', instances: ['i2', 'i3'] }];
+    const d = layoutAssemblyDrawing(sampleViews(), s, { date: '', docName: 'Conjunto' }, bom, [{ item: 1, view: 'iso', X: 10, Y: 10 }, { item: 2, view: 'iso', X: 70, Y: 60 }, { item: 2, view: 'iso', X: 72, Y: 62 }]);
+    const texts = d.primitives.filter((p) => p.kind === 'text').map((p) => (p as { text: string }).text);
+    expect(texts).toContain('DENOMINAÇÃO'); expect(texts).toContain('Base'); expect(texts).toContain('Pino'); expect(texts).toContain('SAE 1020');
+    expect(texts.filter((t) => t === '2').length).toBeGreaterThanOrEqual(2); // qtd do pino + balões
+    expect(d.primitives.filter((p) => p.kind === 'circle').length).toBeGreaterThanOrEqual(3);
+    for (const p of d.primitives) if (p.kind === 'circle') { expect(p.cx).toBeGreaterThan(0); expect(p.cx).toBeLessThan(297); expect(p.cy).toBeGreaterThan(0); expect(p.cy).toBeLessThan(210); }
+    expect(projectPoint({ name: 'front', n: [0, 0, 1], up: [0, 1, 0] }, [3, 4, 5])).toEqual([3, 4]);
+    expect(projectPoint({ name: 'left', n: [-1, 0, 0], up: [0, 1, 0] }, [3, 4, 5])).toEqual([5, 4]);
   });
 
   it('gera PDF válido com xref correto', () => {

@@ -3,6 +3,7 @@
 
 import { type Sketch, type Id, newId } from './sketch/model';
 import { type DrawingSettings, defaultDrawingSettings, SHEET_MM } from './drawing/layout';
+import { type Assembly, type Frame, type JointType, createAssembly, JOINT_NAMES } from './assembly/model';
 
 export const FORJA_VERSION = 2;
 
@@ -75,6 +76,9 @@ export interface ForjaDocument {
   planes: Plane[]; sketches: Sketch[]; features: Feature[];
   /** Opções do desenho técnico (folha, vistas, legenda). Ausente até o primeiro desenho. */
   drawing?: DrawingSettings;
+  /** 'part' (padrão) ou 'assembly'. Uma montagem embute as peças em `assembly.parts`. */
+  kind?: 'part' | 'assembly';
+  assembly?: Assembly;
 }
 
 export const BASE_PLANES: Plane[] = [
@@ -88,6 +92,10 @@ export function createDocument(name = 'Peça sem nome'): ForjaDocument {
   return { format: 'forja', version: FORJA_VERSION, name, units: 'mm', createdAt: now, modifiedAt: now, planes: BASE_PLANES.map((p) => ({ ...p })), sketches: [], features: [] };
 }
 
+export function createAssemblyDocument(name = 'Montagem sem nome'): ForjaDocument {
+  const d = createDocument(name); d.kind = 'assembly'; d.assembly = createAssembly(); return d;
+}
+
 export function serialize(doc: ForjaDocument): string {
   doc.modifiedAt = new Date().toISOString();
   doc.version = FORJA_VERSION;
@@ -96,8 +104,9 @@ export function serialize(doc: ForjaDocument): string {
 
 const isV3 = (v: unknown): v is V3 => Array.isArray(v) && v.length === 3 && v.every((x) => typeof x === 'number' && Number.isFinite(x));
 
-export function deserialize(text: string): ForjaDocument {
-  const d = JSON.parse(text);
+export function deserialize(text: string): ForjaDocument { return fromObject(JSON.parse(text), 0); }
+
+function fromObject(d: Record<string, unknown> & { [k: string]: any }, depth: number): ForjaDocument {
   if (d?.format !== 'forja') throw new Error('Arquivo não é um documento ForjaCAD.');
   if (typeof d.version !== 'number' || d.version > FORJA_VERSION) throw new Error(`Versão de arquivo ${d.version} não suportada por este ForjaCAD.`);
   const fileVersion: number = d.version;
@@ -135,9 +144,40 @@ export function deserialize(text: string): ForjaDocument {
   }
   doc.features = features;
   doc.drawing = sanitizeDrawing(d.drawing, doc.name);
+  delete doc.kind; delete doc.assembly;
+  if (d.kind === 'assembly' && depth === 0) { doc.kind = 'assembly'; doc.assembly = sanitizeAssembly(d.assembly, (o) => fromObject(o as Record<string, unknown>, depth + 1)); }
   // Planos base sempre existem, mesmo que o arquivo venha sem eles.
   for (const bp of BASE_PLANES) if (!doc.planes.some((p) => p.id === bp.id)) doc.planes.push({ ...bp });
   return doc;
+}
+
+/** Montagem válida a partir de um objeto qualquer: peças embutidas, instâncias e juntas conferidas. */
+function sanitizeAssembly(raw: unknown, partDoc: (o: unknown) => ForjaDocument): Assembly {
+  const asm = createAssembly();
+  if (!raw || typeof raw !== 'object') return asm;
+  const r = raw as { parts?: unknown[]; instances?: unknown[]; joints?: unknown[] };
+  const str = (v: unknown, fb: string) => (typeof v === 'string' ? v.slice(0, 120) : fb);
+  for (const p of Array.isArray(r.parts) ? r.parts : []) {
+    const q = p as { id?: unknown; name?: unknown; doc?: unknown }; if (typeof q.id !== 'string') continue;
+    try { asm.parts.push({ id: q.id, name: str(q.name, 'Peça'), doc: partDoc(q.doc) }); } catch { /* peça corrompida: fica de fora */ }
+  }
+  const partIds = new Set(asm.parts.map((p) => p.id));
+  for (const i of Array.isArray(r.instances) ? r.instances : []) {
+    const q = i as { id?: unknown; part?: unknown; name?: unknown; pos?: unknown; rot?: unknown };
+    if (typeof q.id !== 'string' || typeof q.part !== 'string' || !partIds.has(q.part)) continue;
+    asm.instances.push({ id: q.id, part: q.part, name: str(q.name, 'Peça'), pos: isV3(q.pos) ? q.pos : [0, 0, 0], rot: isV3(q.rot) ? q.rot : [0, 0, 0] });
+  }
+  const instIds = new Set(asm.instances.map((i) => i.id));
+  const frame = (f: unknown): Frame | null => { const g = f as Frame; return g && isV3(g.origin) && isV3(g.z) && isV3(g.x) ? { origin: g.origin, z: g.z, x: g.x } : null; };
+  for (const j of Array.isArray(r.joints) ? r.joints : []) {
+    const q = j as { id?: unknown; type?: unknown; name?: unknown; moving?: unknown; base?: unknown; movingFrame?: unknown; baseFrame?: unknown; angle?: unknown; distance?: unknown; flip?: unknown };
+    if (typeof q.id !== 'string' || typeof q.moving !== 'string' || typeof q.base !== 'string' || !instIds.has(q.moving) || !instIds.has(q.base)) continue;
+    const type: JointType = (['fixed', 'revolute', 'slider', 'cylindrical'] as JointType[]).includes(q.type as JointType) ? (q.type as JointType) : 'fixed';
+    const mf = frame(q.movingFrame), bf = frame(q.baseFrame); if (!mf || !bf) continue;
+    if (asm.joints.some((x) => x.moving === q.moving)) continue;
+    asm.joints.push({ id: q.id, type, name: str(q.name, JOINT_NAMES[type]), moving: q.moving, base: q.base, movingFrame: mf, baseFrame: bf, angle: typeof q.angle === 'number' && Number.isFinite(q.angle) ? q.angle : 0, distance: typeof q.distance === 'number' && Number.isFinite(q.distance) ? q.distance : 0, flip: !!q.flip });
+  }
+  return asm;
 }
 
 /** Opções de desenho válidas a partir de um objeto qualquer (arquivo antigo ou editado à mão). */

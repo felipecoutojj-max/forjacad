@@ -5,7 +5,8 @@
 import ocInit from 'opencascade.js/dist/opencascade.full.js';
 import wasmUrl from 'opencascade.js/dist/opencascade.full.wasm?url';
 import type { OpenCascadeInstance } from 'opencascade.js';
-import { rebuildDocument, tessellate, exportSTEP, projectViews, errorMessage, type BuiltBody } from './build';
+import { rebuildDocument, tessellate, exportSTEP, projectViews, assemblyShapes, errorMessage, type BuiltBody } from './build';
+import type { TopoDS_Shape } from 'opencascade.js';
 import type { KernelRequest, KernelResponse, BodyData } from './types';
 import { bodyName } from '../../document';
 
@@ -13,6 +14,7 @@ const post = (m: KernelResponse, transfer: Transferable[] = []) => (self as unkn
 
 let oc: OpenCascadeInstance | null = null;
 let last: BuiltBody[] = [];
+const partCache = new Map<string, TopoDS_Shape[]>();
 const queue: KernelRequest[] = [];
 const t0 = performance.now();
 
@@ -49,6 +51,18 @@ function handle(req: KernelRequest): void {
       const transfer: Transferable[] = [];
       for (const v of views) for (const arr of [...v.visible, ...v.hidden, ...v.tangent]) transfer.push(arr.buffer);
       post({ id: req.id, type: 'projected', views }, transfer);
+    } else if (req.type === 'projectAssembly') {
+      if (partCache.size > 40) partCache.clear();
+      const shapes = assemblyShapes(oc, req.assembly.parts, req.assembly.instances, partCache);
+      if (!shapes.length) throw new Error('Nenhuma peça para projetar.');
+      const views = projectViews(oc, shapes, req.views);
+      const transfer: Transferable[] = [];
+      for (const v of views) for (const arr of [...v.visible, ...v.hidden, ...v.tangent]) transfer.push(arr.buffer);
+      post({ id: req.id, type: 'projected', views }, transfer);
+    } else if (req.type === 'exportAssembly') {
+      const shapes = assemblyShapes(oc, req.assembly.parts, req.assembly.instances, partCache);
+      if (!shapes.length) throw new Error('Nenhuma peça para exportar.');
+      post({ id: req.id, type: 'exported', data: exportSTEP(oc, shapes.map((shape, i) => ({ id: String(i), shape }))), mime: 'application/step' });
     } else if (req.type === 'export') {
       if (!last.length) throw new Error('Nenhum corpo para exportar.');
       const text = exportSTEP(oc, last);
