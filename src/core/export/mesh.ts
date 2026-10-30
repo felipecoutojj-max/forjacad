@@ -5,7 +5,7 @@ import type * as THREE from 'three';
 import type { BodyData } from '../kernel/occ/types';
 
 export interface MeshGroup { name: string; /** em triângulos */ start: number; count: number; }
-export interface MeshData { name: string; positions: Float32Array; indices: Uint32Array; groups?: MeshGroup[]; }
+export interface MeshData { name: string; positions: Float32Array; normals?: Float32Array; indices: Uint32Array; groups?: MeshGroup[]; }
 
 export function fromGeometry(name: string, geo: THREE.BufferGeometry): MeshData {
   const pos = geo.getAttribute('position').array as Float32Array;
@@ -14,12 +14,13 @@ export function fromGeometry(name: string, geo: THREE.BufferGeometry): MeshData 
   if (geo.index) indices = Uint32Array.from(geo.index.array as ArrayLike<number>);
   else { indices = new Uint32Array(n); for (let i = 0; i < n; i++) indices[i] = i; }
   const groups: MeshGroup[] = geo.groups.length ? geo.groups.map((g, i) => ({ name: g.materialIndex === 0 ? `tampas${i}` : `lateral${i}`, start: g.start / 3, count: (g.count === Infinity ? indices.length - g.start : g.count) / 3 })) : [];
-  return { name, positions: pos, indices, groups };
+  const nrm = geo.getAttribute('normal'); const normals = nrm ? (nrm.array as Float32Array) : undefined;
+  return { name, positions: pos, normals, indices, groups };
 }
 
 /** Malha de um corpo do kernel, com um grupo por face B-rep (vira polygroup no ZBrush). */
 export function fromBody(b: BodyData): MeshData {
-  return { name: b.name, positions: b.positions, indices: b.indices, groups: b.faces.map((f) => ({ name: `face${f.index + 1}`, start: f.triStart, count: f.triCount })) };
+  return { name: b.name, positions: b.positions, normals: b.normals, indices: b.indices, groups: b.faces.map((f) => ({ name: `face${f.index + 1}`, start: f.triStart, count: f.triCount })) };
 }
 
 /** STL binário com todos os corpos juntos. */

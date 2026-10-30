@@ -3,7 +3,7 @@ import { describe, it, expect, beforeAll } from 'vitest';
 import initOpenCascade from 'opencascade.js/dist/node.js';
 import type { OpenCascadeInstance } from 'opencascade.js';
 import { rebuildDocument, tessellate, exportSTEP } from './build';
-import { createDocument, addExtrude, addFillet, addBoolean, type ForjaDocument } from '../../document';
+import { createDocument, addExtrude, addRevolve, addFillet, addBoolean, type ForjaDocument } from '../../document';
 import * as M from '../../sketch/model';
 
 let oc: OpenCascadeInstance;
@@ -110,6 +110,39 @@ describe('kernel OpenCASCADE', () => {
     addBoolean(doc, 'union', a.id, b.id);
     const r = rebuildDocument(oc, doc); expect(r.errors).toEqual([]); expect(r.bodies).toHaveLength(1);
     expect(tessellate(oc, r.bodies[0], 'c').volume).toBeCloseTo((1600 + 1600 - 400) * 10, 0);
+  });
+
+  it('revoluciona um retângulo em tubo (360°) e em quarto de tubo (90°)', () => {
+    const doc = createDocument(); const s = rectSketch(doc, 'plane-xy', 10, 0, 10, 30); // u 10..20, v 0..30
+    const f = addRevolve(doc, s.id, { p: [0, 0], d: [0, 1] }, 360);
+    const r = rebuildDocument(oc, doc); expect(r.errors).toEqual([]); expect(r.bodies).toHaveLength(1);
+    const m = tessellate(oc, r.bodies[0], 'c');
+    expect(m.volume).toBeCloseTo(Math.PI * (400 - 100) * 30, 0);
+    expect(m.faces.filter((x) => x.type === 'cylinder')).toHaveLength(2);
+    f.angle = 90;
+    const m2 = tessellate(oc, rebuildDocument(oc, doc).bodies[0], 'c');
+    expect(m2.volume).toBeCloseTo((Math.PI * 300 * 30) / 4, 0);
+    expect(m2.faces.filter((x) => x.type === 'plane')).toHaveLength(4);
+  });
+
+  it('revolução usa uma linha de construção como eixo e recusa perfil que cruza o eixo', () => {
+    const doc = createDocument(); const s = rectSketch(doc, 'plane-xy', 10, 0, 10, 30);
+    const a = M.addPoint(s, 5, -10), b = M.addPoint(s, 5, 50); const axisLine = M.addLine(s, a.id, b.id); axisLine.construction = true;
+    addRevolve(doc, s.id, { line: axisLine.id, p: [0, 0], d: [0, 1] }, 360);
+    const r = rebuildDocument(oc, doc); expect(r.errors).toEqual([]);
+    // Raios em relação a u=5: interno 5, externo 15.
+    expect(tessellate(oc, r.bodies[0], 'c').volume).toBeCloseTo(Math.PI * (225 - 25) * 30, 0);
+    // Eixo passando pelo meio do perfil: erro de feature.
+    M.getPoint(s, a.id).x = 15; M.getPoint(s, b.id).x = 15;
+    const r2 = rebuildDocument(oc, doc); expect(r2.bodies).toHaveLength(0); expect(r2.errors[0].message).toMatch(/cruza o eixo/);
+  });
+
+  it('revolução em corte tira um quarto de cilindro do canto do bloco', () => {
+    const doc = createDocument(); const body = addExtrude(doc, rectSketch(doc, 'plane-xy', 0, 0, 100, 60).id, 20);
+    const prof = rectSketch(doc, 'plane-xy', 0, 0, 5, 20); // u 0..5, v 0..20 girando em torno de u=0 (eixo y do mundo)
+    addRevolve(doc, prof.id, { p: [0, 0], d: [0, 1] }, 360, { op: 'cut', target: body.id });
+    const r = rebuildDocument(oc, doc); expect(r.errors).toEqual([]); expect(r.bodies).toHaveLength(1);
+    expect(tessellate(oc, r.bodies[0], 'c').volume).toBeCloseTo(120000 - (Math.PI * 25 * 20) / 4, 0);
   });
 
   it('exporta STEP com os corpos', () => {

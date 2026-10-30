@@ -35,6 +35,21 @@ export interface ExtrudeFeature {
   visible?: boolean;
 }
 
+/** Eixo de revolução em coordenadas do plano do esboço: uma linha do esboço (quando existir) ou ponto + direção. */
+export interface SketchAxis { line?: Id; p: [number, number]; d: [number, number]; }
+
+export interface RevolveFeature {
+  id: Id; type: 'revolve'; name: string; sketch: Id;
+  axis: SketchAxis;
+  /** Ângulo em graus (360 = volta completa). */
+  angle: number;
+  op: ExtrudeOp;
+  target?: Id;
+  /** Gira no sentido contrário. */
+  flip?: boolean;
+  visible?: boolean;
+}
+
 /** Referência geométrica a uma aresta: ponto médio e comprimento. Sobrevive a recálculos enquanto a aresta existir. */
 export interface EdgeRef { mid: V3; len: number; }
 
@@ -51,7 +66,7 @@ export interface BooleanFeature {
   body: Id; tool: Id;
 }
 
-export type Feature = ExtrudeFeature | FilletFeature | BooleanFeature;
+export type Feature = ExtrudeFeature | RevolveFeature | FilletFeature | BooleanFeature;
 
 export interface ForjaDocument {
   format: 'forja'; version: number; name: string; units: 'mm';
@@ -99,6 +114,14 @@ export function deserialize(text: string): ForjaDocument {
       let op: ExtrudeOp = f.op === 'cut' ? 'cut' : f.op === 'add' && fileVersion >= 2 ? 'add' : 'new';
       if (op !== 'new' && typeof f.target !== 'string') op = 'new';
       features.push({ id: f.id, type: 'extrude', name: str(f.name, 'Extrusão'), sketch: f.sketch, depth: Math.abs(num(f.depth, 10)) || 10, op, target: op === 'new' ? undefined : id(f.target), symmetric: !!f.symmetric, flip: !!f.flip, throughAll: !!f.throughAll, visible: f.visible !== false });
+    } else if (f.type === 'revolve' && typeof f.sketch === 'string') {
+      const ax = f.axis as Partial<SketchAxis> | undefined;
+      const is2 = (v: unknown): v is [number, number] => Array.isArray(v) && v.length === 2 && v.every((x) => typeof x === 'number' && Number.isFinite(x));
+      const axis: SketchAxis = { line: id(ax?.line), p: is2(ax?.p) ? ax!.p! : [0, 0], d: is2(ax?.d) && (ax!.d![0] || ax!.d![1]) ? ax!.d! : [0, 1] };
+      let op: ExtrudeOp = f.op === 'cut' ? 'cut' : f.op === 'add' ? 'add' : 'new';
+      if (op !== 'new' && typeof f.target !== 'string') op = 'new';
+      const angle = Math.min(360, Math.abs(num(f.angle, 360))) || 360;
+      features.push({ id: f.id, type: 'revolve', name: str(f.name, 'Revolução'), sketch: f.sketch, axis, angle, op, target: op === 'new' ? undefined : id(f.target), flip: !!f.flip, visible: f.visible !== false });
     } else if ((f.type === 'fillet' || f.type === 'chamfer') && typeof f.body === 'string' && Array.isArray(f.edges)) {
       const edges = (f.edges as unknown[]).filter((e): e is EdgeRef => !!e && isV3((e as EdgeRef).mid) && typeof (e as EdgeRef).len === 'number').map((e) => ({ mid: e.mid, len: e.len }));
       if (edges.length) features.push({ id: f.id, type: f.type, name: str(f.name, f.type === 'fillet' ? 'Filete' : 'Chanfro'), body: f.body, edges, radius: Math.abs(num(f.radius, 1)) || 1 });
@@ -123,11 +146,14 @@ export function getSketch(doc: ForjaDocument, id: Id): Sketch {
 }
 export function findFeature(doc: ForjaDocument, id: Id): Feature | undefined { return doc.features.find((f) => f.id === id); }
 
-/** Corpos existentes ao final da lista de features: cada extrusão 'new' cria um, booleanas consomem a ferramenta. */
+/** A feature cria um corpo novo? */
+export const createsBody = (f: Feature): boolean => (f.type === 'extrude' || f.type === 'revolve') && f.op === 'new';
+
+/** Corpos existentes ao final da lista de features: cada extrusão/revolução 'new' cria um, booleanas consomem a ferramenta. */
 export function bodyIds(doc: ForjaDocument): Id[] {
   const ids: Id[] = [];
   for (const f of doc.features) {
-    if (f.type === 'extrude' && f.op === 'new') ids.push(f.id);
+    if (createsBody(f)) ids.push(f.id);
     else if (f.type === 'boolean') { const i = ids.indexOf(f.tool); if (i >= 0) ids.splice(i, 1); }
   }
   return ids;
@@ -136,13 +162,13 @@ export function bodyIds(doc: ForjaDocument): Id[] {
 /** Nome amigável de um corpo: "Corpo N" pela ordem de criação. */
 export function bodyName(doc: ForjaDocument, body: Id): string {
   let n = 0;
-  for (const f of doc.features) if (f.type === 'extrude' && f.op === 'new') { n++; if (f.id === body) return `Corpo ${n}`; }
+  for (const f of doc.features) if (createsBody(f)) { n++; if (f.id === body) return `Corpo ${n}`; }
   return 'Corpo';
 }
 
 /** Features que dependem de um corpo (inclusive a que o criou). */
 export function featuresOfBody(doc: ForjaDocument, body: Id): Feature[] {
-  return doc.features.filter((f) => f.id === body || (f.type === 'extrude' && f.target === body) || ((f.type === 'fillet' || f.type === 'chamfer') && f.body === body) || (f.type === 'boolean' && (f.body === body || f.tool === body)));
+  return doc.features.filter((f) => f.id === body || ((f.type === 'extrude' || f.type === 'revolve') && f.target === body) || ((f.type === 'fillet' || f.type === 'chamfer') && f.body === body) || (f.type === 'boolean' && (f.body === body || f.tool === body)));
 }
 
 export function addExtrude(doc: ForjaDocument, sketch: Id, depth: number, opts: Partial<Omit<ExtrudeFeature, 'id' | 'type' | 'name' | 'sketch' | 'depth'>> = {}): ExtrudeFeature {
@@ -150,6 +176,13 @@ export function addExtrude(doc: ForjaDocument, sketch: Id, depth: number, opts: 
   const n = doc.features.filter((f) => f.type === 'extrude' && f.op === op).length + 1;
   const base = op === 'cut' ? 'Corte' : op === 'add' ? 'Adição' : 'Extrusão';
   const f: ExtrudeFeature = { id: newId('f'), type: 'extrude', name: `${base} ${n}`, sketch, depth: Math.abs(depth), op, target: op === 'new' ? undefined : opts.target, symmetric: !!opts.symmetric, flip: !!opts.flip, throughAll: !!opts.throughAll, visible: true };
+  doc.features.push(f); return f;
+}
+
+export function addRevolve(doc: ForjaDocument, sketch: Id, axis: SketchAxis, angle: number, opts: Partial<Pick<RevolveFeature, 'op' | 'target' | 'flip'>> = {}): RevolveFeature {
+  const op = opts.op ?? 'new';
+  const n = doc.features.filter((f) => f.type === 'revolve').length + 1;
+  const f: RevolveFeature = { id: newId('f'), type: 'revolve', name: `Revolução ${n}`, sketch, axis, angle: Math.min(360, Math.abs(angle)) || 360, op, target: op === 'new' ? undefined : opts.target, flip: !!opts.flip, visible: true };
   doc.features.push(f); return f;
 }
 

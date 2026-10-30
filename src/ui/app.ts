@@ -5,9 +5,9 @@ import { Viewport, emptySel3D, type Sel3D, type RenderBody } from './viewport';
 import { SketchRenderer, emptySelection, type Selection, dimEndpoints, fmtDim } from './sketchRenderer';
 import { icons, type IconName } from './icons';
 import {
-  createDocument, serialize, deserialize, getPlane, getSketch, addExtrude, addFillet, addBoolean, addFacePlane, pruneFacePlanes,
+  createDocument, serialize, deserialize, getPlane, getSketch, addExtrude, addRevolve, addFillet, addBoolean, addFacePlane, pruneFacePlanes,
   bodyIds, bodyName, featuresOfBody, planeNormal,
-  type ForjaDocument, type Plane, type Feature, type ExtrudeFeature, type ExtrudeOp, type V3,
+  type ForjaDocument, type Plane, type Feature, type ExtrudeFeature, type ExtrudeOp, type V3, type SketchAxis,
 } from '../core/document';
 import * as M from '../core/sketch/model';
 import type { Sketch, Entity, Id, ConstraintKind, DimensionKind } from '../core/sketch/model';
@@ -17,6 +17,7 @@ import { buildAllBodies } from '../core/kernel/preview';
 import { KernelClient, SupersededError } from '../core/kernel/occ/client';
 import type { BodyData, FeatureError, RebuildResult } from '../core/kernel/occ/types';
 import { toSTL, toOBJ, fromBody, fromGeometry, type MeshData } from '../core/export/mesh';
+import { toGLB } from '../core/export/glb';
 import { saveLocal, loadLocal, downloadFile, pickFile, safeFileName } from './storage';
 import { type Vec2, v2, dist, distPointSegment, distPointArc, closestOnSegment, sub, add, scale, norm, angleOf, normAngle, TAU, round } from '../core/geom';
 
@@ -248,6 +249,7 @@ export class App {
       const touch = this.iconButton('touch', 'Dedo desenha', () => { this.touchDraws = !this.touchDraws; this.renderToolbar(); }); if (this.touchDraws) touch.classList.add('active'); g2.append(touch);
       g2.append(this.iconButton('fit', 'Enquadrar', () => this.vp.fitAll()));
       g3.append(this.iconButton('extrude', 'Extrudar', () => this.extrudeActive()));
+      g3.append(this.iconButton('revolve', 'Revolucionar', () => this.revolveActive()));
       g3.append(this.iconButton('done', 'Concluir', () => this.exitSketch(true)));
       this.toolbar.append(g1, g2, g3);
     } else {
@@ -396,6 +398,20 @@ export class App {
       checkRow('Simétrico ao plano', !!f.symmetric, (v) => edit(() => { f.symmetric = v; }));
       checkRow('Inverter sentido', !!f.flip, (v) => edit(() => { f.flip = v; }));
       if (f.op === 'cut') checkRow('Atravessar tudo', !!f.throughAll, (v) => edit(() => { f.throughAll = v; }));
+      const row3 = el('div', 'row');
+      row3.append(this.button('Editar esboço', () => this.enterSketch(f.sketch)));
+      row3.append(this.button('Apagar', () => this.deleteFeature(f), 'btn danger'));
+      p.append(row3);
+    } else if (f.type === 'revolve') {
+      numRow('Ângulo (°)', f.angle, (v) => edit(() => { f.angle = Math.min(360, v); }));
+      const axes = this.axisOptions(getSketch(doc, f.sketch));
+      const cur = axes.find((a) => (f.axis.line ? a.axis.line === f.axis.line : !a.axis.line && a.axis.p[0] === f.axis.p[0] && a.axis.p[1] === f.axis.p[1] && a.axis.d[0] === f.axis.d[0] && a.axis.d[1] === f.axis.d[1]));
+      selectRow('Eixo', axes.map((a) => [a.key, a.label]), cur?.key ?? axes[0].key, (v) => edit(() => { const a = axes.find((x) => x.key === v); if (a) f.axis = a.axis; }));
+      const others = bodyIds(doc).filter((id) => id !== f.id);
+      const opOptions: [string, string][] = [['new', 'Novo corpo']]; if (others.length) opOptions.push(['add', 'Adicionar a corpo'], ['cut', 'Cortar corpo']);
+      selectRow('Operação', opOptions, f.op, (v) => edit(() => { f.op = v as ExtrudeOp; if (f.op === 'new') f.target = undefined; else if (!f.target || !others.includes(f.target)) f.target = others[0]; }));
+      if (f.op !== 'new' && others.length > 1) selectRow('Corpo alvo', others.map((id) => [id, bodyName(doc, id)]), f.target ?? others[0], (v) => edit(() => { f.target = v; }));
+      checkRow('Sentido contrário', !!f.flip, (v) => edit(() => { f.flip = v; }));
       const row3 = el('div', 'row');
       row3.append(this.button('Editar esboço', () => this.enterSketch(f.sketch)));
       row3.append(this.button('Apagar', () => this.deleteFeature(f), 'btn danger'));
@@ -912,7 +928,9 @@ export class App {
   private extrudeMenu(ev: MouseEvent): void {
     const doc = this.doc.current;
     if (!doc.sketches.length) return this.toast('Crie um esboço fechado primeiro.');
-    this.menu(ev.clientX, ev.clientY, doc.sketches.map((s) => ({ label: `Extrudar ${s.name}`, action: () => this.extrudeSketch(s.id) })));
+    const items: { label: string; action: () => void }[] = [];
+    for (const s of doc.sketches) { items.push({ label: `Extrudar ${s.name}`, action: () => this.extrudeSketch(s.id) }); items.push({ label: `Revolucionar ${s.name}`, action: () => this.revolveSketch(s.id) }); }
+    this.menu(ev.clientX, ev.clientY, items);
   }
 
   /** Diálogo de extrusão: operação, profundidade, alvo e sentido. */
@@ -963,6 +981,75 @@ export class App {
     setTimeout(() => { depthInp.focus(); depthInp.select(); }, 30);
   }
 
+  /** Eixos possíveis para revolução: eixos do esboço e cada linha dele (construção primeiro). */
+  private axisOptions(sk: Sketch): { key: string; label: string; axis: SketchAxis }[] {
+    const out: { key: string; label: string; axis: SketchAxis }[] = [
+      { key: 'v', label: 'Eixo vertical do esboço', axis: { p: [0, 0], d: [0, 1] } },
+      { key: 'u', label: 'Eixo horizontal do esboço', axis: { p: [0, 0], d: [1, 0] } },
+    ];
+    const lines = sk.entities.filter((e): e is M.LineEntity => e.type === 'line').sort((a, b) => Number(!!b.construction) - Number(!!a.construction));
+    lines.forEach((l, i) => {
+      const a = M.getPoint(sk, l.a), b = M.getPoint(sk, l.b);
+      out.push({ key: l.id, label: `${l.construction ? 'Construção' : 'Linha'} ${i + 1} (${fmtDim('distance', a.x)}, ${fmtDim('distance', a.y)}) → (${fmtDim('distance', b.x)}, ${fmtDim('distance', b.y)})`, axis: { line: l.id, p: [a.x, a.y], d: [b.x - a.x, b.y - a.y] } });
+    });
+    return out;
+  }
+
+  private revolveActive(): void {
+    const s = this.sketch; if (!s) return;
+    const id = s.id;
+    const selLine = [...this.sel.entities].map((e) => M.findEntity(s, e)).find((e) => e?.type === 'line')?.id;
+    this.exitSketch(true);
+    if (this.doc.current.sketches.some((x) => x.id === id)) this.revolveSketch(id, selLine);
+  }
+
+  /** Diálogo de revolução: eixo, ângulo, operação, alvo e sentido. */
+  private revolveSketch(sketchId: Id, preferredLine?: Id): void {
+    const doc = this.doc.current;
+    const sk = getSketch(doc, sketchId);
+    const bodies = bodyIds(doc);
+    const kernelOk = this.kernel.state === 'ready';
+    if (!kernelOk) return this.toast(this.kernel.state === 'loading' ? 'A revolução precisa do kernel 3D, que ainda está carregando.' : 'Kernel 3D indisponível: revolução não está disponível.', 'err');
+    const axes = this.axisOptions(sk);
+    const firstConstruction = sk.entities.find((e): e is M.LineEntity => e.type === 'line' && !!e.construction);
+    const state = { op: 'new' as ExtrudeOp, angle: 360, target: bodies[0] ?? '', flip: false, axisKey: preferredLine ?? firstConstruction?.id ?? 'v' };
+
+    const back = el('div', 'dialog-backdrop'); const d = el('div', 'dialog');
+    const hh = document.createElement('h2'); hh.textContent = `Revolucionar ${sk.name}`; d.append(hh);
+    const seg = el('div', 'segmented');
+    const ops: [ExtrudeOp, string][] = [['new', 'Novo corpo'], ['add', 'Adicionar'], ['cut', 'Cortar']];
+    const render = () => {
+      seg.innerHTML = '';
+      for (const [op, label] of ops) { const b = this.button(label, () => { state.op = op; render(); }, `btn ${state.op === op ? 'primary' : ''}`); b.disabled = op !== 'new' && !bodies.length; seg.append(b); }
+      targetRow.style.display = state.op !== 'new' && bodies.length > 1 ? '' : 'none';
+    };
+    d.append(seg);
+    const axisRow = el('div', 'row'); const al = document.createElement('label'); al.textContent = 'Eixo';
+    const axisSel = document.createElement('select'); for (const a of axes) { const o = document.createElement('option'); o.value = a.key; o.textContent = a.label; axisSel.append(o); } axisSel.value = state.axisKey;
+    axisSel.addEventListener('change', () => { state.axisKey = axisSel.value; }); axisRow.append(al, axisSel); d.append(axisRow);
+    const angRow = el('div', 'row'); const gl = document.createElement('label'); gl.textContent = 'Ângulo (°)';
+    const angInp = document.createElement('input'); angInp.type = 'text'; angInp.inputMode = 'decimal'; angInp.value = '360'; angRow.append(gl, angInp); d.append(angRow);
+    const targetRow = el('div', 'row'); const tl = document.createElement('label'); tl.textContent = 'Corpo alvo';
+    const targetSel = document.createElement('select'); for (const id of bodies) { const o = document.createElement('option'); o.value = id; o.textContent = bodyName(doc, id); targetSel.append(o); } targetSel.value = state.target;
+    targetSel.addEventListener('change', () => { state.target = targetSel.value; }); targetRow.append(tl, targetSel); d.append(targetRow);
+    const flipRow = el('div', 'row'); const fl = document.createElement('label'); fl.textContent = 'Sentido contrário'; const flipChk = document.createElement('input'); flipChk.type = 'checkbox'; flipChk.addEventListener('change', () => { state.flip = flipChk.checked; }); flipRow.append(fl, flipChk); d.append(flipRow);
+    const hint = el('div', 'hint'); hint.textContent = 'O perfil precisa ficar todo de um lado do eixo (pode encostar nele). Dica: desenhe o eixo como linha de construção.'; d.append(hint);
+    const acts = el('div', 'actions');
+    const ok = () => {
+      const angle = parseFloat(angInp.value.replace(',', '.'));
+      if (!isFinite(angle) || angle <= 0 || angle > 360) { this.toast('Ângulo inválido (0 a 360).', 'err'); return; }
+      const axis = axes.find((a) => a.key === state.axisKey)?.axis ?? axes[0].axis;
+      back.remove();
+      void this.tryFeature(() => addRevolve(doc, sketchId, axis, angle, { op: state.op, target: state.op === 'new' ? undefined : state.target, flip: state.flip }),
+        (f) => { this.selectedFeature = f.id; this.sel3d = emptySel3D(); this.sel3d.body = bodyOfFeature(f); this.vp.setSelection(this.sel3d); this.renderSidePanel(); this.vp.fitAll(); });
+    };
+    acts.append(this.button('Cancelar', () => back.remove()), this.button('Revolucionar', ok, 'btn primary')); d.append(acts);
+    angInp.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') ok(); if (ev.key === 'Escape') back.remove(); });
+    render();
+    back.append(d); this.overlay.append(back);
+    setTimeout(() => { angInp.focus(); angInp.select(); }, 30);
+  }
+
   private filletSelected(kind: 'fillet' | 'chamfer'): void {
     const edges = this.sel3d.edges; if (!edges.length) return this.toast('Toque nas arestas primeiro.');
     const body = this.bodies.find((b) => b.id === edges[0].body); if (!body) return;
@@ -1008,7 +1095,17 @@ export class App {
       { label: 'STEP (SolidWorks, Fusion, fornecedores)', action: () => void this.exportStep() },
       { label: 'STL (impressão, visualizadores)', action: () => this.exportMesh('stl') },
       { label: 'OBJ (ZBrush, polygroups por face)', action: () => this.exportMesh('obj') },
+      { label: 'GLB (visualizadores 3D, realidade aumentada)', action: () => void this.exportGlb() },
     ]);
+  }
+  private async exportGlb(): Promise<void> {
+    const meshes = this.exportMeshes();
+    if (!meshes.length) return this.toast('Nenhum corpo para exportar. Extrude um esboço antes.', 'err');
+    try {
+      const buf = await toGLB(meshes, this.doc.current.name);
+      downloadFile(`${safeFileName(this.doc.current.name)}.glb`, buf, 'model/gltf-binary');
+      this.toast('GLB gerado (em metros, como manda o formato).');
+    } catch (e) { this.toast(`GLB falhou: ${(e as Error).message}`, 'err'); }
   }
   private exportMeshes(): MeshData[] {
     if (this.bodies.length) return this.bodies.map(fromBody);
@@ -1100,12 +1197,13 @@ function toRenderBody(b: BodyData): RenderBody {
   return { id: b.id, name: b.name, geometry: g, data: b };
 }
 function bodyOfFeature(f: Feature): Id | null {
-  if (f.type === 'extrude') return f.op === 'new' ? f.id : f.target ?? null;
+  if (f.type === 'extrude' || f.type === 'revolve') return f.op === 'new' ? f.id : f.target ?? null;
   if (f.type === 'boolean') return f.body;
   return f.body;
 }
 function featureMini(f: Feature): string {
   if (f.type === 'extrude') return `${f.op === 'cut' ? 'corte ' : f.op === 'add' ? 'adição ' : ''}${f.throughAll ? '∞' : `${fmtDim('distance', f.depth)} mm`}`;
+  if (f.type === 'revolve') return `${f.op === 'cut' ? 'corte ' : f.op === 'add' ? 'adição ' : ''}${fmtDim('angle', f.angle)}`;
   if (f.type === 'fillet') return `R${fmtDim('distance', f.radius)} · ${f.edges.length}`;
   if (f.type === 'chamfer') return `${fmtDim('distance', f.radius)} mm · ${f.edges.length}`;
   if (f.type === 'boolean') return f.op === 'union' ? 'união' : f.op === 'subtract' ? 'subtração' : 'interseção';

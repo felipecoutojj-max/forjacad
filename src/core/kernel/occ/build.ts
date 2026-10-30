@@ -3,10 +3,10 @@
 // Não importa three.js nem DOM: roda no worker e nos testes em Node.
 
 import type { OpenCascadeInstance, TopoDS_Shape, TopoDS_Face, TopoDS_Edge, TopoDS_Wire, BRepAdaptor_Curve } from 'opencascade.js';
-import type { ForjaDocument, FilletFeature, EdgeRef, V3, Plane } from '../../document';
+import type { ForjaDocument, FilletFeature, EdgeRef, V3, Plane, SketchAxis } from '../../document';
 import { getSketch, getPlane, planeNormal, planeToWorld } from '../../document';
 import type { Sketch, Id } from '../../sketch/model';
-import { getPoint } from '../../sketch/model';
+import { getPoint, findEntity } from '../../sketch/model';
 import { extractProfiles, loopArcAngles, type Loop, type Profile } from '../profiles';
 import type { BodyData, FaceData, EdgeData, FeatureError, FaceType } from './types';
 
@@ -118,6 +118,43 @@ export function extrudeFaces(oc: OC, faces: TopoDS_Face[], dir: V3, depth: numbe
   return result!;
 }
 
+/** Eixo de revolução em 3D a partir do esboço: usa a linha referenciada se ainda existir, senão ponto + direção. */
+export function resolveAxis(sk: Sketch, plane: Plane, axis: SketchAxis): { p: V3; d: V3; p2: [number, number]; d2: [number, number] } {
+  let p2 = axis.p, d2 = axis.d;
+  const line = axis.line ? findEntity(sk, axis.line) : undefined;
+  if (line && line.type === 'line') { const a = getPoint(sk, line.a), b = getPoint(sk, line.b); p2 = [a.x, a.y]; d2 = [b.x - a.x, b.y - a.y]; }
+  const L = Math.hypot(d2[0], d2[1]); if (L < 1e-9) throw new Error('eixo de revolução degenerado');
+  d2 = [d2[0] / L, d2[1] / L];
+  const p = planeToWorld(plane, p2[0], p2[1]);
+  const d: V3 = [plane.u[0] * d2[0] + plane.v[0] * d2[1], plane.u[1] * d2[0] + plane.v[1] * d2[1], plane.u[2] * d2[0] + plane.v[2] * d2[1]];
+  return { p, d, p2, d2 };
+}
+
+/** O perfil fica inteiro de um lado do eixo? (pode encostar, não pode cruzar) */
+function profileCrossesAxis(sk: Sketch, p: [number, number], d: [number, number]): boolean {
+  let pos = false, neg = false;
+  const test = (x: number, y: number) => { const s = d[0] * (y - p[1]) - d[1] * (x - p[0]); if (s > 1e-6) pos = true; else if (s < -1e-6) neg = true; };
+  for (const e of sk.entities) {
+    if (e.construction) continue;
+    if (e.type === 'line') { const a = getPoint(sk, e.a), b = getPoint(sk, e.b); test(a.x, a.y); test(b.x, b.y); }
+    else { const c = getPoint(sk, e.center); const px = -d[1], py = d[0]; test(c.x + px * e.r, c.y + py * e.r); test(c.x - px * e.r, c.y - py * e.r); if (e.type === 'arc') { const s = getPoint(sk, e.start), en = getPoint(sk, e.end); test(s.x, s.y); test(en.x, en.y); } }
+  }
+  return pos && neg;
+}
+
+export function revolveFaces(oc: OC, faces: TopoDS_Face[], p: V3, d: V3, angleDeg: number): TopoDS_Shape {
+  const full = Math.abs(angleDeg) >= 360 - 1e-6;
+  const ax = new oc.gp_Ax1_2(pnt(oc, p), new oc.gp_Dir_4(d[0], d[1], d[2]));
+  let result: TopoDS_Shape | null = null;
+  for (const face of faces) {
+    const mk = full ? new oc.BRepPrimAPI_MakeRevol_2(face, ax, true) : new oc.BRepPrimAPI_MakeRevol_1(face, ax, (angleDeg * Math.PI) / 180, true);
+    const solid = mk.Shape();
+    if (!hasSolid(oc, solid)) throw new Error('a revolução não gerou um sólido');
+    result = result ? boolOp(oc, 'fuse', result, solid) : solid;
+  }
+  return result!;
+}
+
 export function bbox(oc: OC, shape: TopoDS_Shape): [V3, V3] {
   const box = new oc.Bnd_Box_1(); oc.BRepBndLib.Add(shape, box, true);
   const mn = box.CornerMin(), mx = box.CornerMax();
@@ -187,15 +224,23 @@ export function rebuildDocument(oc: OC, doc: ForjaDocument): RebuildShapes {
   const bodies = new Map<Id, TopoDS_Shape>(); const order: Id[] = []; const errors: FeatureError[] = [];
   for (const f of doc.features) {
     try {
-      if (f.type === 'extrude') {
+      if (f.type === 'extrude' || f.type === 'revolve') {
         if (f.visible === false) continue;
         const { faces, plane } = sketchFaces(oc, doc, f.sketch);
-        let dir = planeNormal(plane); if (f.flip) dir = neg(dir);
-        let depth = f.depth;
         const target = f.op !== 'new' && f.target ? bodies.get(f.target) : undefined;
         if (f.op !== 'new' && !target) throw new Error('o corpo alvo não existe mais');
-        if (f.throughAll && target) { const [mn, mx] = bbox(oc, target); depth = dist3(mn, mx) * 2 + depth; }
-        const tool = extrudeFaces(oc, faces, dir, depth, !!f.symmetric);
+        let tool: TopoDS_Shape;
+        if (f.type === 'extrude') {
+          let dir = planeNormal(plane); if (f.flip) dir = neg(dir);
+          let depth = f.depth;
+          if (f.throughAll && target) { const [mn, mx] = bbox(oc, target); depth = dist3(mn, mx) * 2 + depth; }
+          tool = extrudeFaces(oc, faces, dir, depth, !!f.symmetric);
+        } else {
+          const sk = getSketch(doc, f.sketch);
+          const ax = resolveAxis(sk, plane, f.axis);
+          if (profileCrossesAxis(sk, ax.p2, ax.d2)) throw new Error('o perfil cruza o eixo de revolução');
+          tool = revolveFaces(oc, faces, ax.p, f.flip ? neg(ax.d) : ax.d, f.angle);
+        }
         if (f.op === 'new') { bodies.set(f.id, tool); order.push(f.id); }
         else bodies.set(f.target!, boolOp(oc, f.op === 'add' ? 'fuse' : 'cut', target!, tool));
       } else if (f.type === 'fillet' || f.type === 'chamfer') {

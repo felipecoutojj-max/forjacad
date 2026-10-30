@@ -24,6 +24,7 @@ export const icons = {
   chamfer: w('<path d="M4 20V10l6-6h10"/><path d="M4 4h4M20 16v4" stroke-dasharray="2 2"/>'),
   face: w('<path d="M4 16l8 4 8-4V8l-8-4-8 4z"/><path d="M4 8l8 4 8-4" fill="currentColor" fill-opacity="0.25"/>'),
   boolean: w('<circle cx="9" cy="12" r="6"/><circle cx="15" cy="12" r="6"/>'),
+  revolve: w('<path d="M12 3v18" stroke-dasharray="2 2"/><path d="M14 6c3 0 5 1 5 2.5S17 11 14 11M14 13c3 0 5 1 5 2.5S17 18 14 18"/><path d="M14 6v12"/>'),
   cut: w('<path d="M4 16l8 4 8-4V8l-8-4-8 4z"/><path d="M9 6v9M15 6v9"/>'),
 };
 export type IconName = keyof typeof icons;

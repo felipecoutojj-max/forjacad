@@ -1,7 +1,7 @@
 {
   "name": "forjacad",
   "private": true,
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "CAD para ferramental: esboço com caneta, cotas, sólidos e desenho técnico. Roda no iPad e no Mac.",
   "type": "module",
   "scripts": {
