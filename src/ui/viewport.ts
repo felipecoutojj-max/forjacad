@@ -4,10 +4,21 @@
 import * as THREE from 'three';
 import type { Plane } from '../core/document';
 import { planeNormal } from '../core/document';
-import type { BodyMesh } from '../core/kernel/preview';
+import type { BodyData } from '../core/kernel/occ/types';
 import type { Vec2 } from '../core/geom';
+import type { Id } from '../core/sketch/model';
 
 export type ViewMode = 'view' | 'sketch';
+
+/** Corpo para desenhar: malha do kernel (com `data`) ou prévia (só geometria). */
+export interface RenderBody { id: Id; name: string; geometry: THREE.BufferGeometry; data?: BodyData; }
+
+/** Seleção em modo vista. Arestas selecionadas pertencem sempre a um único corpo. */
+export interface Sel3D { body: Id | null; face: { body: Id; index: number } | null; edges: { body: Id; index: number }[]; }
+export const emptySel3D = (): Sel3D => ({ body: null, face: null, edges: [] });
+
+export interface FaceHit { body: Id; index: number; distance: number; point: THREE.Vector3; }
+export interface EdgeHit { body: Id; index: number; px: number; }
 
 export class Viewport {
   readonly renderer: THREE.WebGLRenderer;
@@ -19,7 +30,10 @@ export class Viewport {
   readonly bodies = new THREE.Group();
   readonly sketches = new THREE.Group();
   readonly helpers = new THREE.Group();
+  readonly highlights = new THREE.Group();
   private planeMeshes = new Map<string, THREE.Mesh>();
+  private bodyMeshes = new Map<Id, THREE.Mesh>();
+  private bodyData = new Map<Id, BodyData>();
   private grid: THREE.Object3D | null = null;
   private axes: THREE.Object3D | null = null;
   private pending = false;
@@ -28,8 +42,10 @@ export class Viewport {
   private orthoHalf = 80;
   private raycaster = new THREE.Raycaster();
   private bodyMaterial = new THREE.MeshStandardMaterial({ color: 0x9aa7b8, metalness: 0.35, roughness: 0.55, side: THREE.DoubleSide });
-  private bodySelMaterial = new THREE.MeshStandardMaterial({ color: 0xf2a65a, metalness: 0.3, roughness: 0.5, side: THREE.DoubleSide });
+  private bodySelMaterial = new THREE.MeshStandardMaterial({ color: 0xc9a06a, metalness: 0.3, roughness: 0.5, side: THREE.DoubleSide });
+  private faceSelMaterial = new THREE.MeshBasicMaterial({ color: 0xf28c28, transparent: true, opacity: 0.5, side: THREE.DoubleSide, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -3, polygonOffsetUnits: -3 });
   private edgeMaterial = new THREE.LineBasicMaterial({ color: 0x2a2f38 });
+  private edgeSelMaterial = new THREE.LineBasicMaterial({ color: 0xffb15c, depthTest: false });
   width = 1; height = 1;
 
   constructor(readonly container: HTMLElement) {
@@ -40,7 +56,8 @@ export class Viewport {
     this.persp = new THREE.PerspectiveCamera(40, 1, 0.5, 20000);
     this.persp.position.set(160, 120, 200); this.persp.up.set(0, 1, 0); this.persp.lookAt(this.target);
     this.ortho = new THREE.OrthographicCamera(-1, 1, 1, -1, -5000, 5000);
-    this.scene.add(this.bodies, this.sketches, this.helpers);
+    this.scene.add(this.bodies, this.sketches, this.helpers, this.highlights);
+    this.highlights.renderOrder = 5;
     const hemi = new THREE.HemisphereLight(0xdfe6f0, 0x2a2f38, 1.1); this.scene.add(hemi);
     const key = new THREE.DirectionalLight(0xffffff, 1.4); key.position.set(200, 300, 250); this.scene.add(key);
     const fill = new THREE.DirectionalLight(0xffe2c0, 0.5); fill.position.set(-250, 100, -150); this.scene.add(fill);
@@ -59,10 +76,12 @@ export class Viewport {
     this.axes = axes; this.helpers.add(axes);
   }
 
+  /** Desenha só os planos base; planos de face existem no documento mas não viram quadrados na cena. */
   setPlanes(planes: Plane[]): void {
     for (const m of this.planeMeshes.values()) this.helpers.remove(m);
     this.planeMeshes.clear();
     for (const p of planes) {
+      if (p.kind === 'face') continue;
       const geo = new THREE.PlaneGeometry(120, 120);
       const mat = new THREE.MeshBasicMaterial({ color: 0x4aa3ff, transparent: true, opacity: 0.06, side: THREE.DoubleSide, depthWrite: false });
       const mesh = new THREE.Mesh(geo, mat);
@@ -87,20 +106,61 @@ export class Viewport {
     this.requestRender();
   }
 
-  setBodies(meshes: BodyMesh[], selected: string | null): void {
-    this.bodies.clear();
+  /** Substitui os corpos da cena e aplica a seleção (corpo, face, arestas). */
+  setBodies(list: RenderBody[], sel: Sel3D): void {
+    this.bodies.clear(); this.bodyMeshes.clear(); this.bodyData.clear();
     // A grade vira piso: fica logo abaixo do ponto mais baixo dos corpos.
     let minY = 0;
-    for (const b of meshes) { b.geometry.computeBoundingBox(); const bb = b.geometry.boundingBox; if (bb) minY = Math.min(minY, bb.min.y); }
+    for (const b of list) { b.geometry.computeBoundingBox(); const bb = b.geometry.boundingBox; if (bb) minY = Math.min(minY, bb.min.y); }
     if (this.grid) this.grid.position.y = minY - 0.5;
-    for (const b of meshes) {
-      const mesh = new THREE.Mesh(b.geometry, b.feature.id === selected ? this.bodySelMaterial : this.bodyMaterial);
-      mesh.userData.featureId = b.feature.id;
-      const edges = new THREE.LineSegments(new THREE.EdgesGeometry(b.geometry, 25), this.edgeMaterial);
-      mesh.add(edges);
-      this.bodies.add(mesh);
+    for (const b of list) {
+      const mesh = new THREE.Mesh(b.geometry, b.id === sel.body ? this.bodySelMaterial : this.bodyMaterial);
+      mesh.userData.bodyId = b.id;
+      if (b.data) {
+        this.bodyData.set(b.id, b.data);
+        const segs: number[] = [];
+        for (const e of b.data.edges) for (let i = 0; i + 5 < e.points.length; i += 3) segs.push(e.points[i], e.points[i + 1], e.points[i + 2], e.points[i + 3], e.points[i + 4], e.points[i + 5]);
+        if (segs.length) { const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.Float32BufferAttribute(segs, 3)); mesh.add(new THREE.LineSegments(g, this.edgeMaterial)); }
+      } else {
+        mesh.add(new THREE.LineSegments(new THREE.EdgesGeometry(b.geometry, 25), this.edgeMaterial));
+      }
+      this.bodies.add(mesh); this.bodyMeshes.set(b.id, mesh);
+    }
+    this.setSelection(sel);
+  }
+
+  /** Redesenha só os destaques de face e aresta. */
+  setSelection(sel: Sel3D): void {
+    this.highlights.clear();
+    for (const [id, mesh] of this.bodyMeshes) mesh.material = id === sel.body ? this.bodySelMaterial : this.bodyMaterial;
+    if (sel.face) {
+      const data = this.bodyData.get(sel.face.body); const mesh = this.bodyMeshes.get(sel.face.body);
+      const f = data?.faces[sel.face.index];
+      if (data && mesh && f) {
+        const g = new THREE.BufferGeometry();
+        g.setAttribute('position', mesh.geometry.getAttribute('position'));
+        g.setIndex(new THREE.BufferAttribute(data.indices.slice(f.triStart * 3, (f.triStart + f.triCount) * 3), 1));
+        const hl = new THREE.Mesh(g, this.faceSelMaterial); hl.renderOrder = 5; this.highlights.add(hl);
+      }
+    }
+    for (const e of sel.edges) {
+      const data = this.bodyData.get(e.body); const ed = data?.edges[e.index]; if (!ed) continue;
+      const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.Float32BufferAttribute(ed.points, 3));
+      const line = new THREE.Line(g, this.edgeSelMaterial); line.renderOrder = 6; this.highlights.add(line);
+      // Pontas marcadas para a aresta ficar visível mesmo fininha.
+      for (const k of [0, ed.points.length - 3]) {
+        const s = new THREE.Mesh(new THREE.SphereGeometry(this.worldPerPixel() * 3, 8, 6), this.edgeSelMaterial as unknown as THREE.Material);
+        s.position.set(ed.points[k], ed.points[k + 1], ed.points[k + 2]); s.renderOrder = 6; this.highlights.add(s);
+      }
     }
     this.requestRender();
+  }
+
+  /** Tamanho aproximado de um pixel em mm no alvo da câmera (modo vista). */
+  worldPerPixel(): number {
+    if (this.mode === 'sketch') return this.mmPerPixel();
+    const dist = this.persp.position.distanceTo(this.target);
+    return (2 * Math.tan((this.persp.fov * Math.PI) / 360) * dist) / this.height;
   }
 
   resize(): void {
@@ -141,8 +201,7 @@ export class Viewport {
       const shift = right.multiplyScalar(-dx * mm).add(up.multiplyScalar(dy * mm));
       this.ortho.position.add(shift); this.target.add(shift);
     } else {
-      const dist = this.persp.position.distanceTo(this.target);
-      const scale = (2 * Math.tan((this.persp.fov * Math.PI) / 360) * dist) / this.height;
+      const scale = this.worldPerPixel();
       const right = new THREE.Vector3(), up = new THREE.Vector3();
       this.persp.matrixWorld.extractBasis(right, up, new THREE.Vector3());
       const shift = right.multiplyScalar(-dx * scale).add(up.multiplyScalar(dy * scale));
@@ -225,19 +284,53 @@ export class Viewport {
     return { x: ((q.x + 1) / 2) * this.width, y: ((1 - q.y) / 2) * this.height };
   }
 
-  pickPlane(x: number, y: number): string | null {
+  private setRay(x: number, y: number): void {
     const ndc = new THREE.Vector2((x / this.width) * 2 - 1, -(y / this.height) * 2 + 1);
     this.raycaster.setFromCamera(ndc, this.camera);
+  }
+
+  pickPlane(x: number, y: number): string | null {
+    this.setRay(x, y);
     const hits = this.raycaster.intersectObjects([...this.planeMeshes.values()], false);
     return hits.length ? (hits[0].object.userData.planeId as string) : null;
   }
-  pickBody(x: number, y: number): string | null {
-    const ndc = new THREE.Vector2((x / this.width) * 2 - 1, -(y / this.height) * 2 + 1);
-    this.raycaster.setFromCamera(ndc, this.camera);
-    const meshes: THREE.Object3D[] = []; this.bodies.children.forEach((m) => meshes.push(m));
-    const hits = this.raycaster.intersectObjects(meshes, false);
-    return hits.length ? (hits[0].object.userData.featureId as string) : null;
+
+  /** Face sob o cursor (corpo do kernel). Para corpos de prévia devolve índice -1. */
+  pickFace(x: number, y: number): FaceHit | null {
+    this.setRay(x, y);
+    const hits = this.raycaster.intersectObjects([...this.bodyMeshes.values()], false);
+    if (!hits.length) return null;
+    const h = hits[0]; const body = h.object.userData.bodyId as Id; const data = this.bodyData.get(body);
+    const index = data && h.faceIndex != null ? data.triFace[h.faceIndex] : -1;
+    return { body, index, distance: h.distance, point: h.point };
   }
+
+  /** Aresta a menos de `tolPx` pixels do cursor, ignorando as escondidas atrás de faces. */
+  pickEdge(x: number, y: number, tolPx: number, faceHit: FaceHit | null): EdgeHit | null {
+    let best: EdgeHit | null = null; let bestPx = tolPx;
+    const cam = this.camera; const camPos = new THREE.Vector3().setFromMatrixPosition(cam.matrixWorld);
+    const a = new THREE.Vector3(), b = new THREE.Vector3(), q = new THREE.Vector3();
+    for (const [body, data] of this.bodyData) {
+      for (const e of data.edges) {
+        const pts = e.points;
+        for (let i = 0; i + 5 < pts.length; i += 3) {
+          a.set(pts[i], pts[i + 1], pts[i + 2]); b.set(pts[i + 3], pts[i + 4], pts[i + 5]);
+          const sa = this.worldToScreen(a), sb = this.worldToScreen(b);
+          const dx = sb.x - sa.x, dy = sb.y - sa.y; const L2 = dx * dx + dy * dy;
+          const t = L2 > 0 ? Math.max(0, Math.min(1, ((x - sa.x) * dx + (y - sa.y) * dy) / L2)) : 0;
+          const px = Math.hypot(sa.x + t * dx - x, sa.y + t * dy - y);
+          if (px >= bestPx) continue;
+          // Oclusão: ponto da aresta mais longe da câmera que a face tocada (com folga) fica escondido.
+          if (faceHit) { q.copy(a).lerp(b, t); const d = this.mode === 'sketch' ? 0 : q.distanceTo(camPos); if (d > faceHit.distance + Math.max(0.5, faceHit.distance * 0.004)) continue; }
+          bestPx = px; best = { body, index: e.index, px };
+        }
+      }
+    }
+    return best;
+  }
+
+  bodyDataOf(id: Id): BodyData | undefined { return this.bodyData.get(id); }
+
   /** Distância em pixels de um ponto 3D ao cursor. */
   screenDistance(p: THREE.Vector3, x: number, y: number): number { const s = this.worldToScreen(p); return Math.hypot(s.x - x, s.y - y); }
 

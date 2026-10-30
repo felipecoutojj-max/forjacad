@@ -36,6 +36,8 @@ export class SketchRenderer {
   }
 
   update(s: Sketch, plane: Plane, sel: Selection, active: boolean, mmPerPx: number): void {
+    // O esboço ativo fica sempre visível, mesmo sobre a face de um corpo (sem teste de profundidade).
+    for (const o of [this.lines, this.dims, this.points, this.stroke]) { const m = o.material as THREE.Material; if (m.depthTest !== !active) { m.depthTest = !active; m.needsUpdate = true; } }
     const pos: number[] = []; const col: number[] = [];
     const push = (a: Vec2, b: Vec2, c: THREE.Color) => { pos.push(...planeToWorld(plane, a.x, a.y, 0.05), ...planeToWorld(plane, b.x, b.y, 0.05)); col.push(c.r, c.g, c.b, c.r, c.g, c.b); };
     for (const e of s.entities) {

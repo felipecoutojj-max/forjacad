@@ -1,47 +1,66 @@
 // Exportação de malhas: STL binário (impressão 3D, visualizadores) e OBJ (ZBrush, com grupos).
+// Trabalha sobre arrays puros, então serve tanto às malhas do kernel quanto às da prévia.
 
-import * as THREE from 'three';
+import type * as THREE from 'three';
+import type { BodyData } from '../kernel/occ/types';
 
-export interface NamedMesh { name: string; geometry: THREE.BufferGeometry; }
+export interface MeshGroup { name: string; /** em triângulos */ start: number; count: number; }
+export interface MeshData { name: string; positions: Float32Array; indices: Uint32Array; groups?: MeshGroup[]; }
 
-function triangles(geo: THREE.BufferGeometry): Float32Array {
-  const g = geo.index ? geo.toNonIndexed() : geo;
-  return g.getAttribute('position').array as Float32Array;
+export function fromGeometry(name: string, geo: THREE.BufferGeometry): MeshData {
+  const pos = geo.getAttribute('position').array as Float32Array;
+  const n = pos.length / 3;
+  let indices: Uint32Array;
+  if (geo.index) indices = Uint32Array.from(geo.index.array as ArrayLike<number>);
+  else { indices = new Uint32Array(n); for (let i = 0; i < n; i++) indices[i] = i; }
+  const groups: MeshGroup[] = geo.groups.length ? geo.groups.map((g, i) => ({ name: g.materialIndex === 0 ? `tampas${i}` : `lateral${i}`, start: g.start / 3, count: (g.count === Infinity ? indices.length - g.start : g.count) / 3 })) : [];
+  return { name, positions: pos, indices, groups };
+}
+
+/** Malha de um corpo do kernel, com um grupo por face B-rep (vira polygroup no ZBrush). */
+export function fromBody(b: BodyData): MeshData {
+  return { name: b.name, positions: b.positions, indices: b.indices, groups: b.faces.map((f) => ({ name: `face${f.index + 1}`, start: f.triStart, count: f.triCount })) };
 }
 
 /** STL binário com todos os corpos juntos. */
-export function toSTL(meshes: NamedMesh[]): ArrayBuffer {
-  const tris = meshes.map((m) => triangles(m.geometry));
-  const count = tris.reduce((acc, t) => acc + t.length / 9, 0);
+export function toSTL(meshes: MeshData[]): ArrayBuffer {
+  const count = meshes.reduce((acc, m) => acc + m.indices.length / 3, 0);
   const buf = new ArrayBuffer(84 + count * 50); const dv = new DataView(buf);
   const header = new TextEncoder().encode('ForjaCAD STL binario'); new Uint8Array(buf, 0, 80).set(header.subarray(0, 80));
   dv.setUint32(80, count, true);
-  let off = 84; const a = new THREE.Vector3(), b = new THREE.Vector3(), c = new THREE.Vector3(), n = new THREE.Vector3();
-  for (const t of tris) for (let i = 0; i < t.length; i += 9) {
-    a.set(t[i], t[i + 1], t[i + 2]); b.set(t[i + 3], t[i + 4], t[i + 5]); c.set(t[i + 6], t[i + 7], t[i + 8]);
-    n.subVectors(c, b).cross(a.clone().sub(b)).normalize();
-    for (const v of [n, a, b, c]) { dv.setFloat32(off, v.x, true); dv.setFloat32(off + 4, v.y, true); dv.setFloat32(off + 8, v.z, true); off += 12; }
-    dv.setUint16(off, 0, true); off += 2;
+  let off = 84;
+  for (const m of meshes) {
+    const p = m.positions, ix = m.indices;
+    for (let i = 0; i < ix.length; i += 3) {
+      const a = ix[i] * 3, b = ix[i + 1] * 3, c = ix[i + 2] * 3;
+      const ux = p[b] - p[a], uy = p[b + 1] - p[a + 1], uz = p[b + 2] - p[a + 2];
+      const vx = p[c] - p[a], vy = p[c + 1] - p[a + 1], vz = p[c + 2] - p[a + 2];
+      let nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
+      const L = Math.hypot(nx, ny, nz) || 1; nx /= L; ny /= L; nz /= L;
+      dv.setFloat32(off, nx, true); dv.setFloat32(off + 4, ny, true); dv.setFloat32(off + 8, nz, true); off += 12;
+      for (const k of [a, b, c]) { dv.setFloat32(off, p[k], true); dv.setFloat32(off + 4, p[k + 1], true); dv.setFloat32(off + 8, p[k + 2], true); off += 12; }
+      dv.setUint16(off, 0, true); off += 2;
+    }
   }
   return buf;
 }
 
-/** OBJ com um objeto por corpo e grupos por tampa e lateral (o ZBrush lê grupos como polygroups). */
-export function toOBJ(meshes: NamedMesh[]): string {
+/** OBJ com um objeto por corpo e grupos por face (o ZBrush lê grupos como polygroups). */
+export function toOBJ(meshes: MeshData[]): string {
   const lines: string[] = ['# ForjaCAD OBJ', '# unidades: mm'];
   let vbase = 1;
   for (const m of meshes) {
-    const g = m.geometry.index ? m.geometry.toNonIndexed() : m.geometry;
-    const pos = g.getAttribute('position').array as Float32Array;
-    lines.push(`o ${m.name.replace(/\s+/g, '_')}`);
-    for (let i = 0; i < pos.length; i += 3) lines.push(`v ${fmt(pos[i])} ${fmt(pos[i + 1])} ${fmt(pos[i + 2])}`);
-    const groups = g.groups.length ? g.groups : [{ start: 0, count: pos.length / 3, materialIndex: 0 }];
-    groups.forEach((gr, gi) => {
-      lines.push(`g ${m.name.replace(/\s+/g, '_')}_${gr.materialIndex === 0 ? 'tampas' : 'lateral'}${gi}`);
-      const end = gr.count === Infinity ? pos.length / 3 : gr.start + gr.count;
-      for (let i = gr.start; i < end; i += 3) lines.push(`f ${vbase + i} ${vbase + i + 1} ${vbase + i + 2}`);
-    });
-    vbase += pos.length / 3;
+    const safe = m.name.replace(/\s+/g, '_');
+    lines.push(`o ${safe}`);
+    const p = m.positions;
+    for (let i = 0; i < p.length; i += 3) lines.push(`v ${fmt(p[i])} ${fmt(p[i + 1])} ${fmt(p[i + 2])}`);
+    const groups = m.groups?.length ? m.groups : [{ name: 'todas', start: 0, count: m.indices.length / 3 }];
+    for (const g of groups) {
+      lines.push(`g ${safe}_${g.name}`);
+      const end = (g.start + g.count) * 3;
+      for (let i = g.start * 3; i < end; i += 3) lines.push(`f ${vbase + m.indices[i]} ${vbase + m.indices[i + 1]} ${vbase + m.indices[i + 2]}`);
+    }
+    vbase += p.length / 3;
   }
   return lines.join('\n') + '\n';
 }

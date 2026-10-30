@@ -6,7 +6,9 @@ const base = process.env.BASE_PATH ?? '/';
 
 export default defineConfig({
   base,
-  build: { target: 'es2022', sourcemap: false },
+  build: { target: 'es2022', sourcemap: false, chunkSizeWarningLimit: 1500 },
+  worker: { format: 'es' },
+  optimizeDeps: { exclude: ['opencascade.js'] },
   plugins: [
     VitePWA({
       registerType: 'autoUpdate',
@@ -30,8 +32,15 @@ export default defineConfig({
       workbox: {
         globPatterns: ['**/*.{js,css,html,png,svg,woff2}'],
         maximumFileSizeToCacheInBytes: 8 * 1024 * 1024,
+        // O kernel OpenCASCADE (.wasm, ~50 MB) fica fora do pré-cache: se a cota de armazenamento do
+        // aparelho não comportar, o app continua instalando. Ele entra no cache no primeiro uso, quando couber.
+        runtimeCaching: [{
+          urlPattern: /\.wasm$/,
+          handler: 'CacheFirst',
+          options: { cacheName: 'forjacad-kernel', cacheableResponse: { statuses: [0, 200] }, expiration: { maxEntries: 2 } },
+        }],
       },
     }),
   ],
-  test: { environment: 'node', include: ['src/**/*.test.ts'] },
+  test: { environment: 'node', include: ['src/**/*.test.ts'], testTimeout: 60000, hookTimeout: 60000 },
 } as any);

@@ -1,16 +1,22 @@
-// Aplicativo: ferramentas, gestos, painel lateral, desfazer, autosave e arquivos.
+// Aplicativo: ferramentas, gestos, painel lateral, desfazer, autosave, arquivos e o diálogo com o kernel 3D.
 
 import * as THREE from 'three';
-import { Viewport } from './viewport';
+import { Viewport, emptySel3D, type Sel3D, type RenderBody } from './viewport';
 import { SketchRenderer, emptySelection, type Selection, dimEndpoints, fmtDim } from './sketchRenderer';
 import { icons, type IconName } from './icons';
-import { createDocument, serialize, deserialize, getPlane, getSketch, addExtrude, type ForjaDocument, type Plane } from '../core/document';
+import {
+  createDocument, serialize, deserialize, getPlane, getSketch, addExtrude, addFillet, addBoolean, addFacePlane, pruneFacePlanes,
+  bodyIds, bodyName, featuresOfBody, planeNormal,
+  type ForjaDocument, type Plane, type Feature, type ExtrudeFeature, type ExtrudeOp, type V3,
+} from '../core/document';
 import * as M from '../core/sketch/model';
 import type { Sketch, Entity, Id, ConstraintKind, DimensionKind } from '../core/sketch/model';
 import { solveSketch, type SolveResult } from '../core/sketch/solver';
 import { recognizeStroke, type Primitive } from '../core/sketch/recognizer';
 import { buildAllBodies } from '../core/kernel/preview';
-import { toSTL, toOBJ } from '../core/export/mesh';
+import { KernelClient, SupersededError } from '../core/kernel/occ/client';
+import type { BodyData, FeatureError, RebuildResult } from '../core/kernel/occ/types';
+import { toSTL, toOBJ, fromBody, fromGeometry, type MeshData } from '../core/export/mesh';
 import { saveLocal, loadLocal, downloadFile, pickFile, safeFileName } from './storage';
 import { type Vec2, v2, dist, distPointSegment, distPointArc, closestOnSegment, sub, add, scale, norm, angleOf, normAngle, TAU, round } from '../core/geom';
 
@@ -22,18 +28,30 @@ interface Hit { kind: 'point' | 'entity' | 'dimension'; id: Id; d: number; }
 const H_V_SNAP_DEG = 6;
 const TANGENT_SNAP_DEG = 12;
 
+const v3sub = (a: V3, b: V3): V3 => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+const v3dot = (a: V3, b: V3) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+const v3cross = (a: V3, b: V3): V3 => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+const v3neg = (a: V3): V3 => [-a[0], -a[1], -a[2]];
+const fmtMm3 = (v: number) => (v >= 1000 ? `${(v / 1000).toFixed(2).replace('.', ',')} cm³` : `${v.toFixed(1).replace('.', ',')} mm³`);
+
 export class App {
   readonly doc: { current: ForjaDocument };
   readonly vp: Viewport;
   readonly sk = new SketchRenderer();
   readonly inactiveSketches = new Map<Id, SketchRenderer>();
+  readonly kernel = new KernelClient();
   private undoStack: string[] = []; private redoStack: string[] = [];
   mode: 'view' | 'sketch' = 'view';
   activeSketch: Id | null = null;
   tool: Tool = 'draw';
   touchDraws = false;
   sel: Selection = emptySelection();
+  sel3d: Sel3D = emptySel3D();
   selectedFeature: Id | null = null;
+  /** Corpos do último recálculo do kernel. */
+  bodies: BodyData[] = [];
+  featureErrors: FeatureError[] = [];
+  private busy = 0;
   private pointers = new Map<number, PointerInfo>();
   private pinch: { d0: number; mid: { x: number; y: number } } | null = null;
   private stroke: Vec2[] = [];
@@ -61,6 +79,11 @@ export class App {
     this.vp.onAfterRender = () => this.placeLabels();
     this.bindPointer();
     this.bindKeys();
+    this.kernel.onState = (s) => {
+      this.renderStatus();
+      if (s === 'ready') { this.toast(`Kernel 3D pronto (${(this.kernel.loadMs / 1000).toFixed(1)} s).`); void this.rebuild(); }
+      else if (s === 'failed') this.toast(`Kernel 3D indisponível: ${this.kernel.failure}. Mostrando só a prévia.`, 'err');
+    };
     this.refreshAll();
     this.vp.fitAll();
     window.addEventListener('beforeunload', () => this.autosave());
@@ -95,7 +118,7 @@ export class App {
   }
 
   toast(msg: string, kind: '' | 'err' = ''): void {
-    const t = el('div', `toast ${kind}`); t.textContent = msg; this.toasts.append(t); setTimeout(() => t.remove(), 3300);
+    const t = el('div', `toast ${kind}`); t.textContent = msg; this.toasts.append(t); setTimeout(() => t.remove(), kind ? 5200 : 3300);
   }
 
   // ---------- Estado e render ----------
@@ -121,10 +144,11 @@ export class App {
   private autosave(): void { saveLocal(serialize(this.doc.current)); }
 
   /** Recalcula tudo que depende do documento e redesenha. */
-  refreshAll(): void {
+  refreshAll(rebuild = true): void {
     const doc = this.doc.current;
     this.vp.setPlanes(doc.planes);
-    this.vp.setBodies(buildAllBodies(doc), this.selectedFeature);
+    if (this.selectedFeature && !doc.features.some((f) => f.id === this.selectedFeature)) this.selectedFeature = null;
+    if (rebuild) void this.rebuild();
     // Esboços inativos aparecem em 3D (para escolher e extrudar).
     for (const [id, r] of this.inactiveSketches) if (!doc.sketches.some((s) => s.id === id)) { this.vp.scene.remove(r.group); this.inactiveSketches.delete(id); }
     for (const s of doc.sketches) {
@@ -145,9 +169,68 @@ export class App {
     this.vp.requestRender();
   }
 
+  // ---------- Kernel 3D ----------
+  /** Pede ao kernel os corpos atuais. Enquanto ele não está pronto, mostra a prévia em malha. */
+  private async rebuild(): Promise<RebuildResult | null> {
+    const doc = this.doc.current;
+    if (this.kernel.state !== 'ready') {
+      this.bodies = []; this.featureErrors = [];
+      const preview = buildAllBodies(doc).map((b): RenderBody => ({ id: b.feature.id, name: bodyName(doc, b.feature.id), geometry: b.geometry }));
+      this.vp.setBodies(preview, this.sel3d);
+      return null;
+    }
+    this.busy++; this.renderStatus();
+    try {
+      const r = await this.kernel.rebuild(doc);
+      this.bodies = r.bodies; this.featureErrors = r.errors;
+      this.pruneSel3d();
+      this.vp.setBodies(this.bodies.map(toRenderBody), this.sel3d);
+      this.renderSidePanel(); this.renderToolbar();
+      return r;
+    } catch (e) {
+      if (!(e instanceof SupersededError)) this.toast(`Kernel: ${(e as Error).message}`, 'err');
+      return null;
+    } finally { this.busy--; this.renderStatus(); }
+  }
+
+  private pruneSel3d(): void {
+    const has = (id: Id | null) => !!id && this.bodies.some((b) => b.id === id);
+    if (!has(this.sel3d.body)) this.sel3d.body = null;
+    if (this.sel3d.face && !(has(this.sel3d.face.body) && this.bodies.find((b) => b.id === this.sel3d.face!.body)!.faces.length > this.sel3d.face.index)) this.sel3d.face = null;
+    this.sel3d.edges = this.sel3d.edges.filter((e) => has(e.body) && this.bodies.find((b) => b.id === e.body)!.edges.length > e.index);
+  }
+
+  /** Aplica uma mudança de feature e desfaz sozinho se o kernel reprovar. */
+  private async tryFeature(mutate: () => Feature | null, onOk?: (f: Feature) => void): Promise<void> {
+    const snapshot = serialize(this.doc.current);
+    this.pushUndo();
+    const f = mutate();
+    if (!f) { this.undoStack.pop(); return; }
+    this.refreshAll(false);
+    const r = await this.rebuild();
+    if (!r) { onOk?.(f); return; } // kernel ausente: fica a prévia
+    const err = r.errors.find((e) => e.feature === f.id);
+    if (err) {
+      this.doc.current = deserialize(snapshot); this.undoStack.pop();
+      this.toast(`Não deu: ${err.message}.`, 'err');
+      this.refreshAll();
+      return;
+    }
+    onOk?.(f);
+  }
+
   private renderStatus(): void {
     const s = this.sketch;
-    if (!s) { const n = this.doc.current.features.length; this.statusEl.textContent = n ? `${n} corpo${n > 1 ? 's' : ''}` : 'Toque em um plano para esboçar'; this.statusEl.className = 'status'; return; }
+    if (!s) {
+      const n = this.bodies.length; const errs = this.featureErrors.length;
+      let txt: string; let cls = 'status';
+      if (this.busy) { txt = 'Calculando…'; }
+      else if (this.kernel.state === 'loading') { txt = 'Carregando kernel 3D (50 MB, só na primeira vez)…'; cls = 'status warn'; }
+      else if (this.kernel.state === 'failed') { txt = 'Kernel 3D indisponível: só prévia'; cls = 'status err'; }
+      else if (!this.doc.current.features.length) txt = 'Toque em um plano para esboçar';
+      else { txt = n ? `${n} corpo${n > 1 ? 's' : ''}` : 'Nenhum corpo'; if (errs) { txt += ` · ${errs} feature${errs > 1 ? 's' : ''} com erro`; cls = 'status warn'; } }
+      this.statusEl.textContent = txt; this.statusEl.className = cls; return;
+    }
     const r = this.lastSolve;
     if (!r) { this.statusEl.textContent = 'Esboço'; this.statusEl.className = 'status'; return; }
     if (!r.converged) { this.statusEl.textContent = 'Restrições em conflito'; this.statusEl.className = 'status err'; }
@@ -170,10 +253,19 @@ export class App {
     } else {
       g1.append(this.iconButton('sketch', 'Esboço', (ev) => this.newSketchMenu(ev)));
       g1.append(this.iconButton('extrude', 'Extrudar', (ev) => this.extrudeMenu(ev)));
+      const hasEdges = this.sel3d.edges.length > 0;
+      const fil = this.iconButton('fillet', 'Filete', () => this.filletSelected('fillet')); fil.disabled = !hasEdges; g1.append(fil);
+      const cha = this.iconButton('chamfer', 'Chanfro', () => this.filletSelected('chamfer')); cha.disabled = !hasEdges; g1.append(cha);
+      if (this.sel3d.face && this.faceIsPlanar(this.sel3d.face)) g1.append(this.iconButton('face', 'Esboçar na face', () => this.createSketchOnFace(this.sel3d.face!.body, this.sel3d.face!.index)));
+      if (this.sel3d.body && bodyIds(this.doc.current).length > 1) g1.append(this.iconButton('boolean', 'Combinar', (ev) => this.booleanMenu(ev)));
       g2.append(this.iconButton('view', 'Vistas', (ev) => this.viewMenu(ev)));
       g2.append(this.iconButton('fit', 'Enquadrar', () => this.vp.fitAll()));
       this.toolbar.append(g1, g2);
     }
+  }
+
+  private faceIsPlanar(ref: { body: Id; index: number }): boolean {
+    const f = this.bodies.find((b) => b.id === ref.body)?.faces[ref.index]; return !!f && f.type === 'plane';
   }
 
   private renderSidePanel(): void {
@@ -188,7 +280,6 @@ export class App {
         : this.tool === 'select' ? 'Toque para selecionar. Arraste pontos para ajustar. Selecione elementos para ver restrições possíveis.'
         : this.tool === 'erase' ? 'Toque no que quer apagar.' : 'Arraste para desenhar. Pontas próximas se juntam sozinhas.';
       p.append(hint);
-      // Restrições aplicáveis à seleção.
       const cons = this.applicableConstraints();
       if (cons.length) {
         p.append(h3('Restrições'));
@@ -196,63 +287,147 @@ export class App {
         for (const c of cons) grid.append(this.button(c.label, () => this.applyConstraint(c.kind, c.refs)));
         p.append(grid);
       }
-      // Seleção: alternar construção, apagar.
       if (this.sel.entities.size || this.sel.points.size || this.sel.dimensions.size) {
         const row = el('div', 'row');
         if (this.sel.entities.size) row.append(this.button('Construção', () => this.toggleConstruction()));
         row.append(this.button('Apagar', () => this.deleteSelection(), 'btn danger'));
         p.append(row);
       }
-      // Lista de restrições existentes.
       if (s.constraints.length) {
         p.append(h3(`Restrições (${s.constraints.length})`));
         const list = el('div', 'list');
         for (const k of s.constraints) {
           const it = listItem(constraintName(k.kind), '×');
-          it.addEventListener('click', () => { this.pushUndo(); M.removeConstraint(s, k.id); this.solve(); this.refreshAll(); });
+          it.addEventListener('click', () => { this.pushUndo(); M.removeConstraint(s, k.id); this.solve(); this.refreshAll(false); });
           list.append(it);
         }
         p.append(list);
       }
-    } else {
-      p.append(h3('Esboços'));
-      const list = el('div', 'list');
-      if (!doc.sketches.length) { const d = el('div', 'hint'); d.textContent = 'Nenhum esboço ainda. Toque em "Esboço" e escolha um plano, ou toque direto num plano.'; list.append(d); }
-      for (const s of doc.sketches) {
-        const pl = getPlane(doc, s.plane);
-        const it = listItem(s.name, pl.name);
-        it.addEventListener('click', () => this.enterSketch(s.id));
-        list.append(it);
-      }
-      p.append(list);
-      p.append(h3('Corpos'));
-      const flist = el('div', 'list');
-      if (!doc.features.length) { const d = el('div', 'hint'); d.textContent = 'Extrude um esboço fechado para criar o primeiro corpo.'; flist.append(d); }
-      for (const f of doc.features) {
-        const it = listItem(f.name, `${fmtDim('distance', f.depth)} mm`);
-        if (this.selectedFeature === f.id) it.classList.add('active');
-        it.addEventListener('click', () => { this.selectedFeature = this.selectedFeature === f.id ? null : f.id; this.refreshAll(); });
-        flist.append(it);
-      }
-      p.append(flist);
-      const f = doc.features.find((x) => x.id === this.selectedFeature);
-      if (f) {
-        p.append(h3(f.name));
-        const row = el('div', 'row'); const lab = document.createElement('label'); lab.textContent = 'Profundidade (mm)';
-        const inp = document.createElement('input'); inp.type = 'number'; inp.step = '0.5'; inp.value = String(f.depth); inp.inputMode = 'decimal';
-        inp.addEventListener('change', () => { const v = parseFloat(inp.value.replace(',', '.')); if (!isFinite(v) || v === 0) return; this.pushUndo(); f.depth = v; this.refreshAll(); });
-        row.append(lab, inp); p.append(row);
-        const row2 = el('div', 'row'); const lab2 = document.createElement('label'); lab2.textContent = 'Simétrico ao plano';
-        const chk = document.createElement('input'); chk.type = 'checkbox'; chk.checked = !!f.symmetric; chk.addEventListener('change', () => { this.pushUndo(); f.symmetric = chk.checked; this.refreshAll(); });
-        row2.append(lab2, chk); p.append(row2);
-        const row3 = el('div', 'row');
-        row3.append(this.button('Editar esboço', () => this.enterSketch(f.sketch)));
-        row3.append(this.button('Apagar', () => { this.pushUndo(); doc.features = doc.features.filter((x) => x.id !== f.id); this.selectedFeature = null; this.refreshAll(); }, 'btn danger'));
-        p.append(row3);
-      }
-      const info = el('div', 'hint'); info.textContent = 'Unidades em milímetros. Autosave ligado neste aparelho. Use "Salvar" para gerar o arquivo .forja.'; p.append(info);
+      return;
+    }
+
+    // ----- Modo vista -----
+    this.renderSelectionPanel(p);
+
+    p.append(h3('Esboços'));
+    const list = el('div', 'list');
+    if (!doc.sketches.length) { const d = el('div', 'hint'); d.textContent = 'Nenhum esboço ainda. Toque em "Esboço" e escolha um plano, ou toque direto num plano.'; list.append(d); }
+    for (const s of doc.sketches) {
+      const pl = getPlane(doc, s.plane);
+      const it = listItem(s.name, pl.name);
+      it.addEventListener('click', () => this.enterSketch(s.id));
+      list.append(it);
+    }
+    p.append(list);
+
+    p.append(h3(`Features (${doc.features.length})`));
+    const flist = el('div', 'list');
+    if (!doc.features.length) { const d = el('div', 'hint'); d.textContent = 'Extrude um esboço fechado para criar o primeiro corpo.'; flist.append(d); }
+    for (const f of doc.features) {
+      const err = this.featureErrors.find((e) => e.feature === f.id);
+      const it = listItem(`${err ? '⚠ ' : ''}${f.name}`, featureMini(f));
+      if (err) it.title = err.message;
+      if (this.selectedFeature === f.id) it.classList.add('active');
+      it.addEventListener('click', () => { this.selectedFeature = this.selectedFeature === f.id ? null : f.id; this.sel3d = emptySel3D(); if (this.selectedFeature) this.sel3d.body = bodyOfFeature(f); this.vp.setSelection(this.sel3d); this.renderSidePanel(); this.renderToolbar(); });
+      flist.append(it);
+    }
+    p.append(flist);
+    const f = doc.features.find((x) => x.id === this.selectedFeature);
+    if (f) this.renderFeatureEditor(p, f);
+
+    const info = el('div', 'hint'); info.textContent = 'Unidades em milímetros. Autosave ligado neste aparelho. Use "Salvar" para gerar o arquivo .forja.'; p.append(info);
+  }
+
+  private renderSelectionPanel(p: HTMLElement): void {
+    const doc = this.doc.current; const s3 = this.sel3d;
+    if (!s3.body && !s3.face && !s3.edges.length) return;
+    p.append(h3('Seleção'));
+    const body = this.bodies.find((b) => b.id === (s3.face?.body ?? s3.edges[0]?.body ?? s3.body));
+    if (s3.edges.length) {
+      const d = el('div', 'hint'); d.textContent = `${s3.edges.length} aresta${s3.edges.length > 1 ? 's' : ''} de ${body?.name ?? 'corpo'}. Toque em outras para somar.`; p.append(d);
+      const row = el('div', 'row');
+      row.append(this.button('Filete…', () => this.filletSelected('fillet')), this.button('Chanfro…', () => this.filletSelected('chamfer')), this.button('Limpar', () => this.clearSel3d()));
+      p.append(row);
+    } else if (s3.face && body) {
+      const f = body.faces[s3.face.index];
+      const d = el('div', 'hint'); d.textContent = f ? `Face ${faceTypeName(f.type)} de ${body.name}, ${f.area.toFixed(0)} mm².` : body.name; p.append(d);
+      const row = el('div', 'row');
+      if (f?.type === 'plane') row.append(this.button('Esboçar nesta face', () => this.createSketchOnFace(body.id, s3.face!.index), 'btn primary'));
+      row.append(this.button('Limpar', () => this.clearSel3d()));
+      p.append(row);
+    } else if (s3.body && body) {
+      const d = el('div', 'hint'); d.textContent = `${body.name}: volume ${fmtMm3(body.volume)}, ${body.faces.length} faces, ${body.edges.length} arestas.`; p.append(d);
+      const row = el('div', 'row');
+      if (bodyIds(doc).length > 1) row.append(this.button('Combinar…', (ev) => this.booleanMenu(ev)));
+      row.append(this.button('Apagar corpo', () => this.deleteBody(body.id), 'btn danger'));
+      row.append(this.button('Limpar', () => this.clearSel3d()));
+      p.append(row);
     }
   }
+
+  private renderFeatureEditor(p: HTMLElement, f: Feature): void {
+    const doc = this.doc.current;
+    p.append(h3(f.name));
+    const err = this.featureErrors.find((e) => e.feature === f.id);
+    if (err) { const d = el('div', 'hint err'); d.textContent = `Erro: ${err.message}`; p.append(d); }
+    const numRow = (label: string, value: number, onChange: (v: number) => void) => {
+      const row = el('div', 'row'); const lab = document.createElement('label'); lab.textContent = label;
+      const inp = document.createElement('input'); inp.type = 'number'; inp.step = '0.5'; inp.value = String(value); inp.inputMode = 'decimal';
+      inp.addEventListener('change', () => { const v = parseFloat(inp.value.replace(',', '.')); if (!isFinite(v) || v <= 0) return; onChange(v); });
+      row.append(lab, inp); p.append(row);
+    };
+    const checkRow = (label: string, value: boolean, onChange: (v: boolean) => void) => {
+      const row = el('div', 'row'); const lab = document.createElement('label'); lab.textContent = label;
+      const chk = document.createElement('input'); chk.type = 'checkbox'; chk.checked = value; chk.addEventListener('change', () => onChange(chk.checked));
+      row.append(lab, chk); p.append(row);
+    };
+    const selectRow = (label: string, options: [string, string][], value: string, onChange: (v: string) => void) => {
+      const row = el('div', 'row'); const lab = document.createElement('label'); lab.textContent = label;
+      const sel = document.createElement('select'); for (const [v, t] of options) { const o = document.createElement('option'); o.value = v; o.textContent = t; sel.append(o); }
+      sel.value = value; sel.addEventListener('change', () => onChange(sel.value)); row.append(lab, sel); p.append(row);
+    };
+    const edit = (mut: () => void) => { void this.tryFeature(() => { mut(); return f; }); };
+    if (f.type === 'extrude') {
+      numRow('Profundidade (mm)', f.depth, (v) => edit(() => { f.depth = v; }));
+      const others = bodyIds(doc).filter((id) => id !== f.id);
+      const opOptions: [string, string][] = [['new', 'Novo corpo']]; if (others.length) opOptions.push(['add', 'Adicionar a corpo'], ['cut', 'Cortar corpo']);
+      selectRow('Operação', opOptions, f.op, (v) => edit(() => { f.op = v as ExtrudeOp; if (f.op === 'new') f.target = undefined; else if (!f.target || !others.includes(f.target)) f.target = others[0]; }));
+      if (f.op !== 'new' && others.length > 1) selectRow('Corpo alvo', others.map((id) => [id, bodyName(doc, id)]), f.target ?? others[0], (v) => edit(() => { f.target = v; }));
+      checkRow('Simétrico ao plano', !!f.symmetric, (v) => edit(() => { f.symmetric = v; }));
+      checkRow('Inverter sentido', !!f.flip, (v) => edit(() => { f.flip = v; }));
+      if (f.op === 'cut') checkRow('Atravessar tudo', !!f.throughAll, (v) => edit(() => { f.throughAll = v; }));
+      const row3 = el('div', 'row');
+      row3.append(this.button('Editar esboço', () => this.enterSketch(f.sketch)));
+      row3.append(this.button('Apagar', () => this.deleteFeature(f), 'btn danger'));
+      p.append(row3);
+    } else if (f.type === 'fillet' || f.type === 'chamfer') {
+      numRow(f.type === 'fillet' ? 'Raio (mm)' : 'Distância (mm)', f.radius, (v) => edit(() => { f.radius = v; }));
+      const d = el('div', 'hint'); d.textContent = `${f.edges.length} aresta${f.edges.length > 1 ? 's' : ''} em ${bodyName(doc, f.body)}.`; p.append(d);
+      const row = el('div', 'row'); row.append(this.button('Apagar', () => this.deleteFeature(f), 'btn danger')); p.append(row);
+    } else if (f.type === 'boolean') {
+      selectRow('Operação', [['union', 'União'], ['subtract', 'Subtração'], ['intersect', 'Interseção']], f.op, (v) => edit(() => { f.op = v as typeof f.op; }));
+      const d = el('div', 'hint'); d.textContent = `${bodyName(doc, f.body)} com ${bodyName(doc, f.tool)}.`; p.append(d);
+      const row = el('div', 'row'); row.append(this.button('Apagar', () => this.deleteFeature(f), 'btn danger')); p.append(row);
+    }
+  }
+
+  private deleteFeature(f: Feature): void {
+    const doc = this.doc.current;
+    const go = () => {
+      this.pushUndo();
+      const victims = new Set<Id>([f.id]);
+      if (f.type === 'extrude' && f.op === 'new') for (const d of featuresOfBody(doc, f.id)) victims.add(d.id);
+      doc.features = doc.features.filter((x) => !victims.has(x.id));
+      this.selectedFeature = null; this.sel3d = emptySel3D(); this.refreshAll();
+    };
+    const deps = f.type === 'extrude' && f.op === 'new' ? featuresOfBody(doc, f.id).length - 1 : 0;
+    if (deps > 0) this.confirm('Apagar corpo', `Apagar "${f.name}" remove também ${deps} feature${deps > 1 ? 's' : ''} que dependem desse corpo (cortes, filetes, combinações).`, go);
+    else go();
+  }
+  private deleteBody(body: Id): void {
+    const f = this.doc.current.features.find((x) => x.id === body); if (f) this.deleteFeature(f);
+  }
+  private clearSel3d(): void { this.sel3d = emptySel3D(); this.vp.setSelection(this.sel3d); this.renderSidePanel(); this.renderToolbar(); }
 
   // ---------- Rótulos (HTML sobre a cena) ----------
   private placeLabels(): void {
@@ -275,26 +450,39 @@ export class App {
   // ---------- Modo esboço ----------
   newSketchMenu(ev: MouseEvent): void {
     const doc = this.doc.current;
-    this.menu(ev.clientX, ev.clientY, doc.planes.map((p) => ({ label: `Esboço em ${p.name}`, action: () => this.createSketchOn(p.id) })));
+    this.menu(ev.clientX, ev.clientY, doc.planes.filter((p) => p.kind !== 'face').map((p) => ({ label: `Esboço em ${p.name}`, action: () => this.createSketchOn(p.id) })));
   }
-  createSketchOn(planeId: Id): void {
-    this.pushUndo();
+  createSketchOn(planeId: Id, withUndo = true): void {
+    if (withUndo) this.pushUndo();
     const n = this.doc.current.sketches.length + 1;
     const s = M.createSketch(planeId, `Esboço ${n}`); this.doc.current.sketches.push(s);
     this.enterSketch(s.id);
   }
+  /** Cria um plano a partir de uma face plana de um corpo e abre um esboço nele. */
+  createSketchOnFace(body: Id, faceIndex: number): void {
+    const doc = this.doc.current;
+    const data = this.bodies.find((b) => b.id === body); const f = data?.faces[faceIndex];
+    if (!data || !f || f.type !== 'plane' || !f.normal || !f.u || !f.v || !f.origin) { this.toast('Só dá para esboçar em faces planas.', 'err'); return; }
+    const n = f.normal; const d = v3dot(v3sub(f.center, f.origin), n);
+    const origin: V3 = [f.center[0] - n[0] * d, f.center[1] - n[1] * d, f.center[2] - n[2] * d];
+    let u = f.u, v = f.v; if (v3dot(v3cross(u, v), n) < 0) v = v3neg(v);
+    this.pushUndo();
+    const plane = addFacePlane(doc, `Face de ${data.name}`, origin, u, v, body);
+    this.createSketchOn(plane.id, false);
+  }
   enterSketch(id: Id): void {
-    this.activeSketch = id; this.mode = 'sketch'; this.tool = 'draw'; this.sel = emptySelection(); this.pendingDimRefs = []; this.selectedFeature = null;
-    const p = this.plane!; this.vp.enterSketch(p);
-    this.solve(); this.refreshAll(); this.vp.fitAll();
+    this.activeSketch = id; this.mode = 'sketch'; this.tool = 'draw'; this.sel = emptySelection(); this.pendingDimRefs = []; this.selectedFeature = null; this.sel3d = emptySel3D();
+    const p = this.plane!; this.vp.enterSketch(p); this.vp.setSelection(this.sel3d);
+    this.solve(); this.refreshAll(false); this.vp.fitAll();
   }
   exitSketch(removeEmpty: boolean): void {
     const s = this.sketch;
     if (s && removeEmpty && !s.entities.length) this.doc.current.sketches = this.doc.current.sketches.filter((x) => x.id !== s.id);
+    pruneFacePlanes(this.doc.current);
     this.activeSketch = null; this.mode = 'view'; this.sel = emptySelection(); this.pendingDimRefs = []; this.lastSolve = null;
     this.vp.exitSketch(); this.refreshAll(); this.vp.fitAll();
   }
-  setTool(t: Tool): void { this.tool = t; this.pendingDimRefs = []; if (t !== 'select') this.sel = emptySelection(); this.refreshAll(); }
+  setTool(t: Tool): void { this.tool = t; this.pendingDimRefs = []; if (t !== 'select') this.sel = emptySelection(); this.refreshAll(false); }
 
   private solve(opts?: { drag?: { point: Id; x: number; y: number } }): SolveResult | null {
     const s = this.sketch; if (!s) return null;
@@ -326,9 +514,7 @@ export class App {
     let bestP: M.SketchPoint | null = null; let bd = tol;
     for (const p of s.points) { if (exclude.has(p.id)) continue; const d = dist(uv, p); if (d < bd) { bd = d; bestP = p; } }
     if (bestP) return { id: bestP.id, created: false };
-    // origem
     if (dist(uv, v2(0, 0)) < tol) { const p = M.addPoint(s, 0, 0); M.addConstraint(s, 'fixed', [p.id]); return { id: p.id, created: true }; }
-    // sobre entidade
     let bestE: Entity | null = null; let be = tol;
     for (const e of s.entities) { if (exclude.has(e.id)) continue; const d = this.entityDistance(uv, e, s); if (d < be) { be = d; bestE = e; } }
     if (bestE) {
@@ -358,7 +544,6 @@ export class App {
     for (const pr of prims) {
       if (pr.type === 'circle') {
         const c = M.addPoint(s, pr.c.x, pr.c.y);
-        // Centro perto de outro centro → concêntrico.
         const other = s.entities.find((e) => e.type !== 'line' && dist(M.getPoint(s, e.center), pr.c) < tol * 1.5);
         const e = M.addCircle(s, c.id, pr.r); created.push(e);
         if (other) autoCons.push(M.addConstraint(s, 'concentric', [e.id, other.id]).id);
@@ -374,13 +559,11 @@ export class App {
         else if (Math.abs(dev - 90) < H_V_SNAP_DEG) autoCons.push(M.addConstraint(s, 'vertical', [e.id]).id);
         continue;
       }
-      // arco
       const a = pointFor(pr.a), b = pointFor(pr.b);
       if (a === b) continue;
       const c = M.addPoint(s, pr.c.x, pr.c.y);
       const e = pr.ccw ? M.addArc(s, c.id, a, b, pr.r) : M.addArc(s, c.id, b, a, pr.r); created.push(e);
     }
-    // Tangência automática entre arcos e linhas que se encontram quase tangentes.
     for (const e of created) {
       if (e.type !== 'arc') continue;
       for (const pid of [e.start, e.end]) {
@@ -388,7 +571,7 @@ export class App {
         for (const l of lines) {
           const c = M.getPoint(s, e.center), p = M.getPoint(s, pid);
           const radial = norm(sub(p, c)); const other = M.getPoint(s, l.a === pid ? l.b : l.a); const ldir = norm(sub(other, p));
-          const cosang = Math.abs(radial.x * ldir.x + radial.y * ldir.y); // 0 = tangente
+          const cosang = Math.abs(radial.x * ldir.x + radial.y * ldir.y);
           if (Math.asin(Math.min(1, cosang)) * 180 / Math.PI < TANGENT_SNAP_DEG && !s.constraints.some((k) => k.kind === 'tangent' && k.refs.includes(l.id) && k.refs.includes(e.id)))
             autoCons.push(M.addConstraint(s, 'tangent', [l.id, e.id]).id);
         }
@@ -396,13 +579,12 @@ export class App {
     }
     let r = this.solve();
     if (!r || !r.converged) {
-      // Restrições automáticas em conflito: remove e tenta sem elas.
       s.constraints = s.constraints.filter((k) => !autoCons.includes(k.id));
       r = this.solve();
       if (!r || !r.converged) { Object.assign(s, before); this.solve(); this.toast('Não consegui encaixar esse traço. Tente de novo.', 'err'); }
       else this.toast('Encaixes automáticos removidos para fechar a geometria.');
     }
-    this.refreshAll();
+    this.refreshAll(false);
   }
 
   // ---------- Entrada ----------
@@ -422,7 +604,6 @@ export class App {
   private roleFor(ev: PointerEvent): PointerInfo['role'] {
     if (ev.pointerType === 'mouse') { if (ev.button === 1 || ev.button === 2) return 'pan'; return this.mode === 'sketch' ? 'tool' : 'nav'; }
     if (ev.pointerType === 'pen') return this.mode === 'sketch' ? 'tool' : 'nav';
-    // dedo
     if (this.mode === 'sketch' && this.touchDraws) return 'tool';
     return 'nav';
   }
@@ -436,7 +617,6 @@ export class App {
     if (this.pointers.size === 2) {
       const [a, b] = [...this.pointers.values()];
       this.pinch = { d0: Math.hypot(a.x - b.x, a.y - b.y), mid: { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 } };
-      // Dois dedos: cancela traço iniciado por dedo.
       if (this.stroke.length && a.type === 'touch' && b.type === 'touch') { this.stroke = []; this.sk.setStroke(null, []); this.toolStart = null; }
       return;
     }
@@ -476,14 +656,42 @@ export class App {
     if (id !== this.hoverPlane) { this.hoverPlane = id; this.vp.highlightPlane(id); }
   }
 
-  /** Toque simples em modo vista: escolhe plano (novo esboço) ou seleciona corpo. */
+  /** Toque simples em modo vista: aresta, face, corpo de prévia, plano ou vazio. */
   private tapView(info: PointerInfo): void {
     if (this.mode !== 'view') return;
-    const body = this.vp.pickBody(info.x, info.y);
-    if (body) { this.selectedFeature = this.selectedFeature === body ? null : body; this.refreshAll(); return; }
+    const faceHit = this.vp.pickFace(info.x, info.y);
+    const edgeHit = this.vp.pickEdge(info.x, info.y, info.type === 'touch' ? 14 : 9, faceHit);
+    if (edgeHit) {
+      if (this.sel3d.edges.length && this.sel3d.edges[0].body !== edgeHit.body) this.sel3d.edges = [];
+      const i = this.sel3d.edges.findIndex((e) => e.body === edgeHit.body && e.index === edgeHit.index);
+      if (i >= 0) this.sel3d.edges.splice(i, 1); else this.sel3d.edges.push({ body: edgeHit.body, index: edgeHit.index });
+      this.sel3d.face = null; this.sel3d.body = this.sel3d.edges.length ? edgeHit.body : null; this.selectedFeature = null;
+      this.vp.setSelection(this.sel3d); this.renderSidePanel(); this.renderToolbar();
+      if (this.sel3d.edges.length) this.menu(info.x + 10, info.y + 10, [
+        { label: `Filete nas ${this.sel3d.edges.length} aresta${this.sel3d.edges.length > 1 ? 's' : ''}…`, action: () => this.filletSelected('fillet') },
+        { label: 'Chanfro…', action: () => this.filletSelected('chamfer') },
+      ]);
+      return;
+    }
+    if (faceHit) {
+      this.selectedFeature = null;
+      if (faceHit.index < 0) { this.sel3d = { body: faceHit.body, face: null, edges: [] }; }
+      else {
+        const same = this.sel3d.face && this.sel3d.face.body === faceHit.body && this.sel3d.face.index === faceHit.index;
+        this.sel3d = same ? { body: faceHit.body, face: null, edges: [] } : { body: faceHit.body, face: { body: faceHit.body, index: faceHit.index }, edges: [] };
+        if (this.sel3d.face && this.faceIsPlanar(this.sel3d.face)) {
+          const items = [{ label: 'Esboçar nesta face', action: () => this.createSketchOnFace(faceHit.body, faceHit.index) }];
+          const sketchesHere = this.doc.current.sketches.filter((s) => getPlane(this.doc.current, s.plane).body === faceHit.body);
+          for (const s of sketchesHere) items.push({ label: `Extrudar ${s.name}`, action: () => this.extrudeSketch(s.id) });
+          this.menu(info.x + 10, info.y + 10, items);
+        }
+      }
+      this.vp.setSelection(this.sel3d); this.renderSidePanel(); this.renderToolbar();
+      return;
+    }
     const plane = this.vp.pickPlane(info.x, info.y);
     if (plane) { const p = getPlane(this.doc.current, plane); this.menu(info.x + 8, info.y + 8, [{ label: `Novo esboço em ${p.name}`, action: () => this.createSketchOn(plane) }]); return; }
-    if (this.selectedFeature) { this.selectedFeature = null; this.refreshAll(); }
+    if (this.selectedFeature || this.sel3d.body || this.sel3d.face || this.sel3d.edges.length) { this.selectedFeature = null; this.clearSel3d(); }
   }
 
   // ---------- Ferramentas de esboço ----------
@@ -542,18 +750,18 @@ export class App {
         Object.assign(s, M.cloneSketch(this.previewSketchBackup));
         if (!cancelled && info.moved) { this.buildShape(s, this.toolStart.uv, uv, tol, false); this.solve(); }
         else this.undoStack.pop();
-        this.toolStart = null; this.previewSketchBackup = null; this.refreshAll();
+        this.toolStart = null; this.previewSketchBackup = null; this.refreshAll(false);
         break;
       }
       case 'select': {
-        if (this.dragPoint) { if (!info.moved) this.undoStack.pop(); this.dragPoint = null; this.solve(); this.refreshAll(); return; }
+        if (this.dragPoint) { if (!info.moved) this.undoStack.pop(); this.dragPoint = null; this.solve(); this.refreshAll(false); return; }
         if (!info.moved) this.tapSelect(uv, tol, s);
         break;
       }
       case 'erase': {
         const hit = this.hitTest(uv, tol, s);
-        if (hit?.kind === 'entity') { this.pushUndo(); M.removeEntities(s, [hit.id]); this.solve(); this.refreshAll(); }
-        else if (hit?.kind === 'point') { this.pushUndo(); const ents = s.entities.filter((e) => M.entityPoints(e).includes(hit.id)).map((e) => e.id); M.removeEntities(s, ents); this.solve(); this.refreshAll(); }
+        if (hit?.kind === 'entity') { this.pushUndo(); M.removeEntities(s, [hit.id]); this.solve(); this.refreshAll(false); }
+        else if (hit?.kind === 'point') { this.pushUndo(); const ents = s.entities.filter((e) => M.entityPoints(e).includes(hit.id)).map((e) => e.id); M.removeEntities(s, ents); this.solve(); this.refreshAll(false); }
         break;
       }
       case 'dimension': this.tapDimension(uv, tol, s); break;
@@ -586,10 +794,10 @@ export class App {
 
   private tapSelect(uv: Vec2, tol: number, s: Sketch): void {
     const hit = this.hitTest(uv, tol, s);
-    if (!hit) { this.sel = emptySelection(); this.refreshAll(); return; }
+    if (!hit) { this.sel = emptySelection(); this.refreshAll(false); return; }
     const set = hit.kind === 'point' ? this.sel.points : this.sel.entities;
     if (set.has(hit.id)) set.delete(hit.id); else set.add(hit.id);
-    this.refreshAll();
+    this.refreshAll(false);
   }
 
   private tapDimension(uv: Vec2, tol: number, s: Sketch): void {
@@ -603,7 +811,7 @@ export class App {
     if (refs.length === 1 && e && e.type !== 'line') { this.pendingDimRefs = []; this.createDimension(refs, uv); return; }
     if (refs.length >= 2) { this.pendingDimRefs = []; this.createDimension(refs, uv); return; }
     this.pendingDimRefs = refs; this.sel = emptySelection(); if (e) this.sel.entities.add(hit.id); else this.sel.points.add(hit.id);
-    this.refreshAll();
+    this.refreshAll(false);
   }
 
   /** Decide o tipo de cota pelos elementos e abre a entrada de valor. */
@@ -620,11 +828,11 @@ export class App {
       const [e1, e2] = ents; const [p1, p2] = pts;
       if (p1 && p2) { kind = 'distance'; value = dist(p1, p2); }
       else if (e1?.type === 'line' && e2?.type === 'line') { const d1 = sub(M.getPoint(s, e1.b), M.getPoint(s, e1.a)), d2 = sub(M.getPoint(s, e2.b), M.getPoint(s, e2.a)); kind = 'angle'; value = Math.atan2(Math.abs(d1.x * d2.y - d1.y * d2.x), d1.x * d2.x + d1.y * d2.y) * 180 / Math.PI; }
-      else if ((p1 && e2?.type === 'line') || (p2 && e1?.type === 'line')) { const p = p1 ?? p2!; const l = (e2?.type === 'line' ? e2 : e1) as M.LineEntity; finalRefs = [p.id, l.id]; kind = 'distance'; value = distPointSegment(p, M.getPoint(s, l.a), M.getPoint(s, l.b)); const a = M.getPoint(s, l.a), b = M.getPoint(s, l.b); const ab = sub(b, a); const L = Math.hypot(ab.x, ab.y) || 1; value = Math.abs(ab.x * (p.y - a.y) - ab.y * (p.x - a.x)) / L; }
+      else if ((p1 && e2?.type === 'line') || (p2 && e1?.type === 'line')) { const p = p1 ?? p2!; const l = (e2?.type === 'line' ? e2 : e1) as M.LineEntity; finalRefs = [p.id, l.id]; kind = 'distance'; const a = M.getPoint(s, l.a), b = M.getPoint(s, l.b); const ab = sub(b, a); const L = Math.hypot(ab.x, ab.y) || 1; value = Math.abs(ab.x * (p.y - a.y) - ab.y * (p.x - a.x)) / L; }
       else if ((p1 && e2 && e2.type !== 'line') || (p2 && e1 && e1.type !== 'line')) { const p = p1 ?? p2!; const c = (e2 && e2.type !== 'line' ? e2 : e1) as M.CircleEntity; finalRefs = [p.id, c.center]; kind = 'distance'; value = dist(p, M.getPoint(s, c.center)); }
       else if (e1 && e2 && e1.type !== 'line' && e2.type !== 'line') { finalRefs = [e1.center, e2.center]; kind = 'distance'; value = dist(M.getPoint(s, e1.center), M.getPoint(s, e2.center)); }
     }
-    if (!kind) { this.toast('Combinação sem cota possível.'); this.sel = emptySelection(); this.refreshAll(); return; }
+    if (!kind) { this.toast('Combinação sem cota possível.'); this.sel = emptySelection(); this.refreshAll(false); return; }
     const k = kind; const v0 = round(value, 2);
     const screen = this.vp.planeToScreen(this.plane!, at.x, at.y);
     this.valuePopover(screen.x, screen.y, v0, k === 'angle' ? '°' : 'mm', (v) => {
@@ -637,7 +845,7 @@ export class App {
       const d = M.addDimension(s, k, finalRefs, v, offset);
       const r = this.solve();
       if (!r?.converged) { M.removeDimension(s, d.id); this.solve(); this.toast('Essa cota conflita com as restrições existentes.', 'err'); }
-      this.sel = emptySelection(); this.refreshAll();
+      this.sel = emptySelection(); this.refreshAll(false);
     });
   }
 
@@ -649,8 +857,8 @@ export class App {
       this.pushUndo(); const old = d.value; d.value = v;
       const r = this.solve();
       if (!r?.converged) { d.value = old; this.solve(); this.toast('Valor incompatível com as restrições.', 'err'); }
-      this.sel = emptySelection(); this.refreshAll();
-    }, () => { this.pushUndo(); M.removeDimension(s, id); this.solve(); this.sel = emptySelection(); this.refreshAll(); });
+      this.sel = emptySelection(); this.refreshAll(false);
+    }, () => { this.pushUndo(); M.removeDimension(s, id); this.solve(); this.sel = emptySelection(); this.refreshAll(false); });
   }
 
   private applicableConstraints(): { kind: ConstraintKind; label: string; refs: Id[] }[] {
@@ -674,18 +882,17 @@ export class App {
     this.pushUndo(); const before = M.cloneSketch(s);
     if (kind === 'fixed' && refs.length === 2) { M.mergePoints(s, refs[1], refs[0]); }
     else if ((kind === 'horizontal' || kind === 'vertical') && refs.length === 2) {
-      // Alinhar dois pontos: linha de construção entre eles com a restrição.
       const l = M.addLine(s, refs[0], refs[1]); l.construction = true; M.addConstraint(s, kind, [l.id]);
     } else M.addConstraint(s, kind, refs);
     const r = this.solve();
     if (!r?.converged) { Object.assign(s, before); this.solve(); this.toast('Restrição conflita com as existentes.', 'err'); }
-    this.sel = emptySelection(); this.refreshAll();
+    this.sel = emptySelection(); this.refreshAll(false);
   }
 
   private toggleConstruction(): void {
     const s = this.sketch; if (!s) return; this.pushUndo();
     for (const id of this.sel.entities) { const e = M.getEntity(s, id); e.construction = !e.construction; }
-    this.refreshAll();
+    this.refreshAll(false);
   }
   private deleteSelection(): void {
     const s = this.sketch; if (!s) return; this.pushUndo();
@@ -693,10 +900,10 @@ export class App {
     for (const pid of this.sel.points) for (const e of s.entities) if (M.entityPoints(e).includes(pid)) ents.add(e.id);
     for (const did of this.sel.dimensions) M.removeDimension(s, did);
     M.removeEntities(s, [...ents]);
-    this.sel = emptySelection(); this.solve(); this.refreshAll();
+    this.sel = emptySelection(); this.solve(); this.refreshAll(false);
   }
 
-  // ---------- Extrusão ----------
+  // ---------- Extrusão, filete, booleanas ----------
   private extrudeActive(): void {
     const s = this.sketch; if (!s) return;
     const id = s.id; this.exitSketch(true);
@@ -707,42 +914,121 @@ export class App {
     if (!doc.sketches.length) return this.toast('Crie um esboço fechado primeiro.');
     this.menu(ev.clientX, ev.clientY, doc.sketches.map((s) => ({ label: `Extrudar ${s.name}`, action: () => this.extrudeSketch(s.id) })));
   }
-  private extrudeSketch(id: Id): void {
+
+  /** Diálogo de extrusão: operação, profundidade, alvo e sentido. */
+  private extrudeSketch(sketchId: Id): void {
     const doc = this.doc.current;
-    this.valuePopover(this.vp.width / 2, this.vp.height / 2, 10, 'mm', (depth) => {
-      this.pushUndo();
-      const f = addExtrude(doc, id, depth);
-      const bodies = buildAllBodies(doc);
-      if (!bodies.some((b) => b.feature.id === f.id)) { doc.features = doc.features.filter((x) => x.id !== f.id); this.undoStack.pop(); this.toast('O esboço não tem contorno fechado para extrudar.', 'err'); return; }
-      this.selectedFeature = f.id; this.refreshAll(); this.vp.fitAll();
+    const sk = getSketch(doc, sketchId); const plane = getPlane(doc, sk.plane);
+    const bodies = bodyIds(doc);
+    const faceBody = plane.kind === 'face' && plane.body && bodies.includes(plane.body) ? plane.body : null;
+    const kernelOk = this.kernel.state === 'ready';
+    const state = { op: (faceBody && kernelOk ? 'cut' : 'new') as ExtrudeOp, depth: 10, target: faceBody ?? bodies[0] ?? '', symmetric: false, flip: !!faceBody, throughAll: false, flipTouched: false };
+
+    const back = el('div', 'dialog-backdrop'); const d = el('div', 'dialog');
+    const hh = document.createElement('h2'); hh.textContent = `Extrudar ${sk.name}`; d.append(hh);
+    const seg = el('div', 'segmented');
+    const ops: [ExtrudeOp, string][] = [['new', 'Novo corpo'], ['add', 'Adicionar'], ['cut', 'Cortar']];
+    const render = () => {
+      seg.innerHTML = '';
+      for (const [op, label] of ops) {
+        const b = this.button(label, () => { state.op = op; if (!state.flipTouched) state.flip = op === 'cut' && !!faceBody; render(); }, `btn ${state.op === op ? 'primary' : ''}`);
+        b.disabled = op !== 'new' && (!bodies.length || !kernelOk); seg.append(b);
+      }
+      targetRow.style.display = state.op !== 'new' && bodies.length > 1 ? '' : 'none';
+      throughRow.style.display = state.op === 'cut' ? '' : 'none';
+      flipChk.checked = state.flip;
+    };
+    d.append(seg);
+    if (!kernelOk) { const hint = el('div', 'hint'); hint.textContent = this.kernel.state === 'loading' ? 'Adicionar e cortar ficam disponíveis quando o kernel 3D terminar de carregar.' : 'Kernel 3D indisponível: só corpo novo (prévia).'; d.append(hint); }
+    const depthRow = el('div', 'row'); const dl = document.createElement('label'); dl.textContent = 'Profundidade (mm)';
+    const depthInp = document.createElement('input'); depthInp.type = 'text'; depthInp.inputMode = 'decimal'; depthInp.value = '10'; depthRow.append(dl, depthInp); d.append(depthRow);
+    const targetRow = el('div', 'row'); const tl = document.createElement('label'); tl.textContent = 'Corpo alvo';
+    const targetSel = document.createElement('select'); for (const id of bodies) { const o = document.createElement('option'); o.value = id; o.textContent = bodyName(doc, id); targetSel.append(o); } targetSel.value = state.target;
+    targetSel.addEventListener('change', () => { state.target = targetSel.value; }); targetRow.append(tl, targetSel); d.append(targetRow);
+    const symRow = el('div', 'row'); const sl = document.createElement('label'); sl.textContent = 'Simétrico ao plano'; const symChk = document.createElement('input'); symChk.type = 'checkbox'; symChk.addEventListener('change', () => { state.symmetric = symChk.checked; }); symRow.append(sl, symChk); d.append(symRow);
+    const flipRow = el('div', 'row'); const fl = document.createElement('label'); fl.textContent = 'Inverter sentido'; const flipChk = document.createElement('input'); flipChk.type = 'checkbox'; flipChk.addEventListener('change', () => { state.flip = flipChk.checked; state.flipTouched = true; }); flipRow.append(fl, flipChk); d.append(flipRow);
+    const throughRow = el('div', 'row'); const trl = document.createElement('label'); trl.textContent = 'Atravessar tudo'; const thrChk = document.createElement('input'); thrChk.type = 'checkbox'; thrChk.addEventListener('change', () => { state.throughAll = thrChk.checked; }); throughRow.append(trl, thrChk); d.append(throughRow);
+    const acts = el('div', 'actions');
+    const ok = () => {
+      const depth = parseFloat(depthInp.value.replace(',', '.'));
+      if (!isFinite(depth) || depth <= 0) { this.toast('Profundidade inválida.', 'err'); return; }
+      back.remove();
+      void this.tryFeature(() => addExtrude(doc, sketchId, depth, { op: state.op, target: state.op === 'new' ? undefined : state.target, symmetric: state.symmetric, flip: state.flip, throughAll: state.op === 'cut' && state.throughAll }),
+        (f) => { this.selectedFeature = f.id; this.sel3d = emptySel3D(); this.sel3d.body = bodyOfFeature(f); this.vp.setSelection(this.sel3d); this.renderSidePanel(); this.vp.fitAll(); });
+    };
+    acts.append(this.button('Cancelar', () => back.remove()), this.button('Extrudar', ok, 'btn primary')); d.append(acts);
+    depthInp.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') ok(); if (ev.key === 'Escape') back.remove(); });
+    render();
+    back.append(d); this.overlay.append(back);
+    setTimeout(() => { depthInp.focus(); depthInp.select(); }, 30);
+  }
+
+  private filletSelected(kind: 'fillet' | 'chamfer'): void {
+    const edges = this.sel3d.edges; if (!edges.length) return this.toast('Toque nas arestas primeiro.');
+    const body = this.bodies.find((b) => b.id === edges[0].body); if (!body) return;
+    const refs = edges.map((e) => body.edges[e.index]).filter(Boolean).map((e) => ({ mid: e.mid, len: e.len }));
+    const minLen = Math.min(...refs.map((r) => r.len));
+    const def = Math.max(0.5, Math.min(kind === 'fillet' ? 2 : 1, round(minLen / 4, 1)));
+    this.valuePopover(this.vp.width / 2, this.vp.height / 2, def, 'mm', (r) => {
+      void this.tryFeature(() => addFillet(this.doc.current, kind, body.id, refs, r), (f) => { this.sel3d = emptySel3D(); this.sel3d.body = body.id; this.selectedFeature = f.id; this.vp.setSelection(this.sel3d); this.renderSidePanel(); this.renderToolbar(); });
     });
+  }
+
+  private booleanMenu(ev: MouseEvent): void {
+    const doc = this.doc.current; const body = this.sel3d.body; if (!body) return;
+    const others = bodyIds(doc).filter((id) => id !== body);
+    if (!others.length) return this.toast('Precisa de outro corpo para combinar.');
+    const items: { label: string; action: () => void }[] = [];
+    for (const o of others) {
+      const n = bodyName(doc, o);
+      items.push({ label: `Unir com ${n}`, action: () => this.addBooleanFeature('union', body, o) });
+      items.push({ label: `Subtrair ${n}`, action: () => this.addBooleanFeature('subtract', body, o) });
+      items.push({ label: `Interseção com ${n}`, action: () => this.addBooleanFeature('intersect', body, o) });
+    }
+    this.menu(ev.clientX, ev.clientY, items);
+  }
+  private addBooleanFeature(op: 'union' | 'subtract' | 'intersect', body: Id, tool: Id): void {
+    void this.tryFeature(() => addBoolean(this.doc.current, op, body, tool), (f) => { this.selectedFeature = f.id; this.sel3d = emptySel3D(); this.sel3d.body = body; this.vp.setSelection(this.sel3d); this.renderSidePanel(); this.renderToolbar(); });
   }
 
   // ---------- Arquivos ----------
   newDocument(): void {
     this.confirm('Novo documento', 'Descartar o documento atual? O autosave será substituído. Salve antes se precisar.', () => {
-      this.doc.current = createDocument(); this.undoStack = []; this.redoStack = []; this.activeSketch = null; this.mode = 'view'; this.selectedFeature = null; this.sel = emptySelection(); this.vp.exitSketch(); this.titleEl.value = this.doc.current.name; this.refreshAll(); this.vp.fitAll();
+      this.doc.current = createDocument(); this.undoStack = []; this.redoStack = []; this.activeSketch = null; this.mode = 'view'; this.selectedFeature = null; this.sel = emptySelection(); this.sel3d = emptySel3D(); this.vp.exitSketch(); this.titleEl.value = this.doc.current.name; this.refreshAll(); this.vp.fitAll();
     });
   }
   async openFile(): Promise<void> {
     const f = await pickFile('.forja,application/json'); if (!f) return;
-    try { const d = deserialize(f.text); this.doc.current = d; this.undoStack = []; this.redoStack = []; this.activeSketch = null; this.mode = 'view'; this.selectedFeature = null; this.vp.exitSketch(); this.titleEl.value = d.name; this.refreshAll(); this.vp.fitAll(); this.toast(`Aberto: ${f.name}`); }
+    try { const d = deserialize(f.text); this.doc.current = d; this.undoStack = []; this.redoStack = []; this.activeSketch = null; this.mode = 'view'; this.selectedFeature = null; this.sel3d = emptySel3D(); this.vp.exitSketch(); this.titleEl.value = d.name; this.refreshAll(); this.vp.fitAll(); this.toast(`Aberto: ${f.name}`); }
     catch (e) { this.toast(`Não abriu: ${(e as Error).message}`, 'err'); }
   }
   saveFile(): void { downloadFile(`${safeFileName(this.doc.current.name)}.forja`, serialize(this.doc.current), 'application/json'); this.toast('Arquivo .forja gerado.'); }
   exportMenu(ev: MouseEvent): void {
     this.menu(ev.clientX, ev.clientY, [
+      { label: 'STEP (SolidWorks, Fusion, fornecedores)', action: () => void this.exportStep() },
       { label: 'STL (impressão, visualizadores)', action: () => this.exportMesh('stl') },
-      { label: 'OBJ (ZBrush, com grupos)', action: () => this.exportMesh('obj') },
+      { label: 'OBJ (ZBrush, polygroups por face)', action: () => this.exportMesh('obj') },
     ]);
   }
+  private exportMeshes(): MeshData[] {
+    if (this.bodies.length) return this.bodies.map(fromBody);
+    return buildAllBodies(this.doc.current).map((b) => fromGeometry(bodyName(this.doc.current, b.feature.id), b.geometry));
+  }
   private exportMesh(fmt: 'stl' | 'obj'): void {
-    const bodies = buildAllBodies(this.doc.current);
-    if (!bodies.length) return this.toast('Nenhum corpo para exportar. Extrude um esboço antes.', 'err');
-    const named = bodies.map((b) => ({ name: b.feature.name, geometry: b.geometry }));
+    const meshes = this.exportMeshes();
+    if (!meshes.length) return this.toast('Nenhum corpo para exportar. Extrude um esboço antes.', 'err');
     const base = safeFileName(this.doc.current.name);
-    if (fmt === 'stl') downloadFile(`${base}.stl`, toSTL(named), 'model/stl'); else downloadFile(`${base}.obj`, toOBJ(named), 'model/obj');
-    this.toast(`${fmt.toUpperCase()} gerado.`);
+    if (fmt === 'stl') downloadFile(`${base}.stl`, toSTL(meshes), 'model/stl'); else downloadFile(`${base}.obj`, toOBJ(meshes), 'model/obj');
+    this.toast(`${fmt.toUpperCase()} gerado${this.bodies.length ? '' : ' (da prévia)'}.`);
+  }
+  private async exportStep(): Promise<void> {
+    if (this.kernel.state !== 'ready') return this.toast('O STEP precisa do kernel 3D carregado.', 'err');
+    if (!this.bodies.length) return this.toast('Nenhum corpo para exportar.', 'err');
+    try {
+      const text = await this.kernel.exportStep();
+      downloadFile(`${safeFileName(this.doc.current.name)}.step`, text, 'application/step');
+      this.toast('STEP gerado.');
+    } catch (e) { this.toast(`STEP falhou: ${(e as Error).message}`, 'err'); }
   }
 
   // ---------- Menus, popovers, diálogos ----------
@@ -786,21 +1072,48 @@ export class App {
   // ---------- Teclado (Mac) ----------
   private bindKeys(): void {
     window.addEventListener('keydown', (ev) => {
-      const t = ev.target as HTMLElement; if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA')) return;
+      const t = ev.target as HTMLElement; if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT')) return;
       const meta = ev.metaKey || ev.ctrlKey;
       if (meta && ev.key.toLowerCase() === 'z') { ev.preventDefault(); if (ev.shiftKey) this.redo(); else this.undo(); return; }
       if (meta && ev.key.toLowerCase() === 's') { ev.preventDefault(); this.saveFile(); return; }
-      if (this.mode !== 'sketch') return;
+      if (this.mode !== 'sketch') {
+        if (ev.key === 'Escape') { this.closeMenus(); this.selectedFeature = null; this.clearSel3d(); }
+        else if ((ev.key === 'Backspace' || ev.key === 'Delete') && this.selectedFeature) { const f = this.doc.current.features.find((x) => x.id === this.selectedFeature); if (f) this.deleteFeature(f); }
+        else if (ev.key.toLowerCase() === 'f' && this.sel3d.edges.length) this.filletSelected('fillet');
+        return;
+      }
       const map: Record<string, Tool> = { v: 'select', p: 'draw', l: 'line', r: 'rect', c: 'circle', d: 'dimension', x: 'erase' };
       const k = ev.key.toLowerCase();
       if (map[k]) this.setTool(map[k]);
-      else if (ev.key === 'Escape') { if (this.tool !== 'select') this.setTool('select'); else { this.sel = emptySelection(); this.refreshAll(); } }
+      else if (ev.key === 'Escape') { if (this.tool !== 'select') this.setTool('select'); else { this.sel = emptySelection(); this.refreshAll(false); } }
       else if (ev.key === 'Backspace' || ev.key === 'Delete') this.deleteSelection();
       else if (ev.key === 'Enter') this.exitSketch(true);
     });
   }
 }
 
+function toRenderBody(b: BodyData): RenderBody {
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(b.positions, 3));
+  g.setAttribute('normal', new THREE.BufferAttribute(b.normals, 3));
+  g.setIndex(new THREE.BufferAttribute(b.indices, 1));
+  return { id: b.id, name: b.name, geometry: g, data: b };
+}
+function bodyOfFeature(f: Feature): Id | null {
+  if (f.type === 'extrude') return f.op === 'new' ? f.id : f.target ?? null;
+  if (f.type === 'boolean') return f.body;
+  return f.body;
+}
+function featureMini(f: Feature): string {
+  if (f.type === 'extrude') return `${f.op === 'cut' ? 'corte ' : f.op === 'add' ? 'adição ' : ''}${f.throughAll ? '∞' : `${fmtDim('distance', f.depth)} mm`}`;
+  if (f.type === 'fillet') return `R${fmtDim('distance', f.radius)} · ${f.edges.length}`;
+  if (f.type === 'chamfer') return `${fmtDim('distance', f.radius)} mm · ${f.edges.length}`;
+  if (f.type === 'boolean') return f.op === 'union' ? 'união' : f.op === 'subtract' ? 'subtração' : 'interseção';
+  return '';
+}
+function faceTypeName(t: string): string {
+  return ({ plane: 'plana', cylinder: 'cilíndrica', cone: 'cônica', sphere: 'esférica', torus: 'toroidal', other: 'curva' } as Record<string, string>)[t] ?? t;
+}
 function el(tag: string, cls = ''): HTMLElement { const e = document.createElement(tag); if (cls) e.className = cls; return e; }
 function h3(text: string): HTMLElement { const h = document.createElement('h3'); h.textContent = text; return h; }
 function listItem(name: string, mini: string): HTMLElement {
@@ -809,4 +1122,4 @@ function listItem(name: string, mini: string): HTMLElement {
 function constraintName(k: ConstraintKind): string {
   return ({ horizontal: 'Horizontal', vertical: 'Vertical', parallel: 'Paralelas', perpendicular: 'Perpendiculares', equal: 'Iguais', tangent: 'Tangentes', concentric: 'Concêntricos', pointOnLine: 'Ponto na linha', pointOnCircle: 'Ponto no círculo', midpoint: 'Ponto médio', fixed: 'Fixo' } as Record<ConstraintKind, string>)[k];
 }
-export { THREE, normAngle, TAU };
+export { THREE, normAngle, TAU, planeNormal, type ExtrudeFeature };

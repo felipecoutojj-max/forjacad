@@ -1,8 +1,9 @@
 # ForjaCAD
 
 CAD para ferramental e melhoria de equipamentos: esboço com caneta ou mouse, cotas e restrições que fecham
-a geometria nas medidas, extrusão para 3D, exportação para STL e OBJ (ZBrush, visualizadores). Roda no iPad
-e no Mac dentro do navegador, instala como app e funciona off-line.
+a geometria nas medidas, sólidos de verdade (OpenCASCADE em WebAssembly) com extrusão, corte, união, filete
+e chanfro, esboço sobre faces, exportação para STEP, STL e OBJ (ZBrush, visualizadores). Roda no iPad e no
+Mac dentro do navegador, instala como app e funciona off-line.
 
 Referência de interação: Shapr3D. Referência de rigor: SolidWorks.
 
@@ -14,6 +15,16 @@ npm run dev
 ```
 
 Abre em `http://localhost:5173`. Para abrir no iPad na mesma rede, use o endereço de rede que o Vite imprime.
+
+## Como usar (v0.2)
+
+- Toque num plano (ou numa face plana de um corpo) para abrir um esboço. Risque com a caneta; o traço vira
+  linha, arco ou círculo. Toque numa cota para digitar a medida.
+- "Extrudar" abre o diálogo: novo corpo, adicionar ou cortar, profundidade, sentido e "atravessar tudo".
+- Toque numa aresta (ou em várias) e escolha filete ou chanfro. Toque num corpo para combinar com outro.
+- O painel direito lista as features em ordem; mude valores ali e a peça recalcula. Se o kernel reprovar
+  uma mudança, ela volta sozinha com o motivo.
+- O kernel (50 MB) baixa só na primeira abertura; enquanto isso, a prévia em malha segura a ponta.
 
 ## Testes e build
 
@@ -33,16 +44,19 @@ endereço no Safari e use Compartilhar ▸ Adicionar à Tela de Início.
 - `src/core/geom.ts` — geometria 2D.
 - `src/core/sketch/` — modelo do esboço, solver de restrições (Levenberg-Marquardt), reconhecedor de traço.
 - `src/core/document.ts` — documento `.forja` (planos, esboços, features).
-- `src/core/kernel/preview.ts` — kernel de prévia: perfis fechados → extrusão em malha (three.js).
-- `src/core/export/mesh.ts` — STL binário e OBJ com grupos.
+- `src/core/kernel/profiles.ts` — perfis fechados (contornos e furos) de um esboço.
+- `src/core/kernel/occ/` — kernel B-rep sobre OpenCASCADE: `build.ts` (esboço → faces, prisma, booleanas,
+  filete/chanfro, malha, STEP), `worker.ts` (roda o WASM fora do thread da interface), `client.ts`.
+- `src/core/kernel/preview.ts` — prévia em malha (three.js) enquanto o kernel carrega.
+- `src/core/export/mesh.ts` — STL binário e OBJ com um grupo por face (polygroups no ZBrush).
 - `src/ui/` — janela 3D, desenho do esboço, aplicativo.
 - `docs/superpowers/specs/` — especificações por subprojeto.
 
 ## Roteiro
 
-1. Núcleo e esboço 2D (este repositório, v0.1).
-2. Sólidos com OpenCASCADE (WebAssembly): booleanas, furos, chanfros, filetes, empurrar e puxar faces.
-3. Exportação STEP e GLB.
+1. Núcleo e esboço 2D (v0.1, feito).
+2. Sólidos com OpenCASCADE (WebAssembly): extrusão, corte, união, filete, chanfro, esboço em face, STEP (v0.2, feito).
+3. Exportação GLB, revolução e varredura, empurrar e puxar faces.
 4. Desenho técnico ABNT em PDF e DXF.
 5. Montagem com juntas, lista de materiais e balões.
 6. Animação e simulação de movimento simples (v2).

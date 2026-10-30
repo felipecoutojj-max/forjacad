@@ -20,5 +20,10 @@ export const icons = {
   trash: w('<path d="M5 7h14M9 7V4h6v3M7 7l1 13h8l1-13"/>'),
   plus: w('<path d="M12 5v14M5 12h14"/>'),
   construction: w('<path d="M4 20L20 4" stroke-dasharray="3 3"/>'),
+  fillet: w('<path d="M4 20V10a6 6 0 0 1 6-6h10"/><path d="M4 4h4M20 16v4" stroke-dasharray="2 2"/>'),
+  chamfer: w('<path d="M4 20V10l6-6h10"/><path d="M4 4h4M20 16v4" stroke-dasharray="2 2"/>'),
+  face: w('<path d="M4 16l8 4 8-4V8l-8-4-8 4z"/><path d="M4 8l8 4 8-4" fill="currentColor" fill-opacity="0.25"/>'),
+  boolean: w('<circle cx="9" cy="12" r="6"/><circle cx="15" cy="12" r="6"/>'),
+  cut: w('<path d="M4 16l8 4 8-4V8l-8-4-8 4z"/><path d="M9 6v9M15 6v9"/>'),
 };
 export type IconName = keyof typeof icons;
