@@ -145,7 +145,7 @@ export function sanitizeDrawing(raw: unknown, title: string): DrawingSettings | 
   if (!raw || typeof raw !== 'object') return undefined;
   const r = raw as Record<string, unknown>; const def = defaultDrawingSettings(title);
   const bool = (k: keyof DrawingSettings) => (typeof r[k] === 'boolean' ? (r[k] as boolean) : (def[k] as boolean));
-  const text = (k: keyof DrawingSettings) => (typeof r[k] === 'string' ? (r[k] as string).slice(0, 120) : (def[k] as string));
+  const text = (k: keyof DrawingSettings) => (typeof r[k] === 'string' ? (r[k] as string).replace(/[\x00-\x1f\x7f]/g, ' ').slice(0, 120) : (def[k] as string));
   return {
     sheet: typeof r.sheet === 'string' && r.sheet in SHEET_MM ? (r.sheet as DrawingSettings['sheet']) : def.sheet,
     projection: r.projection === 'third' ? 'third' : 'first',

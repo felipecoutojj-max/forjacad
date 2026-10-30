@@ -70,7 +70,8 @@ function ltype(g: (c: number, v: string | number) => void, name: string, desc: s
   for (const v of pattern) g(49, v);
 }
 
-/** Códigos especiais do DXF: %%c é o símbolo de diâmetro, %%d o de grau. */
+/** Códigos especiais do DXF: %%c é o símbolo de diâmetro, %%d o de grau. Caracteres de controle
+ *  (quebras de linha etc.) sumiriam a estrutura código/valor do arquivo, então viram espaço. */
 function dxfText(t: string): string {
-  return t.replace(/[Ø⌀∅]/g, '%%c').replace(/°/g, '%%d');
+  return t.replace(/[\x00-\x1f\x7f]/g, ' ').replace(/[Ø⌀∅]/g, '%%c').replace(/°/g, '%%d');
 }

@@ -77,8 +77,10 @@ describe('layout do desenho', () => {
     expect((dxf.match(/\r\n0\r\nLINE\r\n/g) || []).length).toBeGreaterThan(20);
     expect(dxf).toContain('%%c20'); // diâmetro no código DXF
     expect(dxf).toContain('\r\n0\r\nSOLID\r\n'); // setas
-    // Linhas do pares código/valor: número par de linhas.
+    // Linhas do pares código/valor: número par de linhas, mesmo com texto malicioso no título.
     const lines = dxf.trim().split('\r\n'); expect(lines.length % 2).toBe(0);
+    const evil = layoutDrawing(sampleViews(), { ...defaultDrawingSettings('x'), title: 'a\r\n0\r\nLINE\r\n8\r\nHACK' }, { date: '', docName: 'x' });
+    const dxf2 = toDXF(evil); expect(dxf2).not.toContain('HACK\r\n'); expect(dxf2.trim().split('\r\n').length % 2).toBe(0);
   });
 
   it('gera SVG com a folha e os textos', () => {
