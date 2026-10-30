@@ -5,7 +5,7 @@
 import ocInit from 'opencascade.js/dist/opencascade.full.js';
 import wasmUrl from 'opencascade.js/dist/opencascade.full.wasm?url';
 import type { OpenCascadeInstance } from 'opencascade.js';
-import { rebuildDocument, tessellate, exportSTEP, errorMessage, type BuiltBody } from './build';
+import { rebuildDocument, tessellate, exportSTEP, projectViews, errorMessage, type BuiltBody } from './build';
 import type { KernelRequest, KernelResponse, BodyData } from './types';
 import { bodyName } from '../../document';
 
@@ -43,6 +43,12 @@ function handle(req: KernelRequest): void {
         } catch (e) { errors.push({ feature: b.id, message: `malha falhou: ${errorMessage(oc, e)}` }); }
       }
       post({ id: req.id, type: 'rebuilt', result: { bodies: data, errors, ms: performance.now() - t } }, transfer);
+    } else if (req.type === 'project') {
+      if (!last.length) throw new Error('Nenhum corpo para projetar.');
+      const views = projectViews(oc, last.map((b) => b.shape), req.views);
+      const transfer: Transferable[] = [];
+      for (const v of views) for (const arr of [...v.visible, ...v.hidden, ...v.tangent]) transfer.push(arr.buffer);
+      post({ id: req.id, type: 'projected', views }, transfer);
     } else if (req.type === 'export') {
       if (!last.length) throw new Error('Nenhum corpo para exportar.');
       const text = exportSTEP(oc, last);

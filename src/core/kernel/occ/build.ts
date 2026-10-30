@@ -8,7 +8,7 @@ import { getSketch, getPlane, planeNormal, planeToWorld } from '../../document';
 import type { Sketch, Id } from '../../sketch/model';
 import { getPoint, findEntity } from '../../sketch/model';
 import { extractProfiles, loopArcAngles, type Loop, type Profile } from '../profiles';
-import type { BodyData, FaceData, EdgeData, FeatureError, FaceType } from './types';
+import type { BodyData, FaceData, EdgeData, FeatureError, FaceType, ViewSpec, ProjectedView, ProjCircle } from './types';
 
 type OC = OpenCascadeInstance;
 export interface BuiltBody { id: Id; shape: TopoDS_Shape; }
@@ -343,4 +343,88 @@ export function exportSTEP(oc: OC, bodies: BuiltBody[]): string {
   try { oc.FS.unlink(name); } catch { /* ignore */ }
   w.delete();
   return text;
+}
+
+// ---------- Projeções para desenho técnico (HLR) ----------
+
+const norm3 = (v: V3): V3 => { const L = Math.hypot(v[0], v[1], v[2]) || 1; return [v[0] / L, v[1] / L, v[2] / L]; };
+const cross3 = (a: V3, b: V3): V3 => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+
+function collectEdges(oc: OC, comp: TopoDS_Shape, hidden: boolean, polys: Float32Array[], circles: ProjCircle[], bb: number[]): void {
+  if (comp.IsNull()) return;
+  oc.BRepLib.BuildCurves3d_2(comp);
+  const ex = new oc.TopExp_Explorer_2(comp, oc.TopAbs_ShapeEnum.TopAbs_EDGE as never, oc.TopAbs_ShapeEnum.TopAbs_SHAPE as never);
+  const circleType = enumVal(oc.GeomAbs_CurveType.GeomAbs_Circle);
+  for (; ex.More(); ex.Next()) {
+    const edge = oc.TopoDS.Edge_1(ex.Current());
+    let c: BRepAdaptor_Curve;
+    try { c = new oc.BRepAdaptor_Curve_2(edge); } catch { continue; }
+    const f = c.FirstParameter(), l = c.LastParameter();
+    if (!Number.isFinite(f) || !Number.isFinite(l)) { c.delete(); continue; }
+    if (enumVal(c.GetType()) === circleType && Math.abs(l - f) >= 2 * Math.PI - 1e-6) {
+      const circ = c.Circle(); const loc = circ.Location();
+      circles.push({ cx: loc.X(), cy: loc.Y(), r: circ.Radius(), hidden }); loc.delete(); circ.delete();
+    }
+    const disc = new oc.GCPnts_TangentialDeflection_2(c, 0.08, 0.01, 2, 1e-9, 1e-7);
+    const n = disc.NbPoints(); if (n < 2) { disc.delete(); c.delete(); continue; }
+    const pts = new Float32Array(n * 2);
+    for (let k = 1; k <= n; k++) {
+      const p = disc.Value(k); const x = p.X(), y = p.Y(); p.delete();
+      pts[(k - 1) * 2] = x; pts[(k - 1) * 2 + 1] = y;
+      if (x < bb[0]) bb[0] = x; if (y < bb[1]) bb[1] = y; if (x > bb[2]) bb[2] = x; if (y > bb[3]) bb[3] = y;
+    }
+    polys.push(pts); disc.delete(); c.delete();
+  }
+  ex.delete();
+}
+
+/** Distância de um ponto a uma polilinha 2D. */
+function distToPolyline(x: number, y: number, pts: Float32Array): number {
+  let best = Infinity;
+  for (let i = 0; i + 3 < pts.length; i += 2) {
+    const ax = pts[i], ay = pts[i + 1], bx = pts[i + 2], by = pts[i + 3];
+    const dx = bx - ax, dy = by - ay; const L2 = dx * dx + dy * dy;
+    const t = L2 > 0 ? Math.max(0, Math.min(1, ((x - ax) * dx + (y - ay) * dy) / L2)) : 0;
+    const d = Math.hypot(ax + t * dx - x, ay + t * dy - y);
+    if (d < best) best = d;
+  }
+  return best;
+}
+
+/** Remove linhas ocultas que coincidem com linhas visíveis (arestas de trás alinhadas com o contorno). */
+export function dropCoveredHidden(visible: Float32Array[], hidden: Float32Array[], tol = 0.02): Float32Array[] {
+  const covered = (x: number, y: number) => { for (const v of visible) if (distToPolyline(x, y, v) <= tol) return true; return false; };
+  return hidden.filter((h) => {
+    // Testa pontas e meios de cada trecho: uma oculta que só encosta no contorno pelas pontas continua oculta.
+    for (let i = 0; i + 1 < h.length; i += 2) {
+      if (!covered(h[i], h[i + 1])) return true;
+      if (i + 3 < h.length && !covered((h[i] + h[i + 2]) / 2, (h[i + 1] + h[i + 3]) / 2)) return true;
+    }
+    return false;
+  });
+}
+
+/** Projeta os corpos em cada vista com remoção de linhas ocultas. Coordenadas no plano da vista (mm). */
+export function projectViews(oc: OC, shapes: TopoDS_Shape[], specs: ViewSpec[]): ProjectedView[] {
+  return specs.map((spec) => {
+    const n = norm3(spec.n); const r = norm3(cross3(spec.up, n));
+    const algo = new oc.HLRBRep_Algo_1();
+    for (const s of shapes) algo.Add_2(s, 0);
+    const ax = new oc.gp_Ax2_2(new oc.gp_Pnt_3(0, 0, 0), new oc.gp_Dir_4(n[0], n[1], n[2]), new oc.gp_Dir_4(r[0], r[1], r[2]));
+    const proj = new oc.HLRAlgo_Projector_2(ax);
+    algo.Projector_1(proj); algo.Update(); algo.Hide_1();
+    const ts = new oc.HLRBRep_HLRToShape(new oc.Handle_HLRBRep_Algo_2(algo));
+    const visible: Float32Array[] = [], hidden: Float32Array[] = [], tangent: Float32Array[] = [], circles: ProjCircle[] = [];
+    const bb = [Infinity, Infinity, -Infinity, -Infinity];
+    collectEdges(oc, ts.VCompound_1(), false, visible, circles, bb);
+    collectEdges(oc, ts.OutLineVCompound_1(), false, visible, circles, bb);
+    collectEdges(oc, ts.Rg1LineVCompound_1(), false, tangent, [], bb);
+    collectEdges(oc, ts.HCompound_1(), true, hidden, circles, bb);
+    collectEdges(oc, ts.OutLineHCompound_1(), true, hidden, circles, bb);
+    ts.delete(); algo.delete();
+    if (!Number.isFinite(bb[0])) bb.splice(0, 4, 0, 0, 0, 0);
+    const hiddenClean = dropCoveredHidden(visible, hidden);
+    const circlesClean = circles.filter((c, i) => !circles.some((o, j) => j < i && Math.abs(o.cx - c.cx) < 1e-4 && Math.abs(o.cy - c.cy) < 1e-4 && Math.abs(o.r - c.r) < 1e-4));
+    return { name: spec.name, visible, hidden: hiddenClean, tangent, circles: circlesClean, bbox: bb as [number, number, number, number] };
+  });
 }

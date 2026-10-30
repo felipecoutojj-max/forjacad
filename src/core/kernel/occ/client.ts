@@ -2,9 +2,9 @@
 // (se chegam vários pedidos enquanto um roda, só o último vale).
 
 import type { ForjaDocument } from '../../document';
-import type { KernelRequest, KernelResponse, RebuildResult } from './types';
+import type { KernelRequest, KernelResponse, RebuildResult, ViewSpec, ProjectedView } from './types';
 
-type RequestBody = { type: 'rebuild'; doc: ForjaDocument } | { type: 'export'; format: 'step' };
+type RequestBody = { type: 'rebuild'; doc: ForjaDocument } | { type: 'export'; format: 'step' } | { type: 'project'; views: ViewSpec[] };
 
 export type KernelState = 'loading' | 'ready' | 'failed';
 
@@ -46,6 +46,7 @@ export class KernelClient {
     if (m.type === 'error') p.reject(new Error(m.message));
     else if (m.type === 'rebuilt') p.resolve(m.result as never);
     else if (m.type === 'exported') p.resolve(m.data as never);
+    else if (m.type === 'projected') p.resolve(m.views as never);
     if (p.kind === 'rebuild' && this.queued) { const q = this.queued; this.queued = null; this.startRebuild(q.doc, q.resolve, q.reject); }
   }
 
@@ -71,6 +72,11 @@ export class KernelClient {
       }
       this.startRebuild(doc, resolve, reject);
     });
+  }
+
+  /** Projeções com linhas ocultas dos corpos do último recálculo. */
+  project(views: ViewSpec[]): Promise<ProjectedView[]> {
+    return new Promise((resolve, reject) => this.send({ type: 'project', views }, resolve as (v: never) => void, reject));
   }
 
   exportStep(): Promise<string> {

@@ -34,15 +34,29 @@ export interface BodyData {
 
 export interface FeatureError { feature: Id; message: string; }
 
+/** Vista para projeção: `n` aponta do objeto para quem olha, `up` é o alto da folha. */
+export interface ViewSpec { name: string; n: V3; up: V3; }
+export interface ProjCircle { cx: number; cy: number; r: number; hidden: boolean; }
+/** Resultado da projeção com remoção de linhas ocultas, em mm do modelo, no plano da vista (y para cima). */
+export interface ProjectedView {
+  name: string;
+  visible: Float32Array[]; hidden: Float32Array[]; tangent: Float32Array[];
+  circles: ProjCircle[];
+  /** [minX, minY, maxX, maxY] */
+  bbox: [number, number, number, number];
+}
+
 export interface RebuildResult { bodies: BodyData[]; errors: FeatureError[]; ms: number; }
 
 export type KernelRequest =
   | { id: number; type: 'rebuild'; doc: ForjaDocument }
-  | { id: number; type: 'export'; format: 'step' };
+  | { id: number; type: 'export'; format: 'step' }
+  | { id: number; type: 'project'; views: ViewSpec[] };
 
 export type KernelResponse =
   | { id: 0; type: 'ready'; ms: number }
   | { id: 0; type: 'failed'; message: string }
   | { id: number; type: 'rebuilt'; result: RebuildResult }
   | { id: number; type: 'exported'; data: string; mime: string }
+  | { id: number; type: 'projected'; views: ProjectedView[] }
   | { id: number; type: 'error'; message: string };

@@ -18,6 +18,11 @@ import { KernelClient, SupersededError } from '../core/kernel/occ/client';
 import type { BodyData, FeatureError, RebuildResult } from '../core/kernel/occ/types';
 import { toSTL, toOBJ, fromBody, fromGeometry, type MeshData } from '../core/export/mesh';
 import { toGLB } from '../core/export/glb';
+import { layoutDrawing, viewSpecsFor, defaultDrawingSettings, SHEET_MM, STANDARD_SCALES, scaleLabel, type DrawingSettings } from '../core/drawing/layout';
+import { toPDF } from '../core/drawing/pdf';
+import { toDXF } from '../core/drawing/dxf';
+import { toSVG } from '../core/drawing/svg';
+import type { ProjectedView } from '../core/kernel/occ/types';
 import { saveLocal, loadLocal, downloadFile, pickFile, safeFileName } from './storage';
 import { type Vec2, v2, dist, distPointSegment, distPointArc, closestOnSegment, sub, add, scale, norm, angleOf, normAngle, TAU, round } from '../core/geom';
 
@@ -260,6 +265,7 @@ export class App {
       const cha = this.iconButton('chamfer', 'Chanfro', () => this.filletSelected('chamfer')); cha.disabled = !hasEdges; g1.append(cha);
       if (this.sel3d.face && this.faceIsPlanar(this.sel3d.face)) g1.append(this.iconButton('face', 'Esboçar na face', () => this.createSketchOnFace(this.sel3d.face!.body, this.sel3d.face!.index)));
       if (this.sel3d.body && bodyIds(this.doc.current).length > 1) g1.append(this.iconButton('boolean', 'Combinar', (ev) => this.booleanMenu(ev)));
+      g2.append(this.iconButton('drawing', 'Desenho', () => void this.drawingDialog()));
       g2.append(this.iconButton('view', 'Vistas', (ev) => this.viewMenu(ev)));
       g2.append(this.iconButton('fit', 'Enquadrar', () => this.vp.fitAll()));
       this.toolbar.append(g1, g2);
@@ -1126,6 +1132,74 @@ export class App {
       downloadFile(`${safeFileName(this.doc.current.name)}.step`, text, 'application/step');
       this.toast('STEP gerado.');
     } catch (e) { this.toast(`STEP falhou: ${(e as Error).message}`, 'err'); }
+  }
+
+  // ---------- Desenho técnico ----------
+  /** Diálogo do desenho técnico: prévia ao vivo, opções da folha e exportação em PDF ou DXF. */
+  private async drawingDialog(): Promise<void> {
+    if (this.kernel.state !== 'ready') return this.toast('O desenho técnico precisa do kernel 3D carregado.', 'err');
+    if (!this.bodies.length) return this.toast('Crie um corpo antes de gerar o desenho.', 'err');
+    const doc = this.doc.current;
+    const settings: DrawingSettings = doc.drawing ?? defaultDrawingSettings(doc.name);
+    doc.drawing = settings;
+    const back = el('div', 'dialog-backdrop'); const d = el('div', 'dialog wide');
+    const hh = document.createElement('h2'); hh.textContent = 'Desenho técnico'; d.append(hh);
+    const body = el('div', 'drawing-body'); const preview = el('div', 'drawing-preview'); const form = el('div', 'drawing-form'); body.append(preview, form); d.append(body);
+    const status = el('div', 'hint'); status.textContent = 'Projetando vistas…'; d.append(status);
+    const acts = el('div', 'actions');
+    const btnPdf = this.button('Gerar PDF', () => void exportAs('pdf'), 'btn primary'); const btnDxf = this.button('Gerar DXF', () => void exportAs('dxf'));
+    acts.append(this.button('Fechar', () => back.remove()), btnDxf, btnPdf); d.append(acts);
+    back.append(d); this.overlay.append(back);
+
+    let views: ProjectedView[] = []; let viewsKey = ''; let drawing: ReturnType<typeof layoutDrawing> | null = null; let busy = false; let dirty = false;
+    const meta = () => ({ date: new Date().toLocaleDateString('pt-BR'), docName: doc.name });
+    const render = async () => {
+      if (busy) { dirty = true; return; }
+      busy = true;
+      try {
+        const specs = viewSpecsFor(settings); const key = JSON.stringify(specs);
+        if (key !== viewsKey) { status.textContent = 'Projetando vistas…'; views = await this.kernel.project(specs); viewsKey = key; }
+        drawing = layoutDrawing(views, settings, meta());
+        const svgDoc = new DOMParser().parseFromString(toSVG(drawing), 'image/svg+xml');
+        preview.innerHTML = ''; preview.append(document.importNode(svgDoc.documentElement, true));
+        status.textContent = `${settings.sheet} paisagem · escala ${scaleLabel(drawing.scale)} · ${settings.projection === 'first' ? '1º' : '3º'} diedro · ${views.reduce((a, v) => a + v.visible.length + v.hidden.length, 0)} arestas projetadas`;
+        this.autosave();
+      } catch (e) { status.textContent = `Falhou: ${(e as Error).message}`; }
+      finally { busy = false; if (dirty) { dirty = false; void render(); } }
+    };
+    const exportAs = async (kind: 'pdf' | 'dxf') => {
+      if (!drawing) return;
+      const base = safeFileName(settings.title || doc.name);
+      if (kind === 'pdf') { const bytes = toPDF(drawing); downloadFile(`${base}.pdf`, bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer, 'application/pdf'); this.toast('PDF gerado.'); }
+      else { downloadFile(`${base}.dxf`, toDXF(drawing), 'application/dxf'); this.toast('DXF gerado (coordenadas da folha, em mm).'); }
+    };
+
+    const h3f = (t: string) => { const h = document.createElement('h3'); h.textContent = t; form.append(h); };
+    const selectRow = (label: string, options: [string, string][], value: string, onChange: (v: string) => void) => {
+      const row = el('div', 'row'); const lab = document.createElement('label'); lab.textContent = label;
+      const sel = document.createElement('select'); for (const [v, t] of options) { const o = document.createElement('option'); o.value = v; o.textContent = t; sel.append(o); }
+      sel.value = value; sel.addEventListener('change', () => { onChange(sel.value); void render(); }); row.append(lab, sel); form.append(row);
+    };
+    const checkRow = (label: string, key: keyof DrawingSettings) => {
+      const row = el('div', 'row'); const lab = document.createElement('label'); lab.textContent = label;
+      const chk = document.createElement('input'); chk.type = 'checkbox'; chk.checked = !!settings[key];
+      chk.addEventListener('change', () => { (settings as unknown as Record<string, unknown>)[key] = chk.checked; void render(); }); row.append(lab, chk); form.append(row);
+    };
+    const textRow = (label: string, key: keyof DrawingSettings) => {
+      const row = el('div', 'row'); const lab = document.createElement('label'); lab.textContent = label;
+      const inp = document.createElement('input'); inp.type = 'text'; inp.value = String(settings[key] ?? ''); inp.spellcheck = false;
+      inp.addEventListener('change', () => { (settings as unknown as Record<string, unknown>)[key] = inp.value.trim().slice(0, 120); void render(); }); row.append(lab, inp); form.append(row);
+    };
+    h3f('Folha');
+    selectRow('Formato', (Object.keys(SHEET_MM) as DrawingSettings['sheet'][]).map((k) => [k, `${k} (${SHEET_MM[k][0]}×${SHEET_MM[k][1]} mm)`]), settings.sheet, (v) => { settings.sheet = v as DrawingSettings['sheet']; });
+    selectRow('Projeção', [['first', '1º diedro (ABNT)'], ['third', '3º diedro (EUA)']], settings.projection, (v) => { settings.projection = v as DrawingSettings['projection']; });
+    selectRow('Escala', [['auto', 'Automática'], ...STANDARD_SCALES.map((sc): [string, string] => [String(sc), scaleLabel(sc)])], settings.scale === 'auto' ? 'auto' : String(settings.scale), (v) => { settings.scale = v === 'auto' ? 'auto' : Number(v); });
+    h3f('Vistas');
+    checkRow('Frente', 'front'); checkRow('Topo', 'top'); checkRow(settings.projection === 'first' ? 'Lateral esquerda' : 'Lateral direita', 'side'); checkRow('Isométrica', 'iso');
+    checkRow('Linhas ocultas', 'hidden'); checkRow('Arestas tangentes', 'tangent'); checkRow('Cotas automáticas', 'dimensions');
+    h3f('Legenda');
+    textRow('Título', 'title'); textRow('Nº do desenho', 'number'); textRow('Material', 'material'); textRow('Desenhou', 'author'); textRow('Empresa', 'company');
+    await render();
   }
 
   // ---------- Menus, popovers, diálogos ----------

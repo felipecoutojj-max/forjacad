@@ -2,6 +2,7 @@
 // Serializa para JSON legível (.forja). Guarda geometria + restrições + features, nunca a malha.
 
 import { type Sketch, type Id, newId } from './sketch/model';
+import { type DrawingSettings, defaultDrawingSettings, SHEET_MM } from './drawing/layout';
 
 export const FORJA_VERSION = 2;
 
@@ -72,6 +73,8 @@ export interface ForjaDocument {
   format: 'forja'; version: number; name: string; units: 'mm';
   createdAt: string; modifiedAt: string;
   planes: Plane[]; sketches: Sketch[]; features: Feature[];
+  /** Opções do desenho técnico (folha, vistas, legenda). Ausente até o primeiro desenho. */
+  drawing?: DrawingSettings;
 }
 
 export const BASE_PLANES: Plane[] = [
@@ -131,9 +134,25 @@ export function deserialize(text: string): ForjaDocument {
     }
   }
   doc.features = features;
+  doc.drawing = sanitizeDrawing(d.drawing, doc.name);
   // Planos base sempre existem, mesmo que o arquivo venha sem eles.
   for (const bp of BASE_PLANES) if (!doc.planes.some((p) => p.id === bp.id)) doc.planes.push({ ...bp });
   return doc;
+}
+
+/** Opções de desenho válidas a partir de um objeto qualquer (arquivo antigo ou editado à mão). */
+export function sanitizeDrawing(raw: unknown, title: string): DrawingSettings | undefined {
+  if (!raw || typeof raw !== 'object') return undefined;
+  const r = raw as Record<string, unknown>; const def = defaultDrawingSettings(title);
+  const bool = (k: keyof DrawingSettings) => (typeof r[k] === 'boolean' ? (r[k] as boolean) : (def[k] as boolean));
+  const text = (k: keyof DrawingSettings) => (typeof r[k] === 'string' ? (r[k] as string).slice(0, 120) : (def[k] as string));
+  return {
+    sheet: typeof r.sheet === 'string' && r.sheet in SHEET_MM ? (r.sheet as DrawingSettings['sheet']) : def.sheet,
+    projection: r.projection === 'third' ? 'third' : 'first',
+    scale: typeof r.scale === 'number' && Number.isFinite(r.scale) && r.scale > 0 ? r.scale : 'auto',
+    front: bool('front'), top: bool('top'), side: bool('side'), iso: bool('iso'), hidden: bool('hidden'), tangent: bool('tangent'), dimensions: bool('dimensions'),
+    title: text('title'), number: text('number'), material: text('material'), author: text('author'), company: text('company'),
+  };
 }
 
 export function cloneDocument(doc: ForjaDocument): ForjaDocument { return JSON.parse(JSON.stringify(doc)); }

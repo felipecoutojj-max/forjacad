@@ -2,7 +2,7 @@
 import { describe, it, expect, beforeAll } from 'vitest';
 import initOpenCascade from 'opencascade.js/dist/node.js';
 import type { OpenCascadeInstance } from 'opencascade.js';
-import { rebuildDocument, tessellate, exportSTEP } from './build';
+import { rebuildDocument, tessellate, exportSTEP, projectViews } from './build';
 import { createDocument, addExtrude, addRevolve, addFillet, addBoolean, type ForjaDocument } from '../../document';
 import * as M from '../../sketch/model';
 
@@ -143,6 +143,25 @@ describe('kernel OpenCASCADE', () => {
     addRevolve(doc, prof.id, { p: [0, 0], d: [0, 1] }, 360, { op: 'cut', target: body.id });
     const r = rebuildDocument(oc, doc); expect(r.errors).toEqual([]); expect(r.bodies).toHaveLength(1);
     expect(tessellate(oc, r.bodies[0], 'c').volume).toBeCloseTo(120000 - (Math.PI * 25 * 20) / 4, 0);
+  });
+
+  it('projeta frente, topo e lateral esquerda com linhas ocultas do furo', () => {
+    const doc = createDocument(); const body = addExtrude(doc, rectSketch(doc, 'plane-xy', 0, 0, 100, 60).id, 20);
+    addExtrude(doc, circleSketch(doc, 'plane-xy', 50, 30, 10).id, 5, { op: 'cut', target: body.id, throughAll: true });
+    const r = rebuildDocument(oc, doc); expect(r.errors).toEqual([]);
+    const [front, top, left] = projectViews(oc, r.bodies.map((b) => b.shape), [
+      { name: 'front', n: [0, 0, 1], up: [0, 1, 0] }, { name: 'top', n: [0, 1, 0], up: [0, 0, -1] }, { name: 'left', n: [-1, 0, 0], up: [0, 1, 0] },
+    ]);
+    // Frente: contorno 100×60, furo visível como círculo, nada oculto.
+    expect(front.bbox[2] - front.bbox[0]).toBeCloseTo(100, 3); expect(front.bbox[3] - front.bbox[1]).toBeCloseTo(60, 3);
+    expect(front.visible.length).toBeGreaterThanOrEqual(5); expect(front.hidden).toHaveLength(0);
+    expect(front.circles).toHaveLength(1); expect(front.circles[0].r).toBeCloseTo(10, 3); expect(front.circles[0].cx).toBeCloseTo(50, 3); expect(front.circles[0].cy).toBeCloseTo(30, 3);
+    // Topo: 100×20, furo vira duas linhas ocultas.
+    expect(top.bbox[2] - top.bbox[0]).toBeCloseTo(100, 3); expect(top.bbox[3] - top.bbox[1]).toBeCloseTo(20, 3);
+    expect(top.hidden.length).toBeGreaterThanOrEqual(2); expect(top.circles).toHaveLength(0);
+    // Lateral esquerda: 20×60, o lado da frente (+z) fica à direita (X = z).
+    expect(left.bbox[2] - left.bbox[0]).toBeCloseTo(20, 3); expect(left.bbox[3] - left.bbox[1]).toBeCloseTo(60, 3);
+    expect(left.bbox[0]).toBeCloseTo(0, 3); expect(left.hidden.length).toBeGreaterThanOrEqual(2);
   });
 
   it('exporta STEP com os corpos', () => {
