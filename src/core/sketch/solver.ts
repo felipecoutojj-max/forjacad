@@ -7,9 +7,14 @@ import type { Sketch, Id, Entity, ArcEntity, CircleEntity, LineEntity } from './
 export interface SolveOptions {
   /** Ponto arrastado e posição alvo: o solver tenta levá-lo até lá respeitando as restrições. */
   drag?: { point: Id; x: number; y: number };
+  /** Vários pontos arrastados juntos (mover uma linha inteira). */
+  drags?: { point: Id; x: number; y: number }[];
+  /** Raio arrastado (círculo ou arco) e valor alvo. */
+  dragRadius?: { entity: Id; r: number };
   maxIter?: number;
   tolerance?: number;
 }
+const allDrags = (o: SolveOptions) => (o.drags ?? []).concat(o.drag ? [o.drag] : []);
 
 export interface SolveResult {
   converged: boolean;
@@ -179,10 +184,10 @@ export function buildResiduals(s: Sketch, vm: VarMap, opts: SolveOptions): { har
     }
   }
 
-  if (opts.drag) {
-    const { point, x: tx, y: ty } = opts.drag;
+  for (const { point, x: tx, y: ty } of allDrags(opts)) {
     if (vm.idx.has(`${point}.x`)) { const qx = px(point), qy = py(point); soft.push((x) => qx(x) - tx); soft.push((x) => qy(x) - ty); }
   }
+  if (opts.dragRadius && vm.idx.has(`${opts.dragRadius.entity}.r`)) { const rr = rad(opts.dragRadius.entity); const target = Math.max(1e-3, opts.dragRadius.r); soft.push((x) => rr(x) - target); }
   return { hard, soft };
 }
 
@@ -274,17 +279,18 @@ export function solveSketch(s: Sketch, opts: SolveOptions = {}): SolveResult {
   const maxIter = opts.maxIter ?? 80; const tol = opts.tolerance ?? 1e-8;
   const fixedByConstraint = new Set<Id>(s.constraints.filter((c) => c.kind === 'fixed').map((c) => c.refs[0]));
 
-  // Passo 1: ponto arrastado tratado como fixo no alvo. Se as restrições permitirem, ele chega lá.
-  if (opts.drag) {
-    const p = s.points.find((q) => q.id === opts.drag!.point);
-    if (p && !p.fixed && !fixedByConstraint.has(p.id)) {
-      const ox = p.x, oy = p.y; p.x = opts.drag.x; p.y = opts.drag.y;
-      const vm = buildVarMap(s, new Set([...fixedByConstraint, p.id]));
-      const { hard } = buildResiduals(s, vm, {});
-      const x = readVars(s, vm); const r = lm(hard, x, vm.n, maxIter, tol);
-      if (r.converged) { writeVars(s, vm, x); return finish(s, vm, hard, r); }
-      p.x = ox; p.y = oy; // não deu: solta o ponto e puxa de leve
-    }
+  // Passo 1: pontos arrastados tratados como fixos no alvo (e raio arrastado como cota). Se as restrições permitirem, chegam lá.
+  const drags = allDrags(opts).map((d) => ({ d, p: s.points.find((q) => q.id === d.point) })).filter((x) => x.p && !x.p.fixed && !fixedByConstraint.has(x.p.id)) as { d: { point: Id; x: number; y: number }; p: { id: Id; x: number; y: number } }[];
+  const radEnt = opts.dragRadius ? s.entities.find((e) => e.id === opts.dragRadius!.entity) : undefined;
+  if (drags.length || radEnt) {
+    const backup = drags.map(({ p }) => ({ p, x: p.x, y: p.y })); const oldR = radEnt && (radEnt.type === 'circle' || radEnt.type === 'arc') ? radEnt.r : 0;
+    for (const { d, p } of drags) { p.x = d.x; p.y = d.y; }
+    const vm = buildVarMap(s, new Set([...fixedByConstraint, ...drags.map((x) => x.p.id)]));
+    const { hard } = buildResiduals(s, vm, {});
+    if (radEnt && opts.dragRadius) { const i = vm.idx.get(`${radEnt.id}.r`); const target = Math.max(1e-3, opts.dragRadius.r); if (i !== undefined) hard.push((x) => Math.abs(x[i]) - target); }
+    const x = readVars(s, vm); const r = lm(hard, x, vm.n, maxIter, tol);
+    if (r.converged) { writeVars(s, vm, x); return finish(s, vm, hard, r); }
+    for (const b of backup) { b.p.x = b.x; b.p.y = b.y; } if (radEnt && (radEnt.type === 'circle' || radEnt.type === 'arc')) radEnt.r = oldR; // não deu: solta e puxa de leve
   }
 
   const vm = buildVarMap(s, fixedByConstraint);

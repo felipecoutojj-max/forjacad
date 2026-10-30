@@ -8,9 +8,9 @@ import { getPoint } from '../sketch/model';
 import type { Plane, ExtrudeFeature, ForjaDocument } from '../document';
 import { planeNormal, getPlane, getSketch } from '../document';
 import { TAU } from '../geom';
-import { extractProfiles, loopArcAngles, type Loop, type Profile } from './profiles';
+import { extractProfiles, loopArcAngles, profileContainsPoint, type Loop, type Profile } from './profiles';
 
-export { extractProfiles, signedArea, type Loop, type LoopEdge, type Profile } from './profiles';
+export { extractProfiles, signedArea, profileContainsPoint, profileInnerPoint, type Loop, type LoopEdge, type Profile } from './profiles';
 
 /** Converte um laço em THREE.Shape ou THREE.Path (coordenadas do plano). */
 function loopToPath<T extends THREE.Path>(s: Sketch, loop: Loop, target: T): T {
@@ -50,7 +50,8 @@ export interface BodyMesh { feature: ExtrudeFeature; geometry: THREE.BufferGeome
 /** Gera a malha de uma extrusão. Retorna null se o esboço não tem perfil fechado. */
 export function buildExtrude(doc: ForjaDocument, f: ExtrudeFeature): THREE.BufferGeometry | null {
   const sk = getSketch(doc, f.sketch); const plane = getPlane(doc, sk.plane);
-  const profiles = extractProfiles(sk);
+  let profiles = extractProfiles(sk);
+  if (f.profilePoint) { const pt = { x: f.profilePoint[0], y: f.profilePoint[1] }; profiles = profiles.filter((p) => profileContainsPoint(sk, p, pt)); }
   if (!profiles.length) return null;
   const shapes = profiles.map((p) => profileToShape(sk, p));
   const depth = Math.abs(f.depth) || 1;

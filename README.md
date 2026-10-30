@@ -19,11 +19,22 @@ npm run dev
 
 Abre em `http://localhost:5173`. Para abrir no iPad na mesma rede, use o endereço de rede que o Vite imprime.
 
-## Como usar (v0.2)
+## Como usar (v0.7, modelagem direta)
+
+- **Caneta na peça.** Risque numa face plana: abre um esboço nela, na própria vista 3D (botão "Vista reta"
+  se preferir de frente). Arraste uma região sombreada do esboço: extruda ao vivo; para fora adiciona, para
+  dentro corta. Toque numa face e arraste-a: puxa ou empurra a face. Arraste uma aresta: filete (ou chanfro,
+  conforme o botão ativo) com o raio seguindo a caneta. O valor aparece numa etiqueta; toque nela para digitar.
+- **Esboço vivo.** Linhas colam em horizontal, vertical e ângulo reto automaticamente. Toque numa linha ou
+  círculo para ver a medida e cotá-la; arraste o que está selecionado para mover, alongar ou mudar o raio,
+  sempre respeitando as restrições.
+- **Dedo** orbita; dois dedos aproximam. Mouse: botão esquerdo faz o que a caneta faz, direito/meio movem a câmera.
+
+## Como usar (fluxos por botão)
 
 - Toque num plano (ou numa face plana de um corpo) para abrir um esboço. Risque com a caneta; o traço vira
   linha, arco ou círculo. Toque numa cota para digitar a medida.
-- "Extrudar" abre o diálogo: novo corpo, adicionar ou cortar, profundidade, sentido e "atravessar tudo".
+- "Extrudar" abre o diálogo para quem prefere números: novo corpo, adicionar ou cortar, profundidade, sentido e "atravessar tudo".
 - "Revolucionar" gira o perfil em torno de um eixo: o eixo vertical ou horizontal do esboço, ou qualquer
   linha dele (desenhe o eixo como linha de construção). Ângulo de 1° a 360°, também em corte ou adição.
 - Toque numa aresta (ou em várias) e escolha filete ou chanfro. Toque num corpo para combinar com outro.
@@ -79,5 +90,8 @@ endereço no Safari e use Compartilhar ▸ Adicionar à Tela de Início.
 5. Montagem com juntas, lista de materiais e balões (v0.5, feito).
 6. Animação pelas juntas, vídeo e verificação de interferências (v0.6, feito).
 
-Próximos candidatos: arrastar peças com o dedo, cortes e seções no desenho, cotas editáveis, varredura,
-vistas explodidas.
+7. Modelagem direta (v0.7, feito): gestos da caneta no 3D, esboço na face em perspectiva, esboço manipulável,
+   visual claro de vidro fosco com modo escuro.
+
+Próximos candidatos: arrastar peças da montagem com o dedo, cortes e seções no desenho, cotas editáveis,
+varredura, vistas explodidas.

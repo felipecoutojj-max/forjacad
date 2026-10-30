@@ -10,6 +10,13 @@ import type { Id } from '../core/sketch/model';
 
 export type ViewMode = 'view' | 'sketch';
 
+/** Paleta 3D: aço claro e cinzas no claro; grafite no escuro. Laranja de aço aquecido marca a seleção, palha o hover, lilás os planos. */
+export const THEMES = {
+  light: { body: 0xd3d8df, bodySel: 0xe3c3a0, faceSel: 0xf0542b, edge: 0x3a3a3c, edgeSel: 0xf0542b, hover: 0xe9a825, region: 0xe9a825, regionHot: 0xf0542b, ghost: 0xf0542b, ghostEdge: 0xf0542b, grid1: 0xb8bec8, grid2: 0xcdd2d9, plane: 0x7c6bc4, axes: [0xff3b30, 0x34c759, 0x5e5ce6], hemiSky: 0xffffff, hemiGround: 0x9aa0a8, key: 1.25, fill: 0.55 },
+  dark: { body: 0x8d96a3, bodySel: 0xc9a070, faceSel: 0xff6a3d, edge: 0x16171a, edgeSel: 0xff6a3d, hover: 0xf2b640, region: 0xf2b640, regionHot: 0xff6a3d, ghost: 0xff6a3d, ghostEdge: 0xffb15c, grid1: 0x3c3f46, grid2: 0x2a2c31, plane: 0x9d8ce0, axes: [0xff453a, 0x30d158, 0x7d7aff], hemiSky: 0xe0e4ea, hemiGround: 0x2a2f38, key: 1.3, fill: 0.5 },
+};
+export type ThemeName = keyof typeof THEMES;
+
 /** Corpo para desenhar: malha do kernel (com `data`) ou prévia (só geometria). */
 export interface RenderBody { id: Id; name: string; geometry: THREE.BufferGeometry; data?: BodyData; /** 4×4 em linha-maior (instância de montagem). */ matrix?: number[]; }
 
@@ -19,6 +26,9 @@ export const emptySel3D = (): Sel3D => ({ body: null, face: null, edges: [] });
 
 export interface FaceHit { body: Id; index: number; distance: number; point: THREE.Vector3; }
 export interface EdgeHit { body: Id; index: number; px: number; }
+export interface RegionHit { sketch: Id; index: number; distance: number; point: THREE.Vector3; }
+export interface RegionDef { sketch: Id; index: number; geometry: THREE.BufferGeometry; }
+export type Hover = { kind: 'region'; sketch: Id; index: number } | { kind: 'face'; body: Id; index: number } | { kind: 'edge'; body: Id; index: number } | null;
 
 export class Viewport {
   readonly renderer: THREE.WebGLRenderer;
@@ -26,11 +36,23 @@ export class Viewport {
   readonly persp: THREE.PerspectiveCamera;
   readonly ortho: THREE.OrthographicCamera;
   mode: ViewMode = 'view';
+  /** Em modo esboço: desenhar na vista 3D (perspectiva) em vez da vista reta ortográfica. */
+  sketchPerspective = false;
   readonly target = new THREE.Vector3(0, 0, 0);
   readonly bodies = new THREE.Group();
   readonly sketches = new THREE.Group();
   readonly helpers = new THREE.Group();
   readonly highlights = new THREE.Group();
+  readonly regions = new THREE.Group();
+  readonly hoverGroup = new THREE.Group();
+  readonly ghostGroup = new THREE.Group();
+  private regionMeshes: THREE.Mesh[] = [];
+  private regionMat = new THREE.MeshBasicMaterial({ color: 0xe9a825, transparent: true, opacity: 0.12, side: THREE.DoubleSide, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2 });
+  private regionHotMat = new THREE.MeshBasicMaterial({ color: 0xf0542b, transparent: true, opacity: 0.35, side: THREE.DoubleSide, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2 });
+  private hoverFaceMat = new THREE.MeshBasicMaterial({ color: 0xe9a825, transparent: true, opacity: 0.3, side: THREE.DoubleSide, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -3, polygonOffsetUnits: -3 });
+  private hoverEdgeMat = new THREE.LineBasicMaterial({ color: 0xe9a825, depthTest: false });
+  private ghostMat = new THREE.MeshStandardMaterial({ color: 0xf0542b, transparent: true, opacity: 0.45, metalness: 0.2, roughness: 0.6, side: THREE.DoubleSide, depthWrite: false });
+  private ghostEdgeMat = new THREE.LineBasicMaterial({ color: 0xf0542b });
   private planeMeshes = new Map<string, THREE.Mesh>();
   private bodyMeshes = new Map<Id, THREE.Mesh>();
   private bodyData = new Map<Id, BodyData>();
@@ -42,39 +64,61 @@ export class Viewport {
   /** Em modo esboço: meio-tamanho da janela ortográfica em mm (zoom). */
   private orthoHalf = 80;
   private raycaster = new THREE.Raycaster();
-  private bodyMaterial = new THREE.MeshStandardMaterial({ color: 0x9aa7b8, metalness: 0.35, roughness: 0.55, side: THREE.DoubleSide });
-  private bodySelMaterial = new THREE.MeshStandardMaterial({ color: 0xc9a06a, metalness: 0.3, roughness: 0.5, side: THREE.DoubleSide });
-  private faceSelMaterial = new THREE.MeshBasicMaterial({ color: 0xf28c28, transparent: true, opacity: 0.5, side: THREE.DoubleSide, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -3, polygonOffsetUnits: -3 });
-  private edgeMaterial = new THREE.LineBasicMaterial({ color: 0x2a2f38 });
-  private edgeSelMaterial = new THREE.LineBasicMaterial({ color: 0xffb15c, depthTest: false });
+  private bodyMaterial = new THREE.MeshStandardMaterial({ color: 0xd3d8df, metalness: 0.12, roughness: 0.62, side: THREE.DoubleSide });
+  private bodySelMaterial = new THREE.MeshStandardMaterial({ color: 0xe3c3a0, metalness: 0.12, roughness: 0.58, side: THREE.DoubleSide });
+  private faceSelMaterial = new THREE.MeshBasicMaterial({ color: 0xf0542b, transparent: true, opacity: 0.45, side: THREE.DoubleSide, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -3, polygonOffsetUnits: -3 });
+  private edgeMaterial = new THREE.LineBasicMaterial({ color: 0x3a3a3c });
+  private edgeSelMaterial = new THREE.LineBasicMaterial({ color: 0xf0542b, depthTest: false });
+  private hemi!: THREE.HemisphereLight; private keyLight!: THREE.DirectionalLight; private fillLight!: THREE.DirectionalLight;
+  private planeMat = new THREE.MeshBasicMaterial({ color: 0x7c6bc4, transparent: true, opacity: 0.06, side: THREE.DoubleSide, depthWrite: false });
+  private planeEdgeMat = new THREE.LineBasicMaterial({ color: 0x7c6bc4, transparent: true, opacity: 0.35 });
+  theme: ThemeName = 'light';
   width = 1; height = 1;
 
   constructor(readonly container: HTMLElement) {
-    this.renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false, powerPreference: 'high-performance' });
+    this.renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true, powerPreference: 'high-performance' });
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-    this.renderer.setClearColor(0x14171c);
+    this.renderer.setClearColor(0x000000, 0); // o gradiente de fundo vem do CSS da área de trabalho
     container.appendChild(this.renderer.domElement);
     this.persp = new THREE.PerspectiveCamera(40, 1, 0.5, 20000);
     this.persp.position.set(160, 120, 200); this.persp.up.set(0, 1, 0); this.persp.lookAt(this.target);
     this.ortho = new THREE.OrthographicCamera(-1, 1, 1, -1, -5000, 5000);
-    this.scene.add(this.bodies, this.sketches, this.helpers, this.highlights);
+    this.scene.add(this.bodies, this.sketches, this.helpers, this.regions, this.highlights, this.hoverGroup, this.ghostGroup);
     this.highlights.renderOrder = 5;
-    const hemi = new THREE.HemisphereLight(0xdfe6f0, 0x2a2f38, 1.1); this.scene.add(hemi);
-    const key = new THREE.DirectionalLight(0xffffff, 1.4); key.position.set(200, 300, 250); this.scene.add(key);
-    const fill = new THREE.DirectionalLight(0xffe2c0, 0.5); fill.position.set(-250, 100, -150); this.scene.add(fill);
+    this.hemi = new THREE.HemisphereLight(0xffffff, 0x9aa0a8, 1.6); this.scene.add(this.hemi);
+    this.keyLight = new THREE.DirectionalLight(0xffffff, 1.1); this.keyLight.position.set(200, 300, 250); this.scene.add(this.keyLight);
+    this.fillLight = new THREE.DirectionalLight(0xfff1e0, 0.5); this.fillLight.position.set(-250, 100, -150); this.scene.add(this.fillLight);
     this.buildHelpers();
+    this.applyTheme(window.matchMedia?.('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
     this.resize();
     new ResizeObserver(() => this.resize()).observe(container);
   }
 
-  get camera(): THREE.Camera { return this.mode === 'sketch' ? this.ortho : this.persp; }
+  get camera(): THREE.Camera { return this.mode === 'sketch' && !this.sketchPerspective ? this.ortho : this.persp; }
+  private get usingOrtho(): boolean { return this.camera === this.ortho; }
 
   private buildHelpers(): void {
-    this.grid = new THREE.GridHelper(400, 40, 0x3a4150, 0x262b35); this.grid.position.y = -0.01; this.helpers.add(this.grid);
+    const t = THEMES[this.theme];
+    const gridY = this.grid?.position.y ?? -0.01;
+    if (this.grid) this.helpers.remove(this.grid); if (this.axes) this.helpers.remove(this.axes);
+    this.grid = new THREE.GridHelper(400, 40, t.grid1, t.grid2); this.grid.position.y = gridY; this.helpers.add(this.grid);
     const axes = new THREE.Group();
     const mk = (dir: [number, number, number], color: number) => { const g = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), new THREE.Vector3(...dir).multiplyScalar(60)]); axes.add(new THREE.Line(g, new THREE.LineBasicMaterial({ color }))); };
-    mk([1, 0, 0], 0xef6b6b); mk([0, 1, 0], 0x5fcf80); mk([0, 0, 1], 0x4aa3ff);
+    mk([1, 0, 0], t.axes[0]); mk([0, 1, 0], t.axes[1]); mk([0, 0, 1], t.axes[2]);
     this.axes = axes; this.helpers.add(axes);
+  }
+
+  /** Troca a paleta 3D (claro/escuro) sem reconstruir a cena. */
+  applyTheme(name: ThemeName): void {
+    this.theme = name; const t = THEMES[name];
+    this.bodyMaterial.color.setHex(t.body); this.bodySelMaterial.color.setHex(t.bodySel); this.faceSelMaterial.color.setHex(t.faceSel);
+    this.edgeMaterial.color.setHex(t.edge); this.edgeSelMaterial.color.setHex(t.edgeSel);
+    this.hoverFaceMat.color.setHex(t.hover); this.hoverEdgeMat.color.setHex(t.hover); this.regionMat.color.setHex(t.region); this.regionHotMat.color.setHex(t.regionHot);
+    this.ghostMat.color.setHex(t.ghost); this.ghostEdgeMat.color.setHex(t.ghostEdge);
+    this.planeMat.color.setHex(t.plane); this.planeEdgeMat.color.setHex(t.plane);
+    this.hemi.color.setHex(t.hemiSky); this.hemi.groundColor.setHex(t.hemiGround); this.keyLight.intensity = t.key; this.fillLight.intensity = t.fill;
+    this.buildHelpers();
+    this.requestRender();
   }
 
   /** Desenha só os planos base; planos de face existem no documento mas não viram quadrados na cena. */
@@ -84,12 +128,12 @@ export class Viewport {
     for (const p of planes) {
       if (p.kind === 'face') continue;
       const geo = new THREE.PlaneGeometry(120, 120);
-      const mat = new THREE.MeshBasicMaterial({ color: 0x4aa3ff, transparent: true, opacity: 0.06, side: THREE.DoubleSide, depthWrite: false });
+      const mat = this.planeMat.clone();
       const mesh = new THREE.Mesh(geo, mat);
       const n = planeNormal(p);
       const m = new THREE.Matrix4().makeBasis(new THREE.Vector3(...p.u), new THREE.Vector3(...p.v), new THREE.Vector3(...n)); m.setPosition(new THREE.Vector3(...p.origin));
       mesh.applyMatrix4(m); mesh.userData.planeId = p.id; mesh.name = p.name;
-      const edge = new THREE.LineSegments(new THREE.EdgesGeometry(geo), new THREE.LineBasicMaterial({ color: 0x4aa3ff, transparent: true, opacity: 0.35 }));
+      const edge = new THREE.LineSegments(new THREE.EdgesGeometry(geo), this.planeEdgeMat);
       mesh.add(edge);
       this.helpers.add(mesh); this.planeMeshes.set(p.id, mesh);
     }
@@ -103,7 +147,7 @@ export class Viewport {
     this.requestRender();
   }
   highlightPlane(id: string | null): void {
-    for (const [pid, m] of this.planeMeshes) (m.material as THREE.MeshBasicMaterial).opacity = pid === id ? 0.18 : 0.06;
+    for (const [pid, m] of this.planeMeshes) (m.material as THREE.MeshBasicMaterial).opacity = pid === id ? 0.16 : 0.06;
     this.requestRender();
   }
 
@@ -138,6 +182,60 @@ export class Viewport {
   }
 
   bodyMatrixOf(id: Id): THREE.Matrix4 { return this.bodyMatrix.get(id) ?? new THREE.Matrix4(); }
+
+  /** Regiões fechadas dos esboços: sombreadas de leve e arrastáveis para extrudar. */
+  setRegions(list: RegionDef[]): void {
+    this.regions.clear(); this.regionMeshes = [];
+    for (const r of list) { const m = new THREE.Mesh(r.geometry, this.regionMat); m.userData.sketch = r.sketch; m.userData.index = r.index; m.renderOrder = 3; this.regions.add(m); this.regionMeshes.push(m); }
+    this.requestRender();
+  }
+  pickRegion(x: number, y: number): RegionHit | null {
+    if (!this.regionMeshes.length) return null;
+    this.setRay(x, y);
+    const hits = this.raycaster.intersectObjects(this.regionMeshes, false);
+    if (!hits.length) return null;
+    const h = hits[0]; return { sketch: h.object.userData.sketch as Id, index: h.object.userData.index as number, distance: h.distance, point: h.point };
+  }
+
+  /** Destaque do que está sob a caneta (hover): região, face ou aresta. */
+  setHover(h: Hover): void {
+    this.hoverGroup.clear();
+    for (const m of this.regionMeshes) m.material = this.regionMat;
+    if (!h) { this.requestRender(); return; }
+    if (h.kind === 'region') { const m = this.regionMeshes.find((r) => r.userData.sketch === h.sketch && r.userData.index === h.index); if (m) m.material = this.regionHotMat; }
+    else if (h.kind === 'face') {
+      const data = this.bodyData.get(h.body); const mesh = this.bodyMeshes.get(h.body); const f = data?.faces[h.index];
+      if (data && mesh && f) { const g = new THREE.BufferGeometry(); g.setAttribute('position', mesh.geometry.getAttribute('position')); g.setIndex(new THREE.BufferAttribute(data.indices.slice(f.triStart * 3, (f.triStart + f.triCount) * 3), 1)); const hl = new THREE.Mesh(g, this.hoverFaceMat); hl.matrixAutoUpdate = false; hl.matrix.copy(mesh.matrix); hl.renderOrder = 4; this.hoverGroup.add(hl); }
+    } else {
+      const data = this.bodyData.get(h.body); const ed = data?.edges[h.index];
+      if (ed) { const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.Float32BufferAttribute(ed.points, 3)); g.applyMatrix4(this.bodyMatrixOf(h.body)); const line = new THREE.Line(g, this.hoverEdgeMat); line.renderOrder = 6; this.hoverGroup.add(line); }
+    }
+    this.requestRender();
+  }
+
+  /** Prévia fantasma durante um arrasto (extrusão, puxar face). */
+  setGhost(geometry: THREE.BufferGeometry | null): void {
+    this.ghostGroup.clear();
+    if (geometry) { const m = new THREE.Mesh(geometry, this.ghostMat); m.renderOrder = 4; m.add(new THREE.LineSegments(new THREE.EdgesGeometry(geometry, 25), this.ghostEdgeMat)); this.ghostGroup.add(m); }
+    this.requestRender();
+  }
+
+  /** Geometria de uma face de um corpo (triângulos dela), no espaço do mundo. */
+  faceGeometry(body: Id, index: number): THREE.BufferGeometry | null {
+    const data = this.bodyData.get(body); const mesh = this.bodyMeshes.get(body); const f = data?.faces[index]; if (!data || !mesh || !f) return null;
+    const g = new THREE.BufferGeometry(); g.setAttribute('position', mesh.geometry.getAttribute('position').clone()); g.setIndex(new THREE.BufferAttribute(data.indices.slice(f.triStart * 3, (f.triStart + f.triCount) * 3), 1)); g.applyMatrix4(mesh.matrix);
+    return g;
+  }
+
+  /** Quanto o cursor "andou" ao longo de uma reta 3D (origem + eixo·t): parâmetro t do ponto da reta mais perto do raio do cursor. */
+  axisDragDistance(origin: THREE.Vector3, axis: THREE.Vector3, x: number, y: number): number {
+    this.setRay(x, y);
+    const ro = this.raycaster.ray.origin, rd = this.raycaster.ray.direction;
+    const a = axis.clone().normalize(); const w0 = origin.clone().sub(ro);
+    const b = a.dot(rd), d = a.dot(w0), e = rd.dot(w0); const denom = 1 - b * b;
+    if (denom < 1e-9) return 0;
+    return (b * e - d) / denom;
+  }
 
   /** Move corpos já na cena (animação): só troca matrizes, sem reconstruir geometria. */
   updateMatrices(map: Map<Id, number[]>): void {
@@ -180,7 +278,7 @@ export class Viewport {
 
   /** Tamanho aproximado de um pixel em mm no alvo da câmera (modo vista). */
   worldPerPixel(): number {
-    if (this.mode === 'sketch') return this.mmPerPixel();
+    if (this.usingOrtho) return (this.ortho.right - this.ortho.left) / this.width;
     const dist = this.persp.position.distanceTo(this.target);
     return (2 * Math.tan((this.persp.fov * Math.PI) / 360) * dist) / this.height;
   }
@@ -216,7 +314,7 @@ export class Viewport {
     this.persp.lookAt(this.target); this.requestRender();
   }
   pan(dx: number, dy: number): void {
-    if (this.mode === 'sketch') {
+    if (this.usingOrtho) {
       const mm = this.mmPerPixel();
       const right = new THREE.Vector3(), up = new THREE.Vector3();
       this.ortho.matrixWorld.extractBasis(right, up, new THREE.Vector3());
@@ -233,7 +331,7 @@ export class Viewport {
   }
   /** factor > 1 aproxima. `at` (pixels) mantém o ponto sob o dedo parado. */
   zoom(factor: number, at?: { x: number; y: number }): void {
-    if (this.mode === 'sketch' && this.sketchPlane) {
+    if (this.usingOrtho && this.sketchPlane) {
       const before = at ? this.screenToPlane(at.x, at.y, this.sketchPlane) : null;
       this.orthoHalf = Math.max(2, Math.min(5000, this.orthoHalf / factor)); this.updateOrtho();
       if (before && at) {
@@ -254,7 +352,7 @@ export class Viewport {
     this.sketches.traverse((o) => { if ((o as THREE.Line).isLine) box.expandByObject(o); });
     if (box.isEmpty()) box.set(new THREE.Vector3(-60, -60, -60), new THREE.Vector3(60, 60, 60));
     const center = box.getCenter(new THREE.Vector3()); const size = box.getSize(new THREE.Vector3()).length() || 100;
-    if (this.mode === 'sketch') {
+    if (this.usingOrtho) {
       this.orthoHalf = size * 0.6; this.updateOrtho();
       const n = this.ortho.getWorldDirection(new THREE.Vector3()).negate();
       this.target.copy(center); this.ortho.position.copy(center).add(n.multiplyScalar(500)); this.ortho.lookAt(center);
@@ -267,23 +365,43 @@ export class Viewport {
   }
 
   // ---------- Modo esboço ----------
-  enterSketch(plane: Plane): void {
-    this.mode = 'sketch'; this.sketchPlane = plane;
+  /** Entra no esboço. Em perspectiva, a câmera 3D fica onde está (a pessoa já olha para a face). */
+  enterSketch(plane: Plane, perspective = false): void {
+    this.mode = 'sketch'; this.sketchPlane = plane; this.sketchPerspective = perspective;
+    this.alignOrthoToPlane();
+    if (perspective) { this.target.copy(new THREE.Vector3(...plane.origin)); this.persp.lookAt(this.target); }
+    this.showPlanes(false, plane.id); this.highlightPlane(null);
+    this.requestRender();
+  }
+  private alignOrthoToPlane(): void {
+    const plane = this.sketchPlane; if (!plane) return;
     const n = new THREE.Vector3(...planeNormal(plane)); const up = new THREE.Vector3(...plane.v);
     const origin = new THREE.Vector3(...plane.origin);
     this.target.copy(origin);
     this.ortho.position.copy(origin).add(n.clone().multiplyScalar(500));
     this.ortho.up.copy(up); this.ortho.lookAt(origin);
     this.orthoHalf = 80; this.updateOrtho();
-    this.showPlanes(false, plane.id); this.highlightPlane(null);
+  }
+  /** Alterna entre vista reta (ortográfica) e vista 3D durante o esboço. */
+  setSketchPerspective(on: boolean): void {
+    if (this.mode !== 'sketch' || this.sketchPerspective === on) return;
+    this.sketchPerspective = on;
+    if (!on) this.alignOrthoToPlane();
+    else if (this.sketchPlane) { this.target.copy(new THREE.Vector3(...this.sketchPlane.origin)); this.persp.lookAt(this.target); }
     this.requestRender();
   }
   exitSketch(): void {
-    this.mode = 'view'; this.sketchPlane = null; this.showPlanes(true); this.requestRender();
+    this.mode = 'view'; this.sketchPlane = null; this.sketchPerspective = false; this.showPlanes(true); this.requestRender();
   }
 
-  /** Milímetros por pixel na tela (modo esboço). */
-  mmPerPixel(): number { return (this.ortho.right - this.ortho.left) / this.width; }
+  /** Milímetros por pixel no plano do esboço (na perspectiva, medido na origem do plano). */
+  mmPerPixel(): number {
+    if (this.usingOrtho || !this.sketchPlane) return (this.ortho.right - this.ortho.left) / this.width;
+    const origin = new THREE.Vector3(...this.sketchPlane.origin);
+    const dir = this.persp.getWorldDirection(new THREE.Vector3());
+    const dist = Math.max(1, origin.clone().sub(this.persp.position).dot(dir));
+    return (2 * Math.tan((this.persp.fov * Math.PI) / 360) * dist) / this.height;
+  }
 
   /** Pixel da tela → coordenadas (u, v) no plano. */
   screenToPlane(x: number, y: number, plane: Plane): Vec2 | null {

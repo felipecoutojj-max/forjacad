@@ -1,19 +1,19 @@
 // Aplicativo: ferramentas, gestos, painel lateral, desfazer, autosave, arquivos e o diálogo com o kernel 3D.
 
 import * as THREE from 'three';
-import { Viewport, emptySel3D, type Sel3D, type RenderBody } from './viewport';
-import { SketchRenderer, emptySelection, type Selection, dimEndpoints, fmtDim } from './sketchRenderer';
+import { Viewport, emptySel3D, type Sel3D, type RenderBody, type RegionDef, type Hover } from './viewport';
+import { SketchRenderer, emptySelection, setSketchTheme, type Selection, dimEndpoints, fmtDim } from './sketchRenderer';
 import { icons, type IconName } from './icons';
 import {
-  createDocument, serialize, deserialize, getPlane, getSketch, addExtrude, addRevolve, addFillet, addBoolean, addFacePlane, pruneFacePlanes,
+  createDocument, serialize, deserialize, getPlane, getSketch, addExtrude, addRevolve, addFillet, addBoolean, addFacePlane, pruneFacePlanes, addPushPull,
   bodyIds, bodyName, featuresOfBody, planeNormal,
   type ForjaDocument, type Plane, type Feature, type ExtrudeFeature, type ExtrudeOp, type V3, type SketchAxis,
 } from '../core/document';
 import * as M from '../core/sketch/model';
 import type { Sketch, Entity, Id, ConstraintKind, DimensionKind } from '../core/sketch/model';
-import { solveSketch, type SolveResult } from '../core/sketch/solver';
+import { solveSketch, type SolveResult, type SolveOptions } from '../core/sketch/solver';
 import { recognizeStroke, type Primitive } from '../core/sketch/recognizer';
-import { buildAllBodies } from '../core/kernel/preview';
+import { buildAllBodies, buildExtrude, extractProfiles, profileInnerPoint, profileToShape, planeMatrix } from '../core/kernel/preview';
 import { KernelClient, SupersededError } from '../core/kernel/occ/client';
 import type { BodyData, FeatureError, RebuildResult } from '../core/kernel/occ/types';
 import { toSTL, toOBJ, fromBody, fromGeometry, type MeshData } from '../core/export/mesh';
@@ -32,8 +32,15 @@ type Tool = 'select' | 'draw' | 'line' | 'rect' | 'circle' | 'dimension' | 'eras
 
 interface PointerInfo { id: number; type: string; x: number; y: number; startX: number; startY: number; moved: boolean; role: 'tool' | 'nav' | 'pan'; button: number; }
 interface Hit { kind: 'point' | 'entity' | 'dimension'; id: Id; d: number; }
+type ViewDrag =
+  | { kind: 'extrude'; sketch: Id; profilePoint: [number, number]; plane: Plane; start: THREE.Vector3; normal: THREE.Vector3; depth: number }
+  | { kind: 'pull'; body: Id; index: number; fd: BodyData['faces'][number]; origin: THREE.Vector3; normal: THREE.Vector3; dist: number }
+  | { kind: 'edge'; body: Id; index: number; created: Id | null; radius: number }
+  | { kind: 'draw'; body: Id; index: number; started: boolean };
+const snapMm = (v: number) => (Math.abs(v) < 20 ? Math.round(v * 2) / 2 : Math.round(v));
 
-const H_V_SNAP_DEG = 6;
+const H_V_SNAP_DEG = 10;
+const PERP_SNAP_DEG = 8;
 const TANGENT_SNAP_DEG = 12;
 
 const v3sub = (a: V3, b: V3): V3 => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
@@ -77,6 +84,13 @@ export class App {
   private pendingDimRefs: Id[] = [];
   private lastSolve: SolveResult | null = null;
   private hoverPlane: Id | null = null;
+  // Modelagem direta (vista 3D)
+  private drag: ViewDrag | null = null;
+  edgeDragKind: 'fillet' | 'chamfer' = 'fillet';
+  private liveTimer = 0;
+  private chipEl: HTMLElement | null = null; private chipTimer = 0;
+  // Manipulação direta no esboço
+  private sketchDrag: { kind: 'line'; id: Id; a: Id; b: Id; a0: Vec2; b0: Vec2; start: Vec2 } | { kind: 'radius'; id: Id; center: Id } | { kind: 'move'; points: { id: Id; x0: number; y0: number }[]; start: Vec2 } | null = null;
 
   // DOM
   private root: HTMLElement; private workspace!: HTMLElement; private overlay!: HTMLElement; private toolbar!: HTMLElement; private sidepanel!: HTMLElement;
@@ -95,6 +109,9 @@ export class App {
     this.vp.onAfterRender = () => this.placeLabels();
     this.bindPointer();
     this.bindKeys();
+    const mq = window.matchMedia?.('(prefers-color-scheme: dark)');
+    const applyTheme = () => { const dark = !!mq?.matches; this.vp.applyTheme(dark ? 'dark' : 'light'); setSketchTheme(dark ? 'dark' : 'light'); this.refreshSketch(); for (const r of this.inactiveSketches.values()) r.group.visible && this.refreshAll(false); };
+    mq?.addEventListener?.('change', applyTheme); setSketchTheme(mq?.matches ? 'dark' : 'light');
     this.kernel.onState = (s) => {
       this.renderStatus();
       if (s === 'ready') { this.toast(`Kernel 3D pronto (${(this.kernel.loadMs / 1000).toFixed(1)} s).`); void this.rebuild(); }
@@ -186,10 +203,21 @@ export class App {
       r.group.visible = s.id !== this.activeSketch;
       if (r.group.visible) r.update(s, getPlane(doc, s.plane), emptySelection(), false, 1);
     }
+    this.vp.setRegions(this.isAssembly ? [] : this.computeRegions());
     this.refreshSketch();
     this.renderToolbar(); this.renderSidePanel(); this.renderStatus();
     this.autosave();
     this.vp.requestRender();
+  }
+  /** Regiões fechadas de todos os esboços, como malhas finas sobre seus planos. */
+  private computeRegions(): RegionDef[] {
+    const doc = this.doc.current; const out: RegionDef[] = [];
+    for (const s of doc.sketches) {
+      let plane: Plane; try { plane = getPlane(doc, s.plane); } catch { continue; }
+      const m = planeMatrix(plane).multiply(new THREE.Matrix4().makeTranslation(0, 0, 0.05));
+      extractProfiles(s).forEach((prof, i) => { try { const g = new THREE.ShapeGeometry(profileToShape(s, prof), 24); g.applyMatrix4(m); out.push({ sketch: s.id, index: i, geometry: g }); } catch { /* perfil ruim: ignora */ } });
+    }
+    return out;
   }
   private refreshSketch(): void {
     const s = this.sketch, p = this.plane;
@@ -488,6 +516,7 @@ export class App {
       const tools: [Tool, IconName, string][] = [['select', 'select', 'Selecionar'], ['draw', 'draw', 'Caneta'], ['line', 'line', 'Linha'], ['rect', 'rect', 'Retângulo'], ['circle', 'circle', 'Círculo'], ['dimension', 'dimension', 'Cota'], ['erase', 'erase', 'Apagar']];
       for (const [t, ic, label] of tools) { const b = this.iconButton(ic, label, () => this.setTool(t)); if (this.tool === t) b.classList.add('active'); g1.append(b); }
       const touch = this.iconButton('touch', 'Dedo desenha', () => { this.touchDraws = !this.touchDraws; this.renderToolbar(); }); if (this.touchDraws) touch.classList.add('active'); g2.append(touch);
+      const persp = this.iconButton('view', this.vp.sketchPerspective ? 'Vista reta' : 'Vista 3D', () => { this.vp.setSketchPerspective(!this.vp.sketchPerspective); this.refreshSketch(); this.renderToolbar(); if (!this.vp.sketchPerspective) this.vp.fitAll(); }); if (this.vp.sketchPerspective) persp.classList.add('active'); g2.append(persp);
       g2.append(this.iconButton('fit', 'Enquadrar', () => this.vp.fitAll()));
       g3.append(this.iconButton('extrude', 'Extrudar', () => this.extrudeActive()));
       g3.append(this.iconButton('revolve', 'Revolucionar', () => this.revolveActive()));
@@ -507,8 +536,8 @@ export class App {
       g1.append(this.iconButton('sketch', 'Esboço', (ev) => this.newSketchMenu(ev)));
       g1.append(this.iconButton('extrude', 'Extrudar', (ev) => this.extrudeMenu(ev)));
       const hasEdges = this.sel3d.edges.length > 0;
-      const fil = this.iconButton('fillet', 'Filete', () => this.filletSelected('fillet')); fil.disabled = !hasEdges; g1.append(fil);
-      const cha = this.iconButton('chamfer', 'Chanfro', () => this.filletSelected('chamfer')); cha.disabled = !hasEdges; g1.append(cha);
+      const fil = this.iconButton('fillet', 'Filete', () => (hasEdges ? this.filletSelected('fillet') : this.setEdgeKind('fillet'))); if (this.edgeDragKind === 'fillet') fil.classList.add('active'); g1.append(fil);
+      const cha = this.iconButton('chamfer', 'Chanfro', () => (hasEdges ? this.filletSelected('chamfer') : this.setEdgeKind('chamfer'))); if (this.edgeDragKind === 'chamfer') cha.classList.add('active'); g1.append(cha);
       if (this.sel3d.face && this.faceIsPlanar(this.sel3d.face)) g1.append(this.iconButton('face', 'Esboçar na face', () => this.createSketchOnFace(this.sel3d.face!.body, this.sel3d.face!.index)));
       if (this.sel3d.body && bodyIds(this.doc.current).length > 1) g1.append(this.iconButton('boolean', 'Combinar', (ev) => this.booleanMenu(ev)));
       g2.append(this.iconButton('drawing', 'Desenho', () => void this.drawingDialog()));
@@ -518,6 +547,10 @@ export class App {
     }
   }
 
+  private setEdgeKind(kind: 'fillet' | 'chamfer'): void {
+    this.edgeDragKind = kind; this.renderToolbar();
+    this.toast(kind === 'fillet' ? 'Arraste uma aresta da peça: o raio do filete segue a caneta.' : 'Arraste uma aresta da peça: a distância do chanfro segue a caneta.');
+  }
   private faceIsPlanar(ref: { body: Id; index: number }): boolean {
     const f = this.bodyOf(ref.body)?.faces[ref.index]; return !!f && f.type === 'plane';
   }
@@ -564,6 +597,9 @@ export class App {
 
     // ----- Modo vista -----
     this.renderSelectionPanel(p);
+    if (!this.sel3d.body && !this.sel3d.face && !this.sel3d.edges.length && this.bodies.length) {
+      const d = el('div', 'hint'); d.textContent = 'Caneta: risque numa face para esboçar nela. Arraste uma região sombreada do esboço para extrudar (para fora adiciona, para dentro corta). Toque numa face e arraste para puxar ou empurrar. Arraste uma aresta para filete ou chanfro.'; p.append(d);
+    }
 
     p.append(h3('Esboços'));
     const list = el('div', 'list');
@@ -670,6 +706,13 @@ export class App {
       row3.append(this.button('Editar esboço', () => this.enterSketch(f.sketch)));
       row3.append(this.button('Apagar', () => this.deleteFeature(f), 'btn danger'));
       p.append(row3);
+    } else if (f.type === 'pushpull') {
+      const row = el('div', 'row'); const lab = document.createElement('label'); lab.textContent = 'Distância (mm, − empurra)';
+      const inp = document.createElement('input'); inp.type = 'number'; inp.step = '0.5'; inp.value = String(f.distance); inp.inputMode = 'decimal';
+      inp.addEventListener('change', () => { const v = parseFloat(inp.value.replace(',', '.')); if (!isFinite(v) || v === 0) return; edit(() => { f.distance = v; f.name = f.name.replace(/^(Puxar|Empurrar)/, v >= 0 ? 'Puxar' : 'Empurrar'); }); });
+      row.append(lab, inp); p.append(row);
+      const d = el('div', 'hint'); d.textContent = `Face de ${bodyName(doc, f.body)}, ${f.face.area.toFixed(0)} mm².`; p.append(d);
+      const row2 = el('div', 'row'); row2.append(this.button('Apagar', () => this.deleteFeature(f), 'btn danger')); p.append(row2);
     } else if (f.type === 'fillet' || f.type === 'chamfer') {
       numRow(f.type === 'fillet' ? 'Raio (mm)' : 'Distância (mm)', f.radius, (v) => edit(() => { f.radius = v; }));
       const d = el('div', 'hint'); d.textContent = `${f.edges.length} aresta${f.edges.length > 1 ? 's' : ''} em ${bodyName(doc, f.body)}.`; p.append(d);
@@ -740,10 +783,12 @@ export class App {
     const plane = addFacePlane(doc, `Face de ${data.name}`, origin, u, v, body);
     this.createSketchOn(plane.id, false);
   }
-  enterSketch(id: Id): void {
+  /** Abre um esboço. Em face de corpo, fica na vista 3D para a peça continuar visível; nos planos base, vista reta. */
+  enterSketch(id: Id, perspective?: boolean): void {
     this.activeSketch = id; this.mode = 'sketch'; this.tool = 'draw'; this.sel = emptySelection(); this.pendingDimRefs = []; this.selectedFeature = null; this.sel3d = emptySel3D();
-    const p = this.plane!; this.vp.enterSketch(p); this.vp.setSelection(this.sel3d);
-    this.solve(); this.refreshAll(false); this.vp.fitAll();
+    const p = this.plane!; const persp = perspective ?? (p.kind === 'face' && this.vp.mode === 'view');
+    this.vp.enterSketch(p, persp); this.vp.setSelection(this.sel3d);
+    this.solve(); this.refreshAll(false); if (!persp) this.vp.fitAll();
   }
   exitSketch(removeEmpty: boolean): void {
     const s = this.sketch;
@@ -754,7 +799,7 @@ export class App {
   }
   setTool(t: Tool): void { this.tool = t; this.pendingDimRefs = []; if (t !== 'select') this.sel = emptySelection(); this.refreshAll(false); }
 
-  private solve(opts?: { drag?: { point: Id; x: number; y: number } }): SolveResult | null {
+  private solve(opts?: SolveOptions): SolveResult | null {
     const s = this.sketch; if (!s) return null;
     this.lastSolve = solveSketch(s, opts); return this.lastSolve;
   }
@@ -847,6 +892,20 @@ export class App {
         }
       }
     }
+    // Ângulo reto automático: linha nova que nasce de outra linha oblíqua e fica a ~90° dela.
+    const hasHV = (l: Id) => s.constraints.some((k) => (k.kind === 'horizontal' || k.kind === 'vertical') && k.refs[0] === l);
+    for (const e of created) {
+      if (e.type !== 'line' || hasHV(e.id)) continue;
+      for (const pid of [e.a, e.b]) {
+        for (const o of s.entities) {
+          if (o.type !== 'line' || o.id === e.id || o.construction || hasHV(o.id) || !(o.a === pid || o.b === pid)) continue;
+          if (s.constraints.some((k) => k.kind === 'perpendicular' && k.refs.includes(e.id) && k.refs.includes(o.id))) continue;
+          const d1 = norm(sub(M.getPoint(s, e.b), M.getPoint(s, e.a))), d2 = norm(sub(M.getPoint(s, o.b), M.getPoint(s, o.a)));
+          const ang = Math.acos(Math.min(1, Math.abs(d1.x * d2.x + d1.y * d2.y))) * 180 / Math.PI;
+          if (Math.abs(ang - 90) < PERP_SNAP_DEG) autoCons.push(M.addConstraint(s, 'perpendicular', [e.id, o.id]).id);
+        }
+      }
+    }
     let r = this.solve();
     if (!r || !r.converged) {
       s.constraints = s.constraints.filter((k) => !autoCons.includes(k.id));
@@ -872,8 +931,9 @@ export class App {
     const r = this.vp.renderer.domElement.getBoundingClientRect(); return { x: ev.clientX - r.left, y: ev.clientY - r.top };
   }
   private roleFor(ev: PointerEvent): PointerInfo['role'] {
-    if (ev.pointerType === 'mouse') { if (ev.button === 1 || ev.button === 2) return 'pan'; return this.mode === 'sketch' ? 'tool' : 'nav'; }
-    if (ev.pointerType === 'pen') return this.mode === 'sketch' ? 'tool' : 'nav';
+    const direct = this.mode === 'sketch' || !this.isAssembly;
+    if (ev.pointerType === 'mouse') { if (ev.button === 1 || ev.button === 2) return 'pan'; return direct ? 'tool' : 'nav'; }
+    if (ev.pointerType === 'pen') return direct ? 'tool' : 'nav';
     if (this.mode === 'sketch' && this.touchDraws) return 'tool';
     return 'nav';
   }
@@ -891,14 +951,16 @@ export class App {
       return;
     }
     if (this.pointers.size > 2) return;
+    this.hideChip(); this.vp.setHover(null);
     if (info.role === 'tool' && this.mode === 'sketch') this.toolDown(info);
+    else if (info.role === 'tool' && this.mode === 'view') this.viewDown(info);
   }
 
   private onMove(ev: PointerEvent): void {
     const info = this.pointers.get(ev.pointerId); if (!info) { this.hover(ev); return; }
     const { x, y } = this.local(ev); const dx = x - info.x, dy = y - info.y;
     info.x = x; info.y = y;
-    if (!info.moved && Math.hypot(x - info.startX, y - info.startY) > 5) info.moved = true;
+    if (!info.moved && Math.hypot(x - info.startX, y - info.startY) > (info.type === 'mouse' ? 5 : 9)) info.moved = true;
     if (this.pointers.size === 2 && this.pinch) {
       const [a, b] = [...this.pointers.values()];
       const d = Math.hypot(a.x - b.x, a.y - b.y); const mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
@@ -907,9 +969,10 @@ export class App {
       this.pinch = { d0: d, mid }; this.refreshSketch(); return;
     }
     if (this.pointers.size !== 1) return;
-    if (info.role === 'nav') { if (this.mode === 'sketch') this.vp.pan(dx, dy); else this.vp.orbit(dx, dy); this.refreshSketch(); return; }
+    if (info.role === 'nav') { if (this.mode === 'sketch' && !this.vp.sketchPerspective) this.vp.pan(dx, dy); else this.vp.orbit(dx, dy); this.refreshSketch(); return; }
     if (info.role === 'pan') { this.vp.pan(dx, dy); this.refreshSketch(); return; }
     if (this.mode === 'sketch') this.toolMove(info, ev);
+    else if (info.role === 'tool') this.viewMove(info);
   }
 
   private onUp(ev: PointerEvent, cancelled = false): void {
@@ -917,12 +980,147 @@ export class App {
     this.pointers.delete(ev.pointerId);
     if (this.pointers.size < 2) this.pinch = null;
     if (info.role === 'nav' && !info.moved && !cancelled) { this.tapView(info); return; }
-    if (info.role === 'tool' && this.mode === 'sketch') this.toolUp(info, cancelled);
+    if (info.role === 'tool' && this.mode === 'sketch') { this.toolUp(info, cancelled); return; }
+    if (info.role === 'tool' && this.mode === 'view') this.viewUp(info, cancelled);
   }
 
+  // ---------- Modelagem direta: gestos da caneta na vista 3D ----------
+  /** Caneta (ou botão esquerdo) tocou a cena: decide o que vai ser arrastado. */
+  private viewDown(info: PointerInfo): void {
+    const doc = this.doc.current; const { x, y } = info;
+    const faceHit = this.vp.pickFace(x, y);
+    let regionHit = this.vp.pickRegion(x, y); if (regionHit && faceHit && regionHit.distance > faceHit.distance + 0.5) regionHit = null;
+    const tol = info.type === 'touch' ? 18 : info.type === 'pen' ? 12 : 9;
+    const edgeHit = regionHit ? null : this.vp.pickEdge(x, y, tol, faceHit);
+    if (regionHit) {
+      const sk = getSketch(doc, regionHit.sketch); const plane = getPlane(doc, sk.plane); const prof = extractProfiles(sk)[regionHit.index]; if (!prof) { info.role = 'nav'; return; }
+      const ip = profileInnerPoint(sk, prof);
+      this.drag = { kind: 'extrude', sketch: sk.id, profilePoint: [ip.x, ip.y], plane, start: regionHit.point.clone(), normal: new THREE.Vector3(...planeNormal(plane)), depth: 0 };
+      return;
+    }
+    if (edgeHit) { this.drag = { kind: 'edge', body: edgeHit.body, index: edgeHit.index, created: null, radius: 0 }; return; }
+    if (faceHit && faceHit.index >= 0) {
+      const fd = this.bodyOf(faceHit.body)?.faces[faceHit.index];
+      if (fd?.type === 'plane' && fd.normal) {
+        const selected = !!this.sel3d.face && this.sel3d.face.body === faceHit.body && this.sel3d.face.index === faceHit.index;
+        this.drag = selected
+          ? { kind: 'pull', body: faceHit.body, index: faceHit.index, fd, origin: new THREE.Vector3(...fd.center), normal: new THREE.Vector3(...fd.normal), dist: 0 }
+          : { kind: 'draw', body: faceHit.body, index: faceHit.index, started: false };
+        return;
+      }
+    }
+    info.role = 'nav';
+  }
+
+  private viewMove(info: PointerInfo): void {
+    const d = this.drag; if (!d) return;
+    const doc = this.doc.current;
+    if (d.kind === 'extrude') {
+      const t = snapMm(this.vp.axisDragDistance(d.start, d.normal, info.x, info.y)); d.depth = t;
+      if (Math.abs(t) < 0.01) this.vp.setGhost(null);
+      else { const tmp: ExtrudeFeature = { id: 'tmp', type: 'extrude', name: '', sketch: d.sketch, depth: Math.abs(t), op: 'new', flip: t < 0, profilePoint: d.profilePoint }; this.vp.setGhost(buildExtrude(doc, tmp)); }
+      this.updateChip(info.x, info.y, `${fmtDim('distance', Math.abs(t))} mm${t < 0 ? ' (corte)' : ''}`);
+    } else if (d.kind === 'pull') {
+      const t = snapMm(this.vp.axisDragDistance(d.origin, d.normal, info.x, info.y)); d.dist = t;
+      const g = Math.abs(t) < 0.01 ? null : this.vp.faceGeometry(d.body, d.index);
+      if (g) g.translate(d.normal.x * t, d.normal.y * t, d.normal.z * t);
+      this.vp.setGhost(g);
+      this.updateChip(info.x, info.y, `${t >= 0 ? '+' : '−'}${fmtDim('distance', Math.abs(t))} mm`);
+    } else if (d.kind === 'edge') {
+      const r = snapMm(Math.hypot(info.x - info.startX, info.y - info.startY) * this.vp.worldPerPixel()); d.radius = r;
+      if (r >= 0.5) {
+        const body = this.bodyOf(d.body); const ed = body?.edges[d.index]; if (!body || !ed) return;
+        if (!d.created) { this.pushUndo(); const f = addFillet(doc, this.edgeDragKind, body.id, [{ mid: ed.mid, len: ed.len }], r); d.created = f.id; this.selectedFeature = f.id; }
+        else { const f = doc.features.find((x) => x.id === d.created); if (f && (f.type === 'fillet' || f.type === 'chamfer')) f.radius = r; }
+        this.scheduleLive();
+      }
+      this.updateChip(info.x, info.y, `${this.edgeDragKind === 'fillet' ? 'R' : ''}${fmtDim('distance', Math.max(r, 0))} mm`);
+    } else if (d.kind === 'draw' && !d.started) {
+      // Riscar numa face abre um esboço nela e o traço continua como desenho.
+      d.started = true;
+      this.createSketchOnFace(d.body, d.index);
+      this.tool = 'draw';
+      const uv0 = this.uvOf({ x: info.startX, y: info.startY }), uv = this.uvOf(info);
+      if (uv0 && uv) { this.stroke = [uv0, uv]; this.sk.setStroke(this.plane, this.stroke); this.vp.requestRender(); }
+      this.drag = null;
+    }
+  }
+
+  private viewUp(info: PointerInfo, cancelled: boolean): void {
+    const d = this.drag; this.drag = null; this.vp.setGhost(null); this.hideChip();
+    const doc = this.doc.current;
+    if (!d || !info.moved || cancelled) {
+      if (d?.kind === 'edge' && d.created) { this.undo(); }
+      if (!cancelled) this.tapView(info);
+      return;
+    }
+    if (d.kind === 'extrude') {
+      const t = d.depth; if (Math.abs(t) < 0.3) return;
+      const faceBody = d.plane.kind === 'face' && d.plane.body && bodyIds(doc).includes(d.plane.body) ? d.plane.body : null;
+      const op: ExtrudeOp = faceBody ? (t > 0 ? 'add' : 'cut') : 'new';
+      void this.tryFeature(() => addExtrude(doc, d.sketch, Math.abs(t), { op, target: faceBody ?? undefined, flip: t < 0, profilePoint: d.profilePoint }), (f) => {
+        this.selectedFeature = f.id; this.sel3d = emptySel3D(); this.sel3d.body = bodyOfFeature(f); this.vp.setSelection(this.sel3d); this.renderSidePanel();
+        this.showChip(info.x, info.y, `${fmtDim('distance', Math.abs(t))} mm ✎`, () => this.valuePopover(info.x, info.y, Math.abs(t), 'mm', (v) => { void this.tryFeature(() => { (f as ExtrudeFeature).depth = v; return f; }); }));
+      });
+    } else if (d.kind === 'pull') {
+      const t = d.dist; if (Math.abs(t) < 0.3) return;
+      const ref = { center: d.fd.center, normal: d.fd.normal!, area: d.fd.area };
+      void this.tryFeature(() => addPushPull(doc, d.body, ref, t), (f) => {
+        this.selectedFeature = f.id; this.sel3d = emptySel3D(); this.sel3d.body = d.body; this.vp.setSelection(this.sel3d); this.renderSidePanel();
+        this.showChip(info.x, info.y, `${t >= 0 ? '+' : '−'}${fmtDim('distance', Math.abs(t))} mm ✎`, () => this.valuePopover(info.x, info.y, Math.abs(t), 'mm', (v) => { void this.tryFeature(() => { if (f.type === 'pushpull') f.distance = Math.sign(t) * v; return f; }); }));
+      });
+    } else if (d.kind === 'edge') {
+      if (!d.created) { this.tapView(info); return; }
+      if (d.radius < 0.5) { this.undo(); return; }
+      if (this.liveTimer) { clearTimeout(this.liveTimer); this.liveTimer = 0; }
+      this.refreshAll(false);
+      void this.rebuild().then((r) => {
+        const err = r?.errors.find((e) => e.feature === d.created);
+        if (err) { this.undo(); this.toast(`Não deu: ${err.message}.`, 'err'); return; }
+        const f = doc.features.find((x) => x.id === d.created); if (!f || (f.type !== 'fillet' && f.type !== 'chamfer')) return;
+        this.showChip(info.x, info.y, `${f.type === 'fillet' ? 'R' : ''}${fmtDim('distance', f.radius)} mm ✎`, () => this.menu(info.x, info.y, [
+          { label: 'Editar valor…', action: () => this.valuePopover(info.x, info.y, f.radius, 'mm', (v) => { void this.tryFeature(() => { f.radius = v; return f; }); }) },
+          { label: f.type === 'fillet' ? 'Trocar para chanfro' : 'Trocar para filete', action: () => { void this.tryFeature(() => { f.type = f.type === 'fillet' ? 'chamfer' : 'fillet'; f.name = f.name.replace(/^(Filete|Chanfro)/, f.type === 'fillet' ? 'Filete' : 'Chanfro'); return f; }); } },
+          { label: 'Apagar', action: () => this.deleteFeature(f) },
+        ]));
+      });
+    }
+  }
+
+  /** Recalcula com atraso curto durante um arrasto (o kernel coalesce os pedidos). */
+  private scheduleLive(): void {
+    if (this.liveTimer) return;
+    this.liveTimer = window.setTimeout(() => { this.liveTimer = 0; this.refreshAll(false); void this.rebuild(); }, 120);
+  }
+
+  private showChip(x: number, y: number, text: string, onTap?: () => void): void {
+    this.hideChip();
+    const c = el('div', `chip ${onTap ? 'tappable' : ''}`); c.textContent = text;
+    c.style.left = `${Math.min(Math.max(16, x + 18), this.vp.width - 60)}px`; c.style.top = `${Math.max(16, y - 28)}px`;
+    if (onTap) c.addEventListener('pointerdown', (ev) => { ev.stopPropagation(); this.hideChip(); onTap(); });
+    this.overlay.append(c); this.chipEl = c;
+    if (onTap) this.chipTimer = window.setTimeout(() => this.hideChip(), 7000);
+  }
+  private updateChip(x: number, y: number, text: string): void {
+    if (!this.chipEl || this.chipEl.classList.contains('tappable')) this.showChip(x, y, text);
+    else { this.chipEl.textContent = text; this.chipEl.style.left = `${Math.min(Math.max(16, x + 18), this.vp.width - 60)}px`; this.chipEl.style.top = `${Math.max(16, y - 28)}px`; }
+  }
+  private hideChip(): void { if (this.chipTimer) { clearTimeout(this.chipTimer); this.chipTimer = 0; } this.chipEl?.remove(); this.chipEl = null; }
+
   private hover(ev: PointerEvent): void {
-    if (this.mode !== 'view') return;
-    const { x, y } = this.local(ev); const id = this.vp.pickPlane(x, y);
+    if (this.mode !== 'view' || ev.pointerType === 'touch') return;
+    const { x, y } = this.local(ev);
+    let h: Hover = null;
+    if (!this.isAssembly) {
+      const faceHit = this.vp.pickFace(x, y);
+      let regionHit = this.vp.pickRegion(x, y); if (regionHit && faceHit && regionHit.distance > faceHit.distance + 0.5) regionHit = null;
+      const edgeHit = regionHit ? null : this.vp.pickEdge(x, y, ev.pointerType === 'pen' ? 12 : 9, faceHit);
+      if (regionHit) h = { kind: 'region', sketch: regionHit.sketch, index: regionHit.index };
+      else if (edgeHit) h = { kind: 'edge', body: edgeHit.body, index: edgeHit.index };
+      else if (faceHit && faceHit.index >= 0) h = { kind: 'face', body: faceHit.body, index: faceHit.index };
+    }
+    this.vp.setHover(h);
+    const id = h ? null : this.vp.pickPlane(x, y);
     if (id !== this.hoverPlane) { this.hoverPlane = id; this.vp.highlightPlane(id); }
   }
 
@@ -936,7 +1134,7 @@ export class App {
       if (this.selectedInstance || this.sel3d.body) { this.selectedInstance = null; this.clearSel3d(); }
       return;
     }
-    const edgeHit = this.vp.pickEdge(info.x, info.y, info.type === 'touch' ? 14 : 9, faceHit);
+    const edgeHit = this.vp.pickEdge(info.x, info.y, info.type === 'touch' ? 18 : info.type === 'pen' ? 12 : 9, faceHit);
     if (edgeHit) {
       if (this.sel3d.edges.length && this.sel3d.edges[0].body !== edgeHit.body) this.sel3d.edges = [];
       const i = this.sel3d.edges.findIndex((e) => e.body === edgeHit.body && e.index === edgeHit.index);
@@ -951,7 +1149,10 @@ export class App {
     }
     if (faceHit) {
       this.selectedFeature = null;
-      if (faceHit.index < 0) { this.sel3d = { body: faceHit.body, face: null, edges: [] }; }
+      if (faceHit.index < 0) {
+        this.sel3d = { body: faceHit.body, face: null, edges: [] };
+        this.toast(this.kernel.state === 'loading' ? 'O kernel 3D ainda está carregando (50 MB na primeira vez). Faces e arestas ficam disponíveis quando terminar.' : 'Kernel 3D indisponível neste navegador: só a prévia.', 'err');
+      }
       else {
         const same = this.sel3d.face && this.sel3d.face.body === faceHit.body && this.sel3d.face.index === faceHit.index;
         this.sel3d = same ? { body: faceHit.body, face: null, edges: [] } : { body: faceHit.body, face: { body: faceHit.body, index: faceHit.index }, edges: [] };
@@ -977,7 +1178,19 @@ export class App {
     const s = this.sketch; const uv = this.uvOf(info); if (!s || !uv) return;
     const tol = this.tolMm(info.type);
     switch (this.tool) {
-      case 'draw': this.stroke = [uv]; this.sk.setStroke(this.plane, this.stroke); this.vp.requestRender(); break;
+      case 'draw': {
+        // Caneta sobre algo já selecionado: arrasta (ponto, linha inteira, raio ou centro) em vez de desenhar.
+        const hit = this.hitTest(uv, tol, s);
+        if (hit && (this.sel.points.has(hit.id) || this.sel.entities.has(hit.id))) {
+          this.pushUndo();
+          if (hit.kind === 'point') { this.dragPoint = hit.id; break; }
+          const e = M.getEntity(s, hit.id);
+          if (e.type === 'line') { const a = M.getPoint(s, e.a), b = M.getPoint(s, e.b); this.sketchDrag = { kind: 'line', id: e.id, a: e.a, b: e.b, a0: v2(a.x, a.y), b0: v2(b.x, b.y), start: uv }; }
+          else { const c = M.getPoint(s, e.center); if (Math.abs(dist(uv, c) - e.r) < tol && dist(uv, c) > tol) this.sketchDrag = { kind: 'radius', id: e.id, center: e.center }; else this.sketchDrag = { kind: 'move', points: M.entityPoints(e).map((pid) => { const q = M.getPoint(s, pid); return { id: pid, x0: q.x, y0: q.y }; }), start: uv }; }
+          break;
+        }
+        this.stroke = [uv]; this.sk.setStroke(this.plane, this.stroke); this.vp.requestRender(); break;
+      }
       case 'line': case 'rect': case 'circle': {
         this.pushUndo(); this.previewSketchBackup = M.cloneSketch(s);
         this.toolStart = { uv }; break;
@@ -994,7 +1207,19 @@ export class App {
   private toolMove(info: PointerInfo, _ev: PointerEvent): void {
     const s = this.sketch; const uv = this.uvOf(info); if (!s || !uv) return;
     switch (this.tool) {
-      case 'draw': if (this.stroke.length) { this.stroke.push(uv); this.sk.setStroke(this.plane, this.stroke); this.vp.requestRender(); } break;
+      case 'draw': {
+        if (this.dragPoint) { if (info.moved) { this.solve({ drag: { point: this.dragPoint, x: uv.x, y: uv.y } }); this.refreshSketch(); this.renderStatus(); } break; }
+        const sd = this.sketchDrag;
+        if (sd) {
+          if (!info.moved) break;
+          if (sd.kind === 'line') { const du = uv.x - sd.start.x, dv = uv.y - sd.start.y; this.solve({ drags: [{ point: sd.a, x: sd.a0.x + du, y: sd.a0.y + dv }, { point: sd.b, x: sd.b0.x + du, y: sd.b0.y + dv }] }); }
+          else if (sd.kind === 'radius') { const c = M.getPoint(s, sd.center); this.solve({ dragRadius: { entity: sd.id, r: dist(uv, c) } }); }
+          else { const du = uv.x - sd.start.x, dv = uv.y - sd.start.y; this.solve({ drags: sd.points.map((q) => ({ point: q.id, x: q.x0 + du, y: q.y0 + dv })) }); }
+          this.refreshSketch(); this.renderStatus(); break;
+        }
+        if (this.stroke.length) { this.stroke.push(uv); this.sk.setStroke(this.plane, this.stroke); this.vp.requestRender(); }
+        break;
+      }
       case 'line': case 'rect': case 'circle': {
         if (!this.toolStart || !this.previewSketchBackup) return;
         Object.assign(s, M.cloneSketch(this.previewSketchBackup));
@@ -1014,8 +1239,25 @@ export class App {
     const tol = this.tolMm(info.type);
     switch (this.tool) {
       case 'draw': {
+        if (this.dragPoint || this.sketchDrag) {
+          if (!info.moved) this.undoStack.pop();
+          this.dragPoint = null; this.sketchDrag = null; this.solve(); this.refreshAll(false); return;
+        }
         const pts = this.stroke; this.stroke = []; this.sk.setStroke(null, []);
-        if (cancelled || pts.length < 2) { this.vp.requestRender(); return; }
+        if (cancelled) { this.vp.requestRender(); return; }
+        if (!info.moved || pts.length < 2) {
+          // Toque: seleciona o que estiver embaixo e mostra a medida para editar; em vazio, limpa.
+          const hit = this.hitTest(uv, tol, s);
+          if (!hit) { this.sel = emptySelection(); this.refreshAll(false); return; }
+          this.sel = emptySelection(); if (hit.kind === 'point') this.sel.points.add(hit.id); else this.sel.entities.add(hit.id);
+          this.refreshAll(false);
+          const e = hit.kind === 'entity' ? M.findEntity(s, hit.id) : undefined;
+          if (e) {
+            const txt = e.type === 'line' ? `${fmtDim('distance', dist(M.getPoint(s, e.a), M.getPoint(s, e.b)))} mm` : e.type === 'circle' ? `⌀${fmtDim('distance', e.r * 2)}` : `R${fmtDim('distance', e.r)}`;
+            this.showChip(info.x, info.y, `${txt} ✎`, () => this.createDimension([e.id], uv));
+          }
+          return;
+        }
         const prims = recognizeStroke(pts, { tol: Math.max(tol * 0.45, this.vp.mmPerPixel() * 3.5), minRadius: tol });
         if (!prims.length) { this.toast('Traço curto demais.'); this.vp.requestRender(); return; }
         this.insertPrimitives(prims, tol);
@@ -1687,12 +1929,12 @@ function toRenderBody(b: BodyData): RenderBody {
 }
 function bodyOfFeature(f: Feature): Id | null {
   if (f.type === 'extrude' || f.type === 'revolve') return f.op === 'new' ? f.id : f.target ?? null;
-  if (f.type === 'boolean') return f.body;
   return f.body;
 }
 function featureMini(f: Feature): string {
   if (f.type === 'extrude') return `${f.op === 'cut' ? 'corte ' : f.op === 'add' ? 'adição ' : ''}${f.throughAll ? '∞' : `${fmtDim('distance', f.depth)} mm`}`;
   if (f.type === 'revolve') return `${f.op === 'cut' ? 'corte ' : f.op === 'add' ? 'adição ' : ''}${fmtDim('angle', f.angle)}`;
+  if (f.type === 'pushpull') return `${f.distance >= 0 ? '+' : '−'}${fmtDim('distance', Math.abs(f.distance))} mm`;
   if (f.type === 'fillet') return `R${fmtDim('distance', f.radius)} · ${f.edges.length}`;
   if (f.type === 'chamfer') return `${fmtDim('distance', f.radius)} mm · ${f.edges.length}`;
   if (f.type === 'boolean') return f.op === 'union' ? 'união' : f.op === 'subtract' ? 'subtração' : 'interseção';

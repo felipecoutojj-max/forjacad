@@ -3,7 +3,7 @@ import { describe, it, expect, beforeAll } from 'vitest';
 import initOpenCascade from 'opencascade.js/dist/node.js';
 import type { OpenCascadeInstance } from 'opencascade.js';
 import { rebuildDocument, tessellate, exportSTEP, projectViews, assemblyShapes, interferences } from './build';
-import { createDocument, addExtrude, addRevolve, addFillet, addBoolean, type ForjaDocument } from '../../document';
+import { createDocument, addExtrude, addRevolve, addFillet, addBoolean, addPushPull, type ForjaDocument } from '../../document';
 import * as M from '../../sketch/model';
 
 let oc: OpenCascadeInstance;
@@ -188,6 +188,31 @@ describe('kernel OpenCASCADE', () => {
       [{ part: 'p', matrix: I }, { part: 'p', matrix: shift(40) }],   // passo 2: 10 mm dentro
     ], cache);
     expect(hits).toHaveLength(1); expect(hits[0]).toMatchObject({ step: 2, a: 0, b: 1 }); expect(hits[0].volume).toBeCloseTo(10 * 50 * 50, 0);
+  });
+
+  it('extrusão por região: só o perfil que contém o ponto', () => {
+    const doc = createDocument(); const s = rectSketch(doc, 'plane-xy', 0, 0, 30, 30);
+    const p1 = M.addPoint(s, 50, 0), p2 = M.addPoint(s, 70, 0), p3 = M.addPoint(s, 70, 20), p4 = M.addPoint(s, 50, 20);
+    M.addLine(s, p1.id, p2.id); M.addLine(s, p2.id, p3.id); M.addLine(s, p3.id, p4.id); M.addLine(s, p4.id, p1.id);
+    const f = addExtrude(doc, s.id, 10); f.profilePoint = [60, 10];
+    const r = rebuildDocument(oc, doc); expect(r.errors).toEqual([]);
+    expect(tessellate(oc, r.bodies[0], 'c').volume).toBeCloseTo(20 * 20 * 10, 0);
+    f.profilePoint = [15, 15]; expect(tessellate(oc, rebuildDocument(oc, doc).bodies[0], 'c').volume).toBeCloseTo(30 * 30 * 10, 0);
+    f.profilePoint = [40, 40]; expect(rebuildDocument(oc, doc).errors[0].message).toMatch(/região/);
+  });
+
+  it('puxar e empurrar face plana', () => {
+    const doc = createDocument(); const body = addExtrude(doc, rectSketch(doc, 'plane-xy', 0, 0, 100, 60).id, 20);
+    const top = { center: [50, 30, 20] as [number, number, number], normal: [0, 0, 1] as [number, number, number], area: 6000 };
+    const pull = addPushPull(doc, body.id, top, 10);
+    let r = rebuildDocument(oc, doc); expect(r.errors).toEqual([]);
+    expect(tessellate(oc, r.bodies[0], 'c').volume).toBeCloseTo(100 * 60 * 30, 0);
+    pull.distance = -5;
+    r = rebuildDocument(oc, doc); expect(r.errors).toEqual([]);
+    expect(tessellate(oc, r.bodies[0], 'c').volume).toBeCloseTo(100 * 60 * 15, 0);
+    // Face que não existe: erro de feature, corpo preservado.
+    pull.face = { center: [50, 30, 99], normal: [0, 0, 1], area: 6000 };
+    r = rebuildDocument(oc, doc); expect(r.errors).toHaveLength(1); expect(r.bodies).toHaveLength(1);
   });
 
   it('exporta STEP com os corpos', () => {

@@ -12,14 +12,25 @@ export const emptySelection = (): Selection => ({ points: new Set(), entities: n
 
 export interface LabelDesc { id: Id; kind: 'dimension' | 'tag'; u: number; v: number; text: string; selected?: boolean; }
 
-const C_LINE = new THREE.Color(0xe6e9ef), C_SEL = new THREE.Color(0x4aa3ff), C_CONSTR = new THREE.Color(0x6f7a8c), C_POINT = new THREE.Color(0xf28c28), C_DIM = new THREE.Color(0x9aa4b5), C_STROKE = new THREE.Color(0xffb15c), C_INACTIVE = new THREE.Color(0x7d8aa3);
+/** Cores do esboço por tema: grafite sobre fundo claro, marfim sobre escuro; laranja de aço marca seleção e pontos. */
+const PALETTES = {
+  light: { line: 0x2c2c2e, sel: 0xf0542b, constr: 0x9a8fd0, point: 0xf0542b, dim: 0x6e6e73, stroke: 0xe9a825, inactive: 0x9a9aa0 },
+  dark: { line: 0xf2f2f7, sel: 0xff6a3d, constr: 0x9d8ce0, point: 0xff6a3d, dim: 0xa1a1a6, stroke: 0xf2b640, inactive: 0x7e7e85 },
+};
+let C_LINE = new THREE.Color(PALETTES.light.line), C_SEL = new THREE.Color(PALETTES.light.sel), C_CONSTR = new THREE.Color(PALETTES.light.constr), C_POINT = new THREE.Color(PALETTES.light.point), C_DIM = new THREE.Color(PALETTES.light.dim), C_STROKE = new THREE.Color(PALETTES.light.stroke), C_INACTIVE = new THREE.Color(PALETTES.light.inactive);
+export function setSketchTheme(name: keyof typeof PALETTES): void {
+  const p = PALETTES[name];
+  C_LINE = new THREE.Color(p.line); C_SEL = new THREE.Color(p.sel); C_CONSTR = new THREE.Color(p.constr); C_POINT = new THREE.Color(p.point); C_DIM = new THREE.Color(p.dim); C_STROKE = new THREE.Color(p.stroke); C_INACTIVE = new THREE.Color(p.inactive);
+}
 
 export class SketchRenderer {
   readonly group = new THREE.Group();
   private lines = new THREE.LineSegments(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({ vertexColors: true }));
   private dims = new THREE.LineSegments(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({ color: C_DIM, transparent: true, opacity: 0.9 }));
+  private dimsMat = this.dims.material as THREE.LineBasicMaterial;
   private points = new THREE.Points(new THREE.BufferGeometry(), new THREE.PointsMaterial({ size: 9, sizeAttenuation: false, vertexColors: true }));
-  private stroke = new THREE.Line(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({ color: C_STROKE }));
+  private stroke = new THREE.Line(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({ color: C_STROKE, linewidth: 2 }));
+  private strokeMat = this.stroke.material as THREE.LineBasicMaterial;
   labels: LabelDesc[] = [];
 
   constructor() { this.group.add(this.lines, this.dims, this.points, this.stroke); this.group.renderOrder = 10; }
@@ -38,6 +49,7 @@ export class SketchRenderer {
   update(s: Sketch, plane: Plane, sel: Selection, active: boolean, mmPerPx: number): void {
     // O esboço ativo fica sempre visível, mesmo sobre a face de um corpo (sem teste de profundidade).
     for (const o of [this.lines, this.dims, this.points, this.stroke]) { const m = o.material as THREE.Material; if (m.depthTest !== !active) { m.depthTest = !active; m.needsUpdate = true; } }
+    this.dimsMat.color.copy(C_DIM); this.strokeMat.color.copy(C_STROKE);
     const pos: number[] = []; const col: number[] = [];
     const push = (a: Vec2, b: Vec2, c: THREE.Color) => { pos.push(...planeToWorld(plane, a.x, a.y, 0.05), ...planeToWorld(plane, b.x, b.y, 0.05)); col.push(c.r, c.g, c.b, c.r, c.g, c.b); };
     for (const e of s.entities) {

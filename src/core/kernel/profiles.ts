@@ -116,6 +116,27 @@ export function loopArcAngles(s: Sketch, ed: LoopEdge): { a0: number; a1: number
   return ed.reversed ? { a0: end, a1: start, sweep: -sweep } : { a0: start, a1: end, sweep };
 }
 
+/** Polilinha amostrada de um laço (coordenadas do plano). */
+export function sampleLoop(s: Sketch, loop: Loop): Vec2[] {
+  if (loop.kind === 'circle') { const e = loop.entity; if (e.type !== 'circle') return []; const c = getPoint(s, e.center); return sampleCircle({ x: c.x, y: c.y }, e.r); }
+  return samplePath(s, loop.edges);
+}
+/** O ponto (u, v) está dentro do perfil (no contorno e fora dos furos)? */
+export function profileContainsPoint(s: Sketch, prof: Profile, pt: Vec2): boolean {
+  if (!pointInPoly(pt, sampleLoop(s, prof.outer))) return false;
+  for (const h of prof.holes) if (pointInPoly(pt, sampleLoop(s, h))) return false;
+  return true;
+}
+/** Um ponto garantidamente dentro do perfil (média de vértices, corrigida se cair num furo ou fora). */
+export function profileInnerPoint(s: Sketch, prof: Profile): Vec2 {
+  const poly = sampleLoop(s, prof.outer);
+  let cx = 0, cy = 0; for (const p of poly) { cx += p.x; cy += p.y; } cx /= poly.length || 1; cy /= poly.length || 1;
+  if (profileContainsPoint(s, prof, { x: cx, y: cy })) return { x: cx, y: cy };
+  // Varre segmentos entre o centroide e os vértices até achar um ponto interno.
+  for (const v of poly) for (const t of [0.5, 0.25, 0.75, 0.1, 0.9]) { const q = { x: cx + (v.x - cx) * t, y: cy + (v.y - cy) * t }; if (profileContainsPoint(s, prof, q)) return q; }
+  return { x: cx, y: cy };
+}
+
 function sampleCircle(c: Vec2, r: number, n = 64): Vec2[] {
   const out: Vec2[] = []; for (let i = 0; i < n; i++) { const t = (i / n) * TAU; out.push({ x: c.x + r * Math.cos(t), y: c.y + r * Math.sin(t) }); } return out;
 }

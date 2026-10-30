@@ -3,11 +3,11 @@
 // Não importa three.js nem DOM: roda no worker e nos testes em Node.
 
 import type { OpenCascadeInstance, TopoDS_Shape, TopoDS_Face, TopoDS_Edge, TopoDS_Wire, BRepAdaptor_Curve } from 'opencascade.js';
-import type { ForjaDocument, FilletFeature, EdgeRef, V3, Plane, SketchAxis } from '../../document';
+import type { ForjaDocument, FilletFeature, EdgeRef, FaceRef, V3, Plane, SketchAxis } from '../../document';
 import { getSketch, getPlane, planeNormal, planeToWorld } from '../../document';
 import type { Sketch, Id } from '../../sketch/model';
 import { getPoint, findEntity } from '../../sketch/model';
-import { extractProfiles, loopArcAngles, type Loop, type Profile } from '../profiles';
+import { extractProfiles, loopArcAngles, profileContainsPoint, type Loop, type Profile } from '../profiles';
 import type { BodyData, FaceData, EdgeData, FeatureError, FaceType, ViewSpec, ProjectedView, ProjCircle, InterferenceHit } from './types';
 
 type OC = OpenCascadeInstance;
@@ -76,10 +76,11 @@ function profileToFace(oc: OC, s: Sketch, plane: Plane, prof: Profile): TopoDS_F
 }
 
 /** Faces planas (uma por perfil fechado) de um esboço, no espaço 3D. */
-export function sketchFaces(oc: OC, doc: ForjaDocument, sketchId: Id): { faces: TopoDS_Face[]; plane: Plane } {
+export function sketchFaces(oc: OC, doc: ForjaDocument, sketchId: Id, profilePoint?: [number, number]): { faces: TopoDS_Face[]; plane: Plane } {
   const sk = getSketch(doc, sketchId); const plane = getPlane(doc, sk.plane);
-  const profiles = extractProfiles(sk);
+  let profiles = extractProfiles(sk);
   if (!profiles.length) throw new Error('o esboço não tem contorno fechado');
+  if (profilePoint) { const pt = { x: profilePoint[0], y: profilePoint[1] }; profiles = profiles.filter((p) => profileContainsPoint(sk, p, pt)); if (!profiles.length) throw new Error('a região escolhida não existe mais no esboço'); }
   return { faces: profiles.map((p) => profileToFace(oc, sk, plane, p)), plane };
 }
 
@@ -219,6 +220,51 @@ export function applyFillet(oc: OC, f: FilletFeature, shape: TopoDS_Shape): Topo
   return result;
 }
 
+interface FaceInfo { face: TopoDS_Face; center: V3; normal: V3; area: number; }
+
+/** Faces planas de uma forma com centro, normal para fora e área. */
+export function planarFaces(oc: OC, shape: TopoDS_Shape): FaceInfo[] {
+  const out: FaceInfo[] = [];
+  const fmap = new oc.TopTools_IndexedMapOfShape_1(); oc.TopExp.MapShapes_1(shape, oc.TopAbs_ShapeEnum.TopAbs_FACE as never, fmap);
+  const REVERSED = enumVal(oc.TopAbs_Orientation.TopAbs_REVERSED); const PLANE = enumVal(oc.GeomAbs_SurfaceType.GeomAbs_Plane);
+  for (let i = 1; i <= fmap.Size(); i++) {
+    const face = oc.TopoDS.Face_1(fmap.FindKey(i));
+    const surf = new oc.BRepAdaptor_Surface_2(face, true);
+    if (enumVal(surf.GetType()) !== PLANE) { surf.delete(); continue; }
+    const sgn = enumVal(face.Orientation_1()) === REVERSED ? -1 : 1;
+    const pln = surf.Plane(); const n = pln.Axis().Direction();
+    const props = new oc.GProp_GProps_1(); oc.BRepGProp.SurfaceProperties_1(face, props, false, false); const c = props.CentreOfMass();
+    out.push({ face, center: [c.X(), c.Y(), c.Z()], normal: [sgn * n.X(), sgn * n.Y(), sgn * n.Z()], area: props.Mass() });
+    c.delete(); props.delete(); n.delete(); pln.delete(); surf.delete();
+  }
+  fmap.delete();
+  return out;
+}
+
+/** Acha a face plana que corresponde a uma referência (centro, normal, área). */
+export function matchFace(faces: FaceInfo[], ref: FaceRef): FaceInfo | null {
+  let best: FaceInfo | null = null; let bd = Infinity;
+  const tol = Math.max(0.5, Math.sqrt(ref.area) * 0.05);
+  for (const f of faces) {
+    if (f.normal[0] * ref.normal[0] + f.normal[1] * ref.normal[1] + f.normal[2] * ref.normal[2] < 0.95) continue;
+    if (Math.abs(f.area - ref.area) > Math.max(1, ref.area * 0.25)) continue;
+    const d = dist3(f.center, ref.center);
+    if (d < tol && d < bd) { bd = d; best = f; }
+  }
+  return best;
+}
+
+/** Puxa (distância > 0, funde) ou empurra (< 0, corta) uma face plana do corpo. */
+export function pushPull(oc: OC, shape: TopoDS_Shape, ref: FaceRef, distance: number): TopoDS_Shape {
+  if (!(Math.abs(distance) > 1e-6)) throw new Error('distância nula');
+  const faces = planarFaces(oc, shape);
+  const f = matchFace(faces, ref); if (!f) throw new Error('face não encontrada (a geometria mudou)');
+  const n = f.normal; const d = distance;
+  const prism = new oc.BRepPrimAPI_MakePrism_1(f.face, new oc.gp_Vec_4(n[0] * d, n[1] * d, n[2] * d), false, true).Shape();
+  if (!hasSolid(oc, prism)) throw new Error('não deu para puxar essa face');
+  return boolOp(oc, d > 0 ? 'fuse' : 'cut', shape, prism);
+}
+
 /** Recalcula todos os corpos do documento, feature por feature. Erros não param o resto. */
 export function rebuildDocument(oc: OC, doc: ForjaDocument): RebuildShapes {
   const bodies = new Map<Id, TopoDS_Shape>(); const order: Id[] = []; const errors: FeatureError[] = [];
@@ -226,7 +272,7 @@ export function rebuildDocument(oc: OC, doc: ForjaDocument): RebuildShapes {
     try {
       if (f.type === 'extrude' || f.type === 'revolve') {
         if (f.visible === false) continue;
-        const { faces, plane } = sketchFaces(oc, doc, f.sketch);
+        const { faces, plane } = sketchFaces(oc, doc, f.sketch, f.type === 'extrude' ? f.profilePoint : undefined);
         const target = f.op !== 'new' && f.target ? bodies.get(f.target) : undefined;
         if (f.op !== 'new' && !target) throw new Error('o corpo alvo não existe mais');
         let tool: TopoDS_Shape;
@@ -243,6 +289,9 @@ export function rebuildDocument(oc: OC, doc: ForjaDocument): RebuildShapes {
         }
         if (f.op === 'new') { bodies.set(f.id, tool); order.push(f.id); }
         else bodies.set(f.target!, boolOp(oc, f.op === 'add' ? 'fuse' : 'cut', target!, tool));
+      } else if (f.type === 'pushpull') {
+        const shape = bodies.get(f.body); if (!shape) throw new Error('o corpo não existe mais');
+        bodies.set(f.body, pushPull(oc, shape, f.face, f.distance));
       } else if (f.type === 'fillet' || f.type === 'chamfer') {
         const shape = bodies.get(f.body); if (!shape) throw new Error('o corpo não existe mais');
         bodies.set(f.body, applyFillet(oc, f, shape));
@@ -311,7 +360,8 @@ export function tessellate(oc: OC, body: BuiltBody, name: string, quality = 1): 
       fd.axisOrigin = [o.X(), o.Y(), o.Z()]; fd.axisDir = [dn.X(), dn.Y(), dn.Z()]; fd.radius = cyl.Radius();
       o.delete(); dn.delete(); ax.delete(); cyl.delete();
     }
-    const props = new oc.GProp_GProps_1(); oc.BRepGProp.SurfaceProperties_1(face, props, false, false); fd.area = props.Mass(); props.delete();
+    const props = new oc.GProp_GProps_1(); oc.BRepGProp.SurfaceProperties_1(face, props, false, false); fd.area = props.Mass();
+    const cm = props.CentreOfMass(); if (Number.isFinite(cm.X())) fd.center = [cm.X(), cm.Y(), cm.Z()]; cm.delete(); props.delete();
     surf.delete(); trsf.delete(); loc.delete();
     faces.push(fd);
   }
