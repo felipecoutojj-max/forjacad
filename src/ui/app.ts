@@ -88,6 +88,8 @@ export class App {
   private anim = { open: false, playing: false, t: 0, raf: 0, lastTs: 0, recorder: null as MediaRecorder | null, hits: [] as InterferenceHit[], hitSteps: 1, checking: false };
   private timeline!: HTMLElement;
   private doneFab!: HTMLButtonElement;
+  /** Paleta de ferramentas: horizontal no topo (padrão) ou vertical à esquerda; muda arrastando pela alça. */
+  toolbarHorizontal = true;
   private busy = 0;
   private pointers = new Map<number, PointerInfo>();
   private pinch: { d0: number; mid: { x: number; y: number } } | null = null;
@@ -104,6 +106,8 @@ export class App {
   private liveTimer = 0;
   private chipEl: HTMLElement | null = null; private chipTimer = 0;
   private polygonSides = 6;
+  /** Modo construção: tudo que for desenhado vira linha de referência tracejada. */
+  constructionMode = false;
   private measure: { on: boolean; first: { kind: 'face' | 'edge'; body: Id; index: number } | null } = { on: false, first: null };
   private section: { on: boolean; origin: V3; normal: V3; offset: number } = { on: false, origin: [0, 0, 0], normal: [0, -1, 0], offset: 0 };
   private mirrorPending = false;
@@ -140,6 +144,31 @@ export class App {
     window.addEventListener('beforeunload', () => this.autosave());
   }
 
+  // ---------- Paleta de ferramentas ----------
+  private loadToolbarLayout(): boolean { try { return localStorage.getItem('forjacad.toolbar') !== 'vertical'; } catch { return true; } }
+  private applyToolbarLayout(): void {
+    this.toolbar.classList.toggle('horizontal', this.toolbarHorizontal);
+    try { localStorage.setItem('forjacad.toolbar', this.toolbarHorizontal ? 'horizontal' : 'vertical'); } catch { /* ignore */ }
+  }
+  /** Alça da paleta: arrastar para a faixa de cima deixa horizontal; para o lado, vertical. */
+  private toolbarGrip(): HTMLElement {
+    const grip = el('div', 'grip'); grip.title = 'Arraste para mudar a posição da paleta';
+    grip.addEventListener('pointerdown', (ev) => {
+      ev.preventDefault(); ev.stopPropagation(); grip.setPointerCapture(ev.pointerId);
+      const start = { x: ev.clientX, y: ev.clientY }; const r0 = this.toolbar.getBoundingClientRect(); const ws = this.workspace.getBoundingClientRect();
+      this.toolbar.classList.add('dragging');
+      const move = (e: PointerEvent) => { this.toolbar.style.left = `${r0.left - ws.left + e.clientX - start.x}px`; this.toolbar.style.top = `${r0.top - ws.top + e.clientY - start.y}px`; this.toolbar.style.transform = 'none'; };
+      const up = (e: PointerEvent) => {
+        grip.removeEventListener('pointermove', move); grip.removeEventListener('pointerup', up); grip.removeEventListener('pointercancel', up);
+        this.toolbar.classList.remove('dragging'); this.toolbar.style.left = ''; this.toolbar.style.top = ''; this.toolbar.style.transform = '';
+        const yRel = e.clientY - ws.top; const moved = Math.hypot(e.clientX - start.x, e.clientY - start.y) > 12;
+        if (moved) { this.toolbarHorizontal = yRel < 140; this.applyToolbarLayout(); this.toast(this.toolbarHorizontal ? 'Paleta no topo.' : 'Paleta na lateral.'); }
+      };
+      grip.addEventListener('pointermove', move); grip.addEventListener('pointerup', up); grip.addEventListener('pointercancel', up);
+    });
+    return grip;
+  }
+
   // ---------- Aparência ----------
   private loadTheme(): 'light' | 'dark' { try { return localStorage.getItem('forjacad.theme') === 'dark' ? 'dark' : 'light'; } catch { return 'light'; } }
   /** Tema claro por padrão (oficina à luz do dia); o escuro é escolha explícita e fica gravado. */
@@ -169,6 +198,7 @@ export class App {
     this.overlay = el('div', 'overlay'); this.workspace.append(this.overlay);
     this.labelsEl = el('div', 'overlay'); this.overlay.append(this.labelsEl);
     this.toolbar = el('div', 'toolbar'); this.toolbar.style.pointerEvents = 'auto'; this.overlay.append(this.toolbar);
+    this.toolbarHorizontal = this.loadToolbarLayout(); this.applyToolbarLayout();
     this.sidepanel = el('div', 'sidepanel'); this.sidepanel.style.pointerEvents = 'auto'; this.overlay.append(this.sidepanel);
     this.toasts = el('div', 'toasts'); this.overlay.append(this.toasts);
     this.timeline = el('div', 'timeline'); this.timeline.style.display = 'none'; this.overlay.append(this.timeline);
@@ -549,11 +579,12 @@ export class App {
   }
 
   private renderToolbar(): void {
-    this.toolbar.innerHTML = '';
+    this.toolbar.innerHTML = ''; this.toolbar.append(this.toolbarGrip());
     const g1 = el('div', 'group'); const g2 = el('div', 'group'); const g3 = el('div', 'group');
     if (this.mode === 'sketch') {
       const tools: [Tool, IconName, string][] = [['select', 'select', 'Selecionar'], ['draw', 'draw', 'Caneta'], ['line', 'line', 'Linha'], ['rect', 'rect', 'Retângulo'], ['circle', 'circle', 'Círculo'], ['polygon', 'polygon', 'Polígono'], ['slot', 'slot', 'Rasgo'], ['dimension', 'dimension', 'Cota'], ['erase', 'erase', 'Apagar']];
       for (const [t, ic, label] of tools) { const b = this.iconButton(ic, label, () => { if (t === 'polygon' && this.tool !== 'polygon') this.valuePopover(this.vp.width / 2, 80, this.polygonSides, 'lados', (v) => { this.polygonSides = Math.max(3, Math.min(24, Math.round(v))); this.setTool('polygon'); }); else this.setTool(t); }); if (this.tool === t) b.classList.add('active'); g1.append(b); }
+      const cons = this.iconButton('construction', 'Construção', () => { this.constructionMode = !this.constructionMode; this.renderToolbar(); this.toast(this.constructionMode ? 'Construção ligada: o que você riscar vira linha de referência tracejada (serve para centralizar e encaixar).' : 'Construção desligada.'); }); if (this.constructionMode) cons.classList.add('active'); g1.append(cons);
       const touch = this.iconButton('touch', 'Dedo desenha', () => { this.touchDraws = !this.touchDraws; this.renderToolbar(); }); if (this.touchDraws) touch.classList.add('active'); g2.append(touch);
       const persp = this.iconButton('view', this.vp.sketchPerspective ? 'Vista reta' : 'Vista 3D', () => { this.vp.setSketchPerspective(!this.vp.sketchPerspective); this.refreshSketch(); this.renderToolbar(); if (!this.vp.sketchPerspective) this.vp.fitAll(); }); if (this.vp.sketchPerspective) persp.classList.add('active'); g2.append(persp);
       g2.append(this.iconButton('fit', 'Enquadrar', () => this.vp.fitAll()));
@@ -1021,6 +1052,7 @@ export class App {
         }
       }
     }
+    if (this.constructionMode) for (const e of created) e.construction = true;
     let r = this.solve();
     if (!r || !r.converged) {
       s.constraints = s.constraints.filter((k) => !autoCons.includes(k.id));
@@ -1482,10 +1514,7 @@ export class App {
           this.sel = emptySelection(); if (hit.kind === 'point') this.sel.points.add(hit.id); else this.sel.entities.add(hit.id);
           this.refreshAll(false);
           const e = hit.kind === 'entity' ? M.findEntity(s, hit.id) : undefined;
-          if (e) {
-            const txt = e.type === 'line' ? `${fmtDim('distance', dist(M.getPoint(s, e.a), M.getPoint(s, e.b)))} mm` : e.type === 'circle' ? `⌀${fmtDim('distance', e.r * 2)}` : `R${fmtDim('distance', e.r)}`;
-            this.showChip(info.x, info.y, `${txt} ✎`, () => this.createDimension([e.id], uv));
-          }
+          if (e) this.quickDimension(e, uv);
           return;
         }
         const prims = recognizeStroke(pts, { tol: Math.max(tol * 0.45, this.vp.mmPerPixel() * 3.5), minRadius: tol });
@@ -1519,6 +1548,44 @@ export class App {
   /** Cria linha, retângulo ou círculo entre dois pontos de tela (prévia e definitivo). */
   private buildShape(s: Sketch, a: Vec2, b: Vec2, tol: number, preview: boolean): void {
     const snapOrAdd = (p: Vec2, exclude: Set<Id>) => preview ? M.addPoint(s, p.x, p.y).id : this.snapPoint(s, p, tol, exclude).id;
+    const before = s.entities.length;
+    this.buildShapeInner(s, a, b, tol, preview, snapOrAdd);
+    if (preview) return;
+    if (this.constructionMode) for (const e of s.entities.slice(before)) e.construction = true;
+    else this.autoDimensions(s, s.entities.slice(before));
+  }
+
+  /** Valor "redondo" para a cota automática: meio milímetro acima de 10 mm, décimo abaixo. */
+  private static niceMm(v: number): number { return v >= 10 ? Math.round(v * 2) / 2 : Math.round(v * 10) / 10; }
+
+  /** Cotas automáticas das formas prontas (retângulo, círculo, rasgo, polígono), para digitar os milímetros em seguida. */
+  private autoDimensions(s: Sketch, created: Entity[]): void {
+    const added: Id[] = [];
+    const nice = App.niceMm;
+    const dimOf = (kind: DimensionKind, refs: Id[], value: number, offset: Vec2) => { added.push(M.addDimension(s, kind, refs, nice(value), offset).id); };
+    if (this.tool === 'rect') {
+      const lines = created.filter((e): e is M.LineEntity => e.type === 'line'); if (lines.length !== 4) return;
+      const [l1, l2] = lines; const a = M.getPoint(s, l1.a), b = M.getPoint(s, l1.b), c = M.getPoint(s, l2.b);
+      dimOf('hdistance', [l1.id], Math.abs(b.x - a.x), v2(0, a.y < c.y ? -8 : 8)); dimOf('vdistance', [l2.id], Math.abs(c.y - b.y), v2(b.x > a.x ? 8 : -8, 0));
+    } else if (this.tool === 'circle') {
+      const c = created.find((e): e is M.CircleEntity => e.type === 'circle'); if (!c) return; dimOf('diameter', [c.id], c.r * 2, v2(0.7, 0.7));
+    } else if (this.tool === 'slot') {
+      const arcs = created.filter((e): e is M.ArcEntity => e.type === 'arc'); if (arcs.length !== 2) return;
+      const ca = M.getPoint(s, arcs[0].center), cb = M.getPoint(s, arcs[1].center);
+      const d = norm(sub(cb, ca)); const n = perp(d);
+      dimOf('distance', [arcs[0].center, arcs[1].center], dist(ca, cb), scale(n, -(arcs[0].r + 8)));
+      dimOf('diameter', [arcs[0].id], arcs[0].r * 2, v2(-d.x, -d.y));
+    } else if (this.tool === 'polygon') {
+      const c = created.find((e): e is M.CircleEntity => e.type === 'circle' && !!e.construction) ?? s.entities.find((e): e is M.CircleEntity => e.type === 'circle' && !!e.construction && s.constraints.some((k) => k.kind === 'pointOnCircle' && k.refs[1] === e.id));
+      if (c) dimOf('diameter', [c.id], c.r * 2, v2(0.7, 0.7));
+    }
+    if (!added.length) return;
+    const r = this.solve();
+    if (!r?.converged) { for (const id of added) M.removeDimension(s, id); this.solve(); }
+  }
+
+  private buildShapeInner(s: Sketch, a: Vec2, b: Vec2, tol: number, preview: boolean, snapOrAdd: (p: Vec2, exclude: Set<Id>) => Id): void {
+    void tol;
     if (this.tool === 'line') {
       if (dist(a, b) < tol * 0.5) return;
       const pa = snapOrAdd(a, new Set()); const pb = snapOrAdd(b, new Set([pa]));
@@ -1556,7 +1623,6 @@ export class App {
       const arcB = M.addArc(s, cb.id, p3.id, p2.id, r), arcA = M.addArc(s, ca.id, p1.id, p4.id, r);
       if (!preview) {
         for (const [l, arc] of [[l1, arcA], [l1, arcB], [l2, arcA], [l2, arcB]] as const) M.addConstraint(s, 'tangent', [l.id, arc.id]);
-        M.addConstraint(s, 'equal', [arcA.id, arcB.id]);
         const ang = Math.abs(((angleOf(d) * 180) / Math.PI) % 180); const dev = Math.min(ang, 180 - ang);
         if (dev < H_V_SNAP_DEG) { M.addConstraint(s, 'horizontal', [l1.id]); M.addConstraint(s, 'horizontal', [l2.id]); } else if (Math.abs(dev - 90) < H_V_SNAP_DEG) { M.addConstraint(s, 'vertical', [l1.id]); M.addConstraint(s, 'vertical', [l2.id]); }
       }
@@ -1619,6 +1685,14 @@ export class App {
       if (!r?.converged) { M.removeDimension(s, d.id); this.solve(); this.toast('Essa cota conflita com as restrições existentes.', 'err'); }
       this.sel = emptySelection(); this.refreshAll(false);
     });
+  }
+
+  /** Cota dinâmica: toque numa entidade abre direto o valor para digitar (edita a cota existente ou cria uma). */
+  private quickDimension(e: Entity, at: Vec2): void {
+    const s = this.sketch; if (!s) return;
+    const existing = s.dimensions.find((d) => d.refs.length === 1 && d.refs[0] === e.id) ?? s.dimensions.find((d) => e.type === 'line' && d.refs.length === 2 && d.refs.includes(e.a) && d.refs.includes(e.b));
+    if (existing) { this.editDimension(existing.id); return; }
+    this.createDimension([e.id], at);
   }
 
   editDimension(id: Id): void {

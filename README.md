@@ -25,6 +25,10 @@ Abre em `http://localhost:5173`. Para abrir no iPad na mesma rede, use o endere�
   se preferir de frente). Arraste uma região sombreada do esboço: extruda ao vivo; para fora adiciona, para
   dentro corta. Toque numa face e arraste-a: puxa ou empurra a face. Arraste uma aresta: filete (ou chanfro,
   conforme o botão ativo) com o raio seguindo a caneta. O valor aparece numa etiqueta; toque nela para digitar.
+- **Cotas.** Retângulo, círculo, rasgo e polígono já nascem cotados (largura e altura, diâmetro, distância
+  entre centros). Toque numa cota, ou direto numa linha ou círculo, e digite o valor em mm: a geometria obedece.
+  O botão "Construção" na paleta deixa tudo o que você riscar como linha de referência tracejada.
+- **Paleta.** A barra de ferramentas fica no topo, na horizontal; arraste pela alça para a lateral se preferir vertical.
 - **Esboço vivo.** Linhas colam em horizontal, vertical e ângulo reto automaticamente. A caneta encaixa em
   cantos, cruzamentos de linhas (o centro de um X de construção), meios de linha e na origem do plano, com um
   anel mostrando onde vai grudar; linhas de construção são tracejadas e a origem tem uma cruz. Toque numa
