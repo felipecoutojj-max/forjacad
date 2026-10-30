@@ -2,7 +2,7 @@
 import { describe, it, expect, beforeAll } from 'vitest';
 import initOpenCascade from 'opencascade.js/dist/node.js';
 import type { OpenCascadeInstance } from 'opencascade.js';
-import { rebuildDocument, tessellate, exportSTEP, exportIGES, projectViews, assemblyShapes, interferences, offsetProfile } from './build';
+import { rebuildDocument, tessellate, exportSTEP, exportIGES, projectViews, assemblyShapes, interferences, offsetProfile, tubeAlongPath, sketchWire } from './build';
 import { createDocument, addExtrude, addRevolve, addFillet, addBoolean, addPushPull, addShell, addMirror, addTransform, addSplit, addSweep, addLoft, addImport, addFacePlane, type ForjaDocument } from '../../document';
 import * as M from '../../sketch/model';
 
@@ -282,6 +282,26 @@ describe('kernel OpenCASCADE', () => {
     for (const e of ents) if (e.type === 'arc') expect(e.r).toBeCloseTo(5, 5);
     const inner = offsetProfile(oc, doc, doc.sketches[0].id, [20, 10], -5); // para dentro: só linhas (cantos vivos)
     expect(inner.filter((e) => e.type === 'line')).toHaveLength(4);
+  });
+
+  it('tubo ao longo de um caminho com curva, em dois esboços emendados', () => {
+    const doc = createDocument();
+    // Caminho 1 (plano XY): reta de (0,0) a (40,0), arco de raio 20 até (60,20), reta até (60,60).
+    const p1 = M.createSketch('plane-xy', 'c1'); doc.sketches.push(p1);
+    const a = M.addPoint(p1, 0, 0), b = M.addPoint(p1, 40, 0), c = M.addPoint(p1, 60, 20), d = M.addPoint(p1, 60, 60), ctr = M.addPoint(p1, 40, 20);
+    M.addLine(p1, a.id, b.id); M.addArc(p1, ctr.id, b.id, c.id, 20); M.addLine(p1, c.id, d.id);
+    // Caminho 2 (plano YZ: u = -z, v = y): continua de (60,60,0) subindo em z até (60,60,30)... u=-z → de u=0 a u=-30 em v=60; mas x fixo em 0 no plano base. Usa plano deslocado em x=60.
+    const pl = addFacePlane(doc, 'x60', [60, 0, 0], [0, 0, -1], [0, 1, 0], 'x');
+    const p2 = M.createSketch(pl.id, 'c2'); doc.sketches.push(p2); const e = M.addPoint(p2, 0, 60), f = M.addPoint(p2, -30, 60); M.addLine(p2, e.id, f.id);
+    const wire = sketchWire(oc, doc, [p1.id, p2.id]);
+    const tube = tubeAlongPath(oc, wire, 5, 4);
+    const vol = (() => { const props = new oc.GProp_GProps_1(); oc.BRepGProp.VolumeProperties_1(tube, props, false, false, false); return props.Mass(); })();
+    const length = 40 + (Math.PI / 2) * 20 + 40 + 30; const ring = Math.PI * (25 - 16);
+    // O canto vivo entre os dois esboços vira cotovelo arredondado, então o volume fica perto (não igual) de comprimento × seção.
+    expect(Math.abs(vol - length * ring) / (length * ring)).toBeLessThan(0.08);
+    // Pela feature, com paths múltiplos e tube
+    addSweep(doc, p1.id, p1.id, { paths: [p1.id, p2.id], tube: { outer: 10, inner: 8 } });
+    const r = rebuildDocument(oc, doc); expect(r.errors).toEqual([]); expect(Math.abs(tessellate(oc, r.bodies[0], 'c').volume - length * ring) / (length * ring)).toBeLessThan(0.08);
   });
 
   it('exporta STEP com os corpos', () => {

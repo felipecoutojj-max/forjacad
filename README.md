@@ -25,9 +25,18 @@ Abre em `http://localhost:5173`. Para abrir no iPad na mesma rede, use o endere�
   se preferir de frente). Arraste uma região sombreada do esboço: extruda ao vivo; para fora adiciona, para
   dentro corta. Toque numa face e arraste-a: puxa ou empurra a face. Arraste uma aresta: filete (ou chanfro,
   conforme o botão ativo) com o raio seguindo a caneta. O valor aparece numa etiqueta; toque nela para digitar.
-- **Esboço vivo.** Linhas colam em horizontal, vertical e ângulo reto automaticamente. Toque numa linha ou
-  círculo para ver a medida e cotá-la; arraste o que está selecionado para mover, alongar ou mudar o raio,
-  sempre respeitando as restrições.
+- **Esboço vivo.** Linhas colam em horizontal, vertical e ângulo reto automaticamente. A caneta encaixa em
+  cantos, cruzamentos de linhas (o centro de um X de construção), meios de linha e na origem do plano, com um
+  anel mostrando onde vai grudar; linhas de construção são tracejadas e a origem tem uma cruz. Toque numa
+  linha ou círculo para ver a medida e cotá-la; arraste o que está selecionado para mover, alongar ou mudar
+  o raio. "Concluir esboço" fica fixo na tela e "Furo passante" corta atravessando com um toque. Uma linha
+  selecionada num esboço sobre face pode dividir o corpo.
+- **Várias faces.** Toque soma faces à seleção; a seta puxa ou empurra todas juntas.
+- **Tubo.** Em "Corpo ▸ Tubo", desenhe o caminho com linhas e arcos (em um ou mais esboços emendados, em planos
+  diferentes para curvas em 3D), informe diâmetro e parede: sai o tubo seguindo as curvas. A varredura
+  também aceita caminho em vários esboços; cantos vivos viram cotovelos.
+- **Montagem.** Arraste peças livres com a caneta. Com "Colisão" ligada a peça para ao encostar em outra; desligada,
+  atravessa e fica translúcida onde se sobrepõe.
 - **Dedo** orbita; dois dedos aproximam. Mouse: botão esquerdo faz o que a caneta faz, direito/meio movem a câmera.
 
 ## Ferramentas, comparadas ao Shapr3D

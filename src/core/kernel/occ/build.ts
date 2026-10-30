@@ -295,8 +295,9 @@ export function rebuildDocument(oc: OC, doc: ForjaDocument): RebuildShapes {
         if (f.pattern) tool = applyPattern(oc, tool, f.pattern);
         place(f.op, f.target, tool);
       } else if (f.type === 'sweep') {
-        const { faces } = sketchFaces(oc, doc, f.profile); const wire = sketchWire(oc, doc, f.path);
-        place(f.op, f.target, sweepFaces(oc, faces, wire));
+        const wire = sketchWire(oc, doc, f.paths?.length ? f.paths : [f.path]);
+        if (f.tube) place(f.op, f.target, tubeAlongPath(oc, wire, f.tube.outer / 2, f.tube.inner / 2));
+        else { const { faces } = sketchFaces(oc, doc, f.profile); place(f.op, f.target, sweepFaces(oc, faces, wire)); }
       } else if (f.type === 'loft') {
         place(f.op, f.target, loftSketches(oc, doc, f.sketches, f.ruled));
       } else if (f.type === 'import') {
@@ -318,8 +319,9 @@ export function rebuildDocument(oc: OC, doc: ForjaDocument): RebuildShapes {
         else if (f.keep === 'back') { if (!back) throw new Error('nada sobra desse lado'); bodies.set(f.body, back); }
         else { if (!front || !back) throw new Error('o plano não corta o corpo'); bodies.set(f.body, front); bodies.set(f.id, back); order.push(f.id); }
       } else if (f.type === 'pushpull') {
-        const shape = bodies.get(f.body); if (!shape) throw new Error('o corpo não existe mais');
-        bodies.set(f.body, pushPull(oc, shape, f.face, f.distance));
+        let shape = bodies.get(f.body); if (!shape) throw new Error('o corpo não existe mais');
+        for (const ref of [f.face, ...(f.faces ?? [])]) shape = pushPull(oc, shape, ref, f.distance);
+        bodies.set(f.body, shape);
       } else if (f.type === 'fillet' || f.type === 'chamfer') {
         const shape = bodies.get(f.body); if (!shape) throw new Error('o corpo não existe mais');
         bodies.set(f.body, applyFillet(oc, f, shape));
@@ -613,10 +615,12 @@ export function splitBody(oc: OC, shape: TopoDS_Shape, origin: V3, normal: V3): 
   return { front: tryOp('cut'), back: tryOp('common') };
 }
 
-/** Caminho de um esboço: todas as linhas e arcos (não construção) encadeados num fio aberto ou fechado. */
-export function sketchWire(oc: OC, doc: ForjaDocument, sketchId: Id): TopoDS_Wire {
-  const s = getSketch(doc, sketchId); const plane = getPlane(doc, s.plane);
+/** Caminho: linhas e arcos (não construção) de um ou mais esboços, emendados num fio aberto ou fechado (pode ser 3D). */
+export function sketchWire(oc: OC, doc: ForjaDocument, sketchIds: Id | Id[]): TopoDS_Wire {
+  const ids = Array.isArray(sketchIds) ? sketchIds : [sketchIds];
   const mk = new oc.BRepBuilderAPI_MakeWire_1(); let n = 0;
+  for (const sketchId of ids) {
+  const s = getSketch(doc, sketchId); const plane = getPlane(doc, s.plane);
   for (const e of s.entities) {
     if (e.construction) continue;
     if (e.type === 'line') { const a = getPoint(s, e.a), b = getPoint(s, e.b); mk.Add_1(new oc.BRepBuilderAPI_MakeEdge_3(pnt(oc, planeToWorld(plane, a.x, a.y)), pnt(oc, planeToWorld(plane, b.x, b.y))).Edge()); n++; }
@@ -628,17 +632,51 @@ export function sketchWire(oc: OC, doc: ForjaDocument, sketchId: Id): TopoDS_Wir
       mk.Add_1(new oc.BRepBuilderAPI_MakeEdge_24(new oc.Handle_Geom_Curve_2(arc.Value().get())).Edge()); n++;
     }
   }
+  }
   if (!n) throw new Error('o caminho não tem linhas nem arcos');
   if (!mk.IsDone()) throw new Error('o caminho não está conectado de ponta a ponta');
   return mk.Wire();
 }
 
+/** Tubo (ou vareta maciça, com innerR = 0) de seção circular ao longo do caminho, começando perpendicular ao primeiro trecho. */
+export function tubeAlongPath(oc: OC, path: TopoDS_Wire, outerR: number, innerR = 0): TopoDS_Shape {
+  if (!(outerR > 0) || innerR >= outerR) throw new Error('diâmetros inválidos');
+  // Ponto e tangente no começo do fio: primeira aresta na ordem do fio.
+  const ex = new oc.BRepTools_WireExplorer_2(path); if (!ex.More()) throw new Error('caminho vazio');
+  const first = ex.Current(); const c = new oc.BRepAdaptor_Curve_2(first);
+  const reversed = enumVal(first.Orientation_1()) === enumVal(oc.TopAbs_Orientation.TopAbs_REVERSED);
+  const u0 = reversed ? c.LastParameter() : c.FirstParameter();
+  const p = new oc.gp_Pnt_1(); const v = new oc.gp_Vec_1(); c.D1(u0, p, v); if (reversed) v.Reverse();
+  const ax = new oc.gp_Ax2_3(p, new oc.gp_Dir_2(v));
+  const outerWire = new oc.BRepBuilderAPI_MakeWire_2(new oc.BRepBuilderAPI_MakeEdge_8(new oc.gp_Circ_2(ax, outerR)).Edge()).Wire();
+  let face = new oc.BRepBuilderAPI_MakeFace_15(outerWire, true).Face();
+  if (innerR > 0) { const innerWire = new oc.BRepBuilderAPI_MakeWire_2(new oc.BRepBuilderAPI_MakeEdge_8(new oc.gp_Circ_2(ax, innerR)).Edge()).Wire(); face = new oc.BRepBuilderAPI_MakeFace_22(face, oc.TopoDS.Wire_1(innerWire.Reversed())).Face(); const fix = new oc.ShapeFix_Face_2(face); fix.Perform(); face = fix.Face(); }
+  ex.delete(); c.delete();
+  return sweepFaces(oc, [face], path);
+}
+
+/** Sólido varrendo um fio fechado ao longo do caminho; cantos vivos do caminho viram cotovelos arredondados. */
+function pipeWire(oc: OC, spine: TopoDS_Wire, profile: TopoDS_Wire): TopoDS_Shape {
+  const mk = new oc.BRepOffsetAPI_MakePipeShell(spine);
+  mk.SetTransitionMode(oc.BRepBuilderAPI_TransitionMode.BRepBuilderAPI_RoundCorner as never);
+  mk.Add_1(profile, false, false);
+  mk.Build(new oc.Message_ProgressRange_1());
+  if (!mk.IsDone()) throw new Error('a varredura não fechou (perfil deve estar no começo do caminho e o caminho ser contínuo)');
+  mk.MakeSolid();
+  const sh = mk.Shape(); if (!hasSolid(oc, sh)) throw new Error('a varredura não gerou um sólido');
+  return sh;
+}
+
 export function sweepFaces(oc: OC, faces: TopoDS_Face[], path: TopoDS_Wire): TopoDS_Shape {
   let result: TopoDS_Shape | null = null;
   for (const face of faces) {
-    const mk = new oc.BRepOffsetAPI_MakePipe_1(path, face); mk.Build(new oc.Message_ProgressRange_1());
-    const sh = mk.Shape(); if (!hasSolid(oc, sh)) throw new Error('a varredura não gerou um sólido (perfil deve estar no início do caminho)');
-    result = result ? boolOp(oc, 'fuse', result, sh) : sh;
+    const outer = oc.BRepTools.OuterWire(face);
+    let solid = pipeWire(oc, path, outer);
+    // Furos do perfil: varre cada contorno interno e subtrai (tubo com parede).
+    const ex = new oc.TopExp_Explorer_2(face, oc.TopAbs_ShapeEnum.TopAbs_WIRE as never, oc.TopAbs_ShapeEnum.TopAbs_SHAPE as never);
+    for (; ex.More(); ex.Next()) { const w = oc.TopoDS.Wire_1(ex.Current()); if (w.IsSame(outer)) continue; solid = boolOp(oc, 'cut', solid, pipeWire(oc, path, w)); }
+    ex.delete();
+    result = result ? boolOp(oc, 'fuse', result, solid) : solid;
   }
   return result!;
 }

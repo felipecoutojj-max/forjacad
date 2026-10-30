@@ -21,8 +21,8 @@ export type ThemeName = keyof typeof THEMES;
 export interface RenderBody { id: Id; name: string; geometry: THREE.BufferGeometry; data?: BodyData; /** 4×4 em linha-maior (instância de montagem). */ matrix?: number[]; }
 
 /** Seleção em modo vista. Arestas selecionadas pertencem sempre a um único corpo. */
-export interface Sel3D { body: Id | null; face: { body: Id; index: number } | null; edges: { body: Id; index: number }[]; }
-export const emptySel3D = (): Sel3D => ({ body: null, face: null, edges: [] });
+export interface Sel3D { body: Id | null; face: { body: Id; index: number } | null; /** Faces selecionadas além da principal (toque soma). */ faces?: { body: Id; index: number }[]; edges: { body: Id; index: number }[]; }
+export const emptySel3D = (): Sel3D => ({ body: null, face: null, faces: [], edges: [] });
 
 export interface FaceHit { body: Id; index: number; distance: number; point: THREE.Vector3; }
 export interface EdgeHit { body: Id; index: number; px: number; }
@@ -76,6 +76,9 @@ export class Viewport {
   private planeMat = new THREE.MeshBasicMaterial({ color: 0x7c6bc4, transparent: true, opacity: 0.06, side: THREE.DoubleSide, depthWrite: false });
   private planeEdgeMat = new THREE.LineBasicMaterial({ color: 0x7c6bc4, transparent: true, opacity: 0.35 });
   theme: ThemeName = 'light';
+  private translucentMat = new THREE.MeshStandardMaterial({ color: 0xd3d8df, metalness: 0.12, roughness: 0.62, side: THREE.DoubleSide, transparent: true, opacity: 0.4, depthWrite: false });
+  private collideMat = new THREE.MeshStandardMaterial({ color: 0xf0542b, metalness: 0.12, roughness: 0.62, side: THREE.DoubleSide, transparent: true, opacity: 0.55, depthWrite: false });
+  private translucent = new Set<Id>();
   width = 1; height = 1;
 
   constructor(readonly container: HTMLElement) {
@@ -118,7 +121,7 @@ export class Viewport {
     this.bodyMaterial.color.setHex(t.body); this.bodySelMaterial.color.setHex(t.bodySel); this.faceSelMaterial.color.setHex(t.faceSel);
     this.edgeMaterial.color.setHex(t.edge); this.edgeSelMaterial.color.setHex(t.edgeSel);
     this.hoverFaceMat.color.setHex(t.hover); this.hoverEdgeMat.color.setHex(t.hover); this.regionMat.color.setHex(t.region); this.regionHotMat.color.setHex(t.regionHot);
-    this.ghostMat.color.setHex(t.ghost); this.ghostEdgeMat.color.setHex(t.ghostEdge); this.handleMat.color.setHex(t.faceSel);
+    this.ghostMat.color.setHex(t.ghost); this.ghostEdgeMat.color.setHex(t.ghostEdge); this.handleMat.color.setHex(t.faceSel); this.translucentMat.color.setHex(t.body); this.collideMat.color.setHex(t.faceSel);
     this.planeMat.color.setHex(t.plane); this.planeEdgeMat.color.setHex(t.plane);
     this.hemi.color.setHex(t.hemiSky); this.hemi.groundColor.setHex(t.hemiGround); this.keyLight.intensity = t.key; this.fillLight.intensity = t.fill;
     this.buildHelpers();
@@ -265,6 +268,13 @@ export class Viewport {
     return g;
   }
 
+  /** Ponto onde o raio do cursor fura um plano (origem + normal). */
+  rayOnPlane(origin: THREE.Vector3, normal: THREE.Vector3, x: number, y: number): THREE.Vector3 | null {
+    this.setRay(x, y);
+    const pl = new THREE.Plane().setFromNormalAndCoplanarPoint(normal.clone().normalize(), origin);
+    return this.raycaster.ray.intersectPlane(pl, new THREE.Vector3());
+  }
+
   /** Quanto o cursor "andou" ao longo de uma reta 3D (origem + eixo·t): parâmetro t do ponto da reta mais perto do raio do cursor. */
   axisDragDistance(origin: THREE.Vector3, axis: THREE.Vector3, x: number, y: number): number {
     this.setRay(x, y);
@@ -286,13 +296,20 @@ export class Viewport {
     return typeof c.captureStream === 'function' ? c.captureStream(fps) : null;
   }
 
+  /** Corpos (ids de cena) desenhados translúcidos: peças que se atravessam com a colisão desligada. */
+  setTranslucent(ids: Set<Id>, colliding = false): void {
+    this.translucent = ids;
+    for (const [id, mesh] of this.bodyMeshes) if (ids.has(id)) mesh.material = colliding ? this.collideMat : this.translucentMat; else if (mesh.material === this.translucentMat || mesh.material === this.collideMat) mesh.material = this.bodyMaterial;
+    this.requestRender();
+  }
+
   /** Redesenha só os destaques de face e aresta. */
   setSelection(sel: Sel3D): void {
     this.highlights.clear();
-    for (const [id, mesh] of this.bodyMeshes) mesh.material = id === sel.body ? this.bodySelMaterial : this.bodyMaterial;
-    if (sel.face) {
-      const data = this.bodyData.get(sel.face.body); const mesh = this.bodyMeshes.get(sel.face.body);
-      const f = data?.faces[sel.face.index];
+    for (const [id, mesh] of this.bodyMeshes) if (!this.translucent.has(id)) mesh.material = id === sel.body ? this.bodySelMaterial : this.bodyMaterial;
+    for (const fs of [...(sel.face ? [sel.face] : []), ...(sel.faces ?? [])]) {
+      const data = this.bodyData.get(fs.body); const mesh = this.bodyMeshes.get(fs.body);
+      const f = data?.faces[fs.index];
       if (data && mesh && f) {
         const g = new THREE.BufferGeometry();
         g.setAttribute('position', mesh.geometry.getAttribute('position'));

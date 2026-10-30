@@ -156,3 +156,6 @@ input[type=checkbox] { width: 20px; height: 20px; accent-color: var(--ember); }
   .sidepanel { width: 204px; font-size: 12px; }
   .toolbar .tool { font-size: 9.5px; min-width: 46px; }
 }
+
+/* Concluir esboço sempre à mão */
+.done-fab { position: absolute; left: 12px; bottom: calc(env(safe-area-inset-bottom) + 14px); pointer-events: auto; min-height: 46px; padding: 8px 18px; border-radius: 999px; font-size: 14px; box-shadow: var(--shadow); }

@@ -46,8 +46,8 @@ export type PatternSpec = { kind: 'linear'; count: number; step: V3 } | { kind: 
 /** Referência geométrica a uma face plana: centro, normal para fora e área. */
 export interface FaceRef { center: V3; normal: V3; area: number; }
 
-/** Puxar/empurrar uma face plana de um corpo (modelagem direta). Positivo cresce para fora, negativo corta. */
-export interface PushPullFeature { id: Id; type: 'pushpull'; name: string; body: Id; face: FaceRef; distance: number; }
+/** Puxar/empurrar faces planas de um corpo (modelagem direta). Positivo cresce para fora, negativo corta. */
+export interface PushPullFeature { id: Id; type: 'pushpull'; name: string; body: Id; face: FaceRef; /** Faces adicionais puxadas junto, mesma distância. */ faces?: FaceRef[]; distance: number; }
 
 /** Eixo de revolução em coordenadas do plano do esboço: uma linha do esboço (quando existir) ou ponto + direção. */
 export interface SketchAxis { line?: Id; p: [number, number]; d: [number, number]; }
@@ -73,8 +73,9 @@ export interface MirrorFeature { id: Id; type: 'mirror'; name: string; body: Id;
 export interface TransformFeature { id: Id; type: 'transform'; name: string; body: Id; translate: V3; axisPoint: V3; axisDir: V3; angle: number; scale: number; }
 /** Divide um corpo por um plano. 'both' mantém os dois (o segundo vira corpo com o id da feature). */
 export interface SplitFeature { id: Id; type: 'split'; name: string; body: Id; origin: V3; normal: V3; keep: 'both' | 'front' | 'back'; }
-/** Varredura: perfil fechado de um esboço ao longo do caminho (linhas e arcos) de outro. */
-export interface SweepFeature { id: Id; type: 'sweep'; name: string; profile: Id; path: Id; op: ExtrudeOp; target?: Id; }
+/** Varredura: perfil fechado de um esboço ao longo de um caminho (linhas e arcos de um ou mais esboços emendados).
+ *  Com `tube`, o perfil é gerado: círculo de diâmetro `outer` (e furo `inner`, se > 0) no começo do caminho. */
+export interface SweepFeature { id: Id; type: 'sweep'; name: string; profile: Id; path: Id; paths?: Id[]; tube?: { outer: number; inner: number }; op: ExtrudeOp; target?: Id; }
 /** Loft entre perfis de dois ou mais esboços. */
 export interface LoftFeature { id: Id; type: 'loft'; name: string; sketches: Id[]; ruled: boolean; op: ExtrudeOp; target?: Id; }
 /** Corpo importado de um STEP (texto guardado no documento). */
@@ -166,7 +167,7 @@ function fromObject(d: Record<string, unknown> & { [k: string]: any }, depth: nu
       features.push({ id: f.id, type: 'extrude', name: str(f.name, 'Extrusão'), sketch: f.sketch, depth: Math.abs(num(f.depth, 10)) || 10, op, target: op === 'new' ? undefined : id(f.target), symmetric: !!f.symmetric, flip: !!f.flip, throughAll: !!f.throughAll, profilePoint, pattern: pattern(f.pattern), visible: f.visible !== false });
     } else if (f.type === 'pushpull' && typeof f.body === 'string') {
       const fr = f.face as Partial<FaceRef> | undefined;
-      if (fr && isV3(fr.center) && isV3(fr.normal) && typeof fr.area === 'number') features.push({ id: f.id, type: 'pushpull', name: str(f.name, 'Puxar face'), body: f.body, face: { center: fr.center, normal: fr.normal, area: fr.area }, distance: num(f.distance, 1) || 1 });
+      if (fr && isV3(fr.center) && isV3(fr.normal) && typeof fr.area === 'number') features.push({ id: f.id, type: 'pushpull', name: str(f.name, 'Puxar face'), body: f.body, face: { center: fr.center, normal: fr.normal, area: fr.area }, faces: (Array.isArray(f.faces) ? f.faces : []).map(faceRef).filter((x): x is FaceRef => !!x), distance: num(f.distance, 1) || 1 });
     } else if (f.type === 'revolve' && typeof f.sketch === 'string') {
       const ax = f.axis as Partial<SketchAxis> | undefined;
       const is2 = (v: unknown): v is [number, number] => Array.isArray(v) && v.length === 2 && v.every((x) => typeof x === 'number' && Number.isFinite(x));
@@ -185,7 +186,9 @@ function fromObject(d: Record<string, unknown> & { [k: string]: any }, depth: nu
     } else if (f.type === 'split' && typeof f.body === 'string' && isV3(f.origin) && isV3(f.normal)) {
       features.push({ id: f.id, type: 'split', name: str(f.name, 'Dividir'), body: f.body, origin: f.origin, normal: f.normal, keep: f.keep === 'front' || f.keep === 'back' ? f.keep : 'both' });
     } else if (f.type === 'sweep' && typeof f.profile === 'string' && typeof f.path === 'string') {
-      const op = opOf(f); features.push({ id: f.id, type: 'sweep', name: str(f.name, 'Varredura'), profile: f.profile, path: f.path, op, target: op === 'new' ? undefined : id(f.target) });
+      const op = opOf(f); const paths = Array.isArray(f.paths) ? (f.paths as unknown[]).filter((x): x is string => typeof x === 'string') : undefined;
+      const tb = f.tube as { outer?: unknown; inner?: unknown } | undefined; const tube = tb && typeof tb.outer === 'number' && tb.outer > 0 ? { outer: tb.outer, inner: Math.max(0, num(tb.inner, 0)) } : undefined;
+      features.push({ id: f.id, type: 'sweep', name: str(f.name, 'Varredura'), profile: f.profile, path: f.path, paths, tube, op, target: op === 'new' ? undefined : id(f.target) });
     } else if (f.type === 'loft' && Array.isArray(f.sketches)) {
       const sk = (f.sketches as unknown[]).filter((x): x is string => typeof x === 'string'); if (sk.length < 2) continue;
       const op = opOf(f); features.push({ id: f.id, type: 'loft', name: str(f.name, 'Loft'), sketches: sk, ruled: !!f.ruled, op, target: op === 'new' ? undefined : id(f.target) });
@@ -329,9 +332,9 @@ export function addSplit(doc: ForjaDocument, body: Id, origin: V3, normal: V3, k
   const n = doc.features.filter((f) => f.type === 'split').length + 1;
   const f: SplitFeature = { id: newId('f'), type: 'split', name: `Dividir ${n}`, body, origin, normal, keep }; doc.features.push(f); return f;
 }
-export function addSweep(doc: ForjaDocument, profile: Id, path: Id, opts: { op?: ExtrudeOp; target?: Id } = {}): SweepFeature {
+export function addSweep(doc: ForjaDocument, profile: Id, path: Id, opts: { op?: ExtrudeOp; target?: Id; paths?: Id[]; tube?: { outer: number; inner: number } } = {}): SweepFeature {
   const op = opts.op ?? 'new'; const n = doc.features.filter((f) => f.type === 'sweep').length + 1;
-  const f: SweepFeature = { id: newId('f'), type: 'sweep', name: `Varredura ${n}`, profile, path, op, target: op === 'new' ? undefined : opts.target }; doc.features.push(f); return f;
+  const f: SweepFeature = { id: newId('f'), type: 'sweep', name: `${opts.tube ? 'Tubo' : 'Varredura'} ${n}`, profile, path, paths: opts.paths, tube: opts.tube, op, target: op === 'new' ? undefined : opts.target }; doc.features.push(f); return f;
 }
 export function addLoft(doc: ForjaDocument, sketches: Id[], opts: { ruled?: boolean; op?: ExtrudeOp; target?: Id } = {}): LoftFeature {
   const op = opts.op ?? 'new'; const n = doc.features.filter((f) => f.type === 'loft').length + 1;
@@ -341,9 +344,9 @@ export function addImport(doc: ForjaDocument, name: string, step: string): Impor
   const f: ImportFeature = { id: newId('f'), type: 'import', name: name.slice(0, 80) || 'Importado', step }; doc.features.push(f); return f;
 }
 
-export function addPushPull(doc: ForjaDocument, body: Id, face: FaceRef, distance: number): PushPullFeature {
+export function addPushPull(doc: ForjaDocument, body: Id, face: FaceRef, distance: number, more: FaceRef[] = []): PushPullFeature {
   const n = doc.features.filter((f) => f.type === 'pushpull').length + 1;
-  const f: PushPullFeature = { id: newId('f'), type: 'pushpull', name: `${distance >= 0 ? 'Puxar' : 'Empurrar'} face ${n}`, body, face, distance };
+  const f: PushPullFeature = { id: newId('f'), type: 'pushpull', name: `${distance >= 0 ? 'Puxar' : 'Empurrar'} ${more.length ? `${more.length + 1} faces` : 'face'} ${n}`, body, face, faces: more.length ? more : undefined, distance };
   doc.features.push(f); return f;
 }
 

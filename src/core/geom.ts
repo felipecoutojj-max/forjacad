@@ -119,3 +119,24 @@ export function polylineLength(pts: Vec2[]): number {
 export function round(v: number, decimals = 2): number {
   const f = Math.pow(10, decimals); return Math.round(v * f) / f;
 }
+
+/** Interseção de dois segmentos (ou das retas, se `extend`). */
+export function intersectSegments(a: Vec2, b: Vec2, c: Vec2, d: Vec2, extend = false): Vec2 | null {
+  const r = sub(b, a), q = sub(d, c); const den = r.x * q.y - r.y * q.x; if (Math.abs(den) < 1e-12) return null;
+  const ac = sub(c, a); const t = (ac.x * q.y - ac.y * q.x) / den, u = (ac.x * r.y - ac.y * r.x) / den;
+  if (!extend && (t < -1e-6 || t > 1 + 1e-6 || u < -1e-6 || u > 1 + 1e-6)) return null;
+  return add(a, scale(r, t));
+}
+/** Interseções de uma reta (por a, b) com um círculo. */
+export function intersectLineCircle(a: Vec2, b: Vec2, c: Vec2, r: number): Vec2[] {
+  const d = sub(b, a); const f = sub(a, c); const A = dot(d, d), B = 2 * dot(f, d), C = dot(f, f) - r * r;
+  const disc = B * B - 4 * A * C; if (disc < 0 || A < 1e-12) return [];
+  const sq = Math.sqrt(disc); return [...new Set([(-B - sq) / (2 * A), (-B + sq) / (2 * A)])].map((t) => add(a, scale(d, t)));
+}
+/** Interseções de dois círculos. */
+export function intersectCircles(c1: Vec2, r1: number, c2: Vec2, r2: number): Vec2[] {
+  const d = dist(c1, c2); if (d < 1e-9 || d > r1 + r2 + 1e-9 || d < Math.abs(r1 - r2) - 1e-9) return [];
+  const a = (r1 * r1 - r2 * r2 + d * d) / (2 * d); const h2 = r1 * r1 - a * a; const h = Math.sqrt(Math.max(0, h2));
+  const m = add(c1, scale(sub(c2, c1), a / d)); const n = perp(norm(sub(c2, c1)));
+  return h < 1e-9 ? [m] : [add(m, scale(n, h)), add(m, scale(n, -h))];
+}
