@@ -55,11 +55,15 @@ export interface AssemblyPayload { parts: { id: Id; doc: ForjaDocument }[]; inst
 
 export type KernelRequest =
   | { id: number; type: 'rebuild'; doc: ForjaDocument }
-  | { id: number; type: 'export'; format: 'step' }
+  | { id: number; type: 'export'; format: 'step' | 'iges' }
   | { id: number; type: 'project'; views: ViewSpec[] }
   | { id: number; type: 'projectAssembly'; assembly: AssemblyPayload; views: ViewSpec[] }
   | { id: number; type: 'exportAssembly'; assembly: AssemblyPayload }
-  | { id: number; type: 'interference'; parts: AssemblyPayload['parts']; steps: { part: Id; matrix: number[] }[][] };
+  | { id: number; type: 'interference'; parts: AssemblyPayload['parts']; steps: { part: Id; matrix: number[] }[][] }
+  | { id: number; type: 'offsetProfile'; doc: ForjaDocument; sketch: Id; profilePoint: [number, number]; distance: number };
+
+/** Entidades 2D devolvidas por operações de esboço no kernel (coordenadas u, v do plano). */
+export type SketchEntity2D = { type: 'line'; a: [number, number]; b: [number, number] } | { type: 'arc'; c: [number, number]; r: number; a: [number, number]; b: [number, number] } | { type: 'circle'; c: [number, number]; r: number };
 
 export interface InterferenceHit { step: number; a: number; b: number; volume: number; }
 
@@ -70,4 +74,5 @@ export type KernelResponse =
   | { id: number; type: 'exported'; data: string; mime: string }
   | { id: number; type: 'projected'; views: ProjectedView[] }
   | { id: number; type: 'interference'; hits: InterferenceHit[] }
+  | { id: number; type: 'offsetProfile'; entities: SketchEntity2D[] }
   | { id: number; type: 'error'; message: string };

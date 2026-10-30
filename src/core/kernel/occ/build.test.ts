@@ -2,8 +2,8 @@
 import { describe, it, expect, beforeAll } from 'vitest';
 import initOpenCascade from 'opencascade.js/dist/node.js';
 import type { OpenCascadeInstance } from 'opencascade.js';
-import { rebuildDocument, tessellate, exportSTEP, projectViews, assemblyShapes, interferences } from './build';
-import { createDocument, addExtrude, addRevolve, addFillet, addBoolean, addPushPull, type ForjaDocument } from '../../document';
+import { rebuildDocument, tessellate, exportSTEP, exportIGES, projectViews, assemblyShapes, interferences, offsetProfile } from './build';
+import { createDocument, addExtrude, addRevolve, addFillet, addBoolean, addPushPull, addShell, addMirror, addTransform, addSplit, addSweep, addLoft, addImport, addFacePlane, type ForjaDocument } from '../../document';
 import * as M from '../../sketch/model';
 
 let oc: OpenCascadeInstance;
@@ -213,6 +213,75 @@ describe('kernel OpenCASCADE', () => {
     // Face que não existe: erro de feature, corpo preservado.
     pull.face = { center: [50, 30, 99], normal: [0, 0, 1], area: 6000 };
     r = rebuildDocument(oc, doc); expect(r.errors).toHaveLength(1); expect(r.bodies).toHaveLength(1);
+  });
+
+  it('casca com a face de cima aberta', () => {
+    const doc = createDocument(); const body = addExtrude(doc, rectSketch(doc, 'plane-xy', 0, 0, 100, 60).id, 20);
+    addShell(doc, body.id, 2, [{ center: [50, 30, 20], normal: [0, 0, 1], area: 6000 }]);
+    const r = rebuildDocument(oc, doc); expect(r.errors).toEqual([]);
+    expect(tessellate(oc, r.bodies[0], 'c').volume).toBeCloseTo(120000 - 96 * 56 * 18, 0);
+  });
+
+  it('espelho fundido e espelho como corpo novo', () => {
+    const doc = createDocument(); const body = addExtrude(doc, rectSketch(doc, 'plane-xy', 0, 0, 100, 60).id, 20);
+    const m = addMirror(doc, body.id, [0, 0, 0], [1, 0, 0], true);
+    let r = rebuildDocument(oc, doc); expect(r.errors).toEqual([]); expect(r.bodies).toHaveLength(1);
+    expect(tessellate(oc, r.bodies[0], 'c').volume).toBeCloseTo(240000, 0);
+    m.join = false; r = rebuildDocument(oc, doc); expect(r.bodies).toHaveLength(2);
+    expect(tessellate(oc, r.bodies[1], 'c').bbox[1][0]).toBeCloseTo(0, 5); // cópia fica em x ≤ 0
+  });
+
+  it('padrão linear e circular na extrusão', () => {
+    const doc = createDocument(); const f = addExtrude(doc, rectSketch(doc, 'plane-xy', 0, 0, 10, 10).id, 10);
+    f.pattern = { kind: 'linear', count: 3, step: [20, 0, 0] };
+    let r = rebuildDocument(oc, doc); expect(r.errors).toEqual([]); expect(r.bodies).toHaveLength(1);
+    expect(tessellate(oc, r.bodies[0], 'c').volume).toBeCloseTo(3000, 0);
+    f.pattern = { kind: 'circular', count: 4, axisPoint: [-20, 0, 0], axisDir: [0, 0, 1], angle: 360 };
+    r = rebuildDocument(oc, doc); expect(r.errors).toEqual([]); expect(tessellate(oc, r.bodies[0], 'c').volume).toBeCloseTo(4000, 0);
+  });
+
+  it('mover, girar e escalar; dividir em dois', () => {
+    const doc = createDocument(); const body = addExtrude(doc, rectSketch(doc, 'plane-xy', 0, 0, 100, 60).id, 20);
+    const t = addTransform(doc, body.id, { translate: [10, 0, 0], angle: 90, axisPoint: [0, 0, 0], axisDir: [0, 0, 1], scale: 2 });
+    let r = rebuildDocument(oc, doc); expect(r.errors).toEqual([]);
+    const m = tessellate(oc, r.bodies[0], 'c'); expect(m.volume).toBeCloseTo(120000 * 8, -1);
+    doc.features = doc.features.filter((x) => x.id !== t.id);
+    addSplit(doc, body.id, [50, 0, 0], [1, 0, 0], 'both');
+    r = rebuildDocument(oc, doc); expect(r.errors).toEqual([]); expect(r.bodies).toHaveLength(2);
+    expect(tessellate(oc, r.bodies[0], 'a').volume).toBeCloseTo(60000, 0); expect(tessellate(oc, r.bodies[1], 'b').volume).toBeCloseTo(60000, 0);
+  });
+
+  it('varredura de círculo ao longo de uma linha e loft entre dois quadrados', () => {
+    const doc = createDocument();
+    const prof = circleSketch(doc, 'plane-xy', 0, 0, 5);
+    const path = M.createSketch('plane-xz', 'caminho'); doc.sketches.push(path); const a = M.addPoint(path, 0, 0), b = M.addPoint(path, 0, -40); M.addLine(path, a.id, b.id); // z de 0 a 40
+    addSweep(doc, prof.id, path.id);
+    let r = rebuildDocument(oc, doc); expect(r.errors).toEqual([]);
+    expect(tessellate(oc, r.bodies[0], 'c').volume).toBeCloseTo(Math.PI * 25 * 40, 0);
+    const doc2 = createDocument(); const p30 = addFacePlane(doc2, 'z30', [0, 0, 30], [1, 0, 0], [0, 1, 0], 'x');
+    const s1 = rectSketch(doc2, 'plane-xy', -10, -10, 20, 20), s2 = rectSketch(doc2, p30.id, -5, -5, 10, 10);
+    addLoft(doc2, [s1.id, s2.id], { ruled: true });
+    r = rebuildDocument(oc, doc2); expect(r.errors).toEqual([]);
+    expect(tessellate(oc, r.bodies[0], 'c').volume).toBeCloseTo(7000, 0);
+  });
+
+  it('importa o STEP exportado e exporta IGES', () => {
+    const doc = createDocument(); addExtrude(doc, rectSketch(doc, 'plane-xy', 0, 0, 100, 60).id, 20);
+    const r = rebuildDocument(oc, doc); const step = exportSTEP(oc, r.bodies);
+    const doc2 = createDocument(); addImport(doc2, 'Bloco', step);
+    const r2 = rebuildDocument(oc, doc2); expect(r2.errors).toEqual([]);
+    expect(tessellate(oc, r2.bodies[0], 'c').volume).toBeCloseTo(120000, 0);
+    const iges = exportIGES(oc, r.bodies); expect(iges.length).toBeGreaterThan(500); expect(iges).toMatch(/S      1/);
+  });
+
+  it('desloca um contorno retangular para fora: 4 linhas e 4 arcos de canto', () => {
+    const doc = createDocument(); rectSketch(doc, 'plane-xy', 0, 0, 40, 20);
+    const ents = offsetProfile(oc, doc, doc.sketches[0].id, [20, 10], 5);
+    expect(ents.filter((e) => e.type === 'line')).toHaveLength(4); expect(ents.filter((e) => e.type === 'arc')).toHaveLength(4);
+    const xs = ents.flatMap((e) => (e.type === 'line' ? [e.a[0], e.b[0]] : [])); expect(Math.min(...xs)).toBeCloseTo(-5, 5); expect(Math.max(...xs)).toBeCloseTo(45, 5);
+    for (const e of ents) if (e.type === 'arc') expect(e.r).toBeCloseTo(5, 5);
+    const inner = offsetProfile(oc, doc, doc.sketches[0].id, [20, 10], -5); // para dentro: só linhas (cantos vivos)
+    expect(inner.filter((e) => e.type === 'line')).toHaveLength(4);
   });
 
   it('exporta STEP com os corpos', () => {

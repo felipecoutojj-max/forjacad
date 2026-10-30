@@ -2,30 +2,28 @@
    manipulado: o laranja do aço aquecido. Palha (revenimento) marca o que está sob a caneta; lilás, planos e
    restrições. O modo escuro segue o sistema. */
 :root {
-  --canvas-a: #f5f6f8; --canvas-b: #d7dbe1;
+  --canvas-a: #f8f6f1; --canvas-b: #d9d4ca;
   --glass: rgba(255, 255, 255, 0.74); --glass-2: rgba(255, 255, 255, 0.92); --glass-border: rgba(0, 0, 0, 0.08);
   --fill: rgba(0, 0, 0, 0.045); --fill-2: rgba(0, 0, 0, 0.09);
   --ink: #1d1d1f; --ink-2: #6e6e73; --ink-3: #9a9aa0;
   --ember: #f0542b; --ember-soft: rgba(240, 84, 43, 0.14); --on-ember: #ffffff;
-  --straw: #e9a825; --lilac: #7c6bc4;
+  --straw: #e9a825; --lilac: #7c6bc4; --teal: #1e9e8a;
   --ok: #248a3d; --warn: #c77800; --err: #d70015;
   --shadow: 0 10px 30px rgba(20, 24, 32, 0.14), 0 1px 2px rgba(20, 24, 32, 0.08);
   --radius: 16px; --radius-sm: 10px; --tap: 44px;
   font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', system-ui, sans-serif;
   color-scheme: light;
 }
-@media (prefers-color-scheme: dark) {
-  :root {
-    --canvas-a: #2b2c31; --canvas-b: #141518;
+:root[data-theme="dark"] {
+    --canvas-a: #2d2b28; --canvas-b: #161513;
     --glass: rgba(34, 34, 38, 0.72); --glass-2: rgba(44, 44, 48, 0.92); --glass-border: rgba(255, 255, 255, 0.1);
     --fill: rgba(255, 255, 255, 0.07); --fill-2: rgba(255, 255, 255, 0.13);
     --ink: #f5f5f7; --ink-2: #a1a1a6; --ink-3: #6e6e73;
     --ember: #ff6a3d; --ember-soft: rgba(255, 106, 61, 0.2); --on-ember: #1a0b06;
-    --straw: #f2b640; --lilac: #9d8ce0;
+    --straw: #f2b640; --lilac: #9d8ce0; --teal: #3ccfb6;
     --ok: #30d158; --warn: #ffb340; --err: #ff453a;
     --shadow: 0 12px 34px rgba(0, 0, 0, 0.45), 0 1px 2px rgba(0, 0, 0, 0.4);
     color-scheme: dark;
-  }
 }
 * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
 html, body { margin: 0; height: 100%; background: var(--canvas-b); color: var(--ink); overflow: hidden; overscroll-behavior: none; }
@@ -33,6 +31,13 @@ html, body { margin: 0; height: 100%; background: var(--canvas-b); color: var(--
 canvas { display: block; touch-action: none; user-select: none; -webkit-user-select: none; }
 button { font: inherit; color: inherit; }
 :focus-visible { outline: 2px solid var(--ember); outline-offset: 2px; }
+
+/* Marca */
+.brand { display: flex; align-items: center; gap: 8px; padding-left: 2px; }
+.brand .mark { width: 26px; height: 26px; border-radius: 8px; background: linear-gradient(145deg, var(--straw) 0%, var(--ember) 60%, #b8321a 100%); box-shadow: inset 0 1px 0 rgba(255,255,255,0.35), 0 2px 6px rgba(240, 84, 43, 0.35); position: relative; flex: none; }
+.brand .mark::after { content: ''; position: absolute; left: 7px; right: 7px; bottom: 7px; height: 5px; border-radius: 2px 2px 1px 1px; background: rgba(255,255,255,0.92); box-shadow: 0 -5px 0 -1px rgba(255,255,255,0.55); }
+.brand .name { font-weight: 700; font-size: 15px; letter-spacing: -0.01em; color: var(--ink); }
+.brand .name b { color: var(--ember); font-weight: 700; }
 
 /* Barra superior: pílula de vidro */
 .topbar { display: flex; align-items: center; gap: 8px; margin: calc(env(safe-area-inset-top) + 8px) 10px 0; padding: 6px 8px 6px 12px; background: var(--glass); backdrop-filter: blur(22px) saturate(1.4); -webkit-backdrop-filter: blur(22px) saturate(1.4); border: 1px solid var(--glass-border); border-radius: 999px; box-shadow: var(--shadow); min-height: 48px; position: relative; z-index: 3; }
@@ -60,7 +65,11 @@ button { font: inherit; color: inherit; }
 .tool svg { width: 22px; height: 22px; stroke: currentColor; fill: none; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
 .tool:hover { background: var(--fill); }
 .tool:active { transform: scale(0.96); }
+.tool span { color: var(--ink); }
+.tool.c-sketch { color: var(--lilac); } .tool.c-solid { color: var(--ember); } .tool.c-out { color: var(--teal); } .tool.c-view { color: var(--ink-2); }
 .tool.active { background: var(--ember); color: var(--on-ember); }
+.tool.active.c-sketch { background: var(--lilac); color: #fff; } .tool.active.c-out { background: var(--teal); color: #fff; } .tool.active.c-view { background: var(--ink); color: var(--canvas-a); }
+.tool.active span { color: inherit; }
 .tool:disabled { opacity: 0.35; cursor: default; }
 
 /* Painel direito (contexto) */

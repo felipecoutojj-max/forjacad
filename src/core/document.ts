@@ -12,8 +12,8 @@ export type V3 = [number, number, number];
 /** Plano de trabalho: origem + eixos u, v no espaço 3D (mm). normal = u × v. */
 export interface Plane {
   id: Id; name: string; origin: V3; u: V3; v: V3;
-  /** 'base' são os três planos fixos; 'face' nasce de uma face plana de um corpo. */
-  kind?: 'base' | 'face';
+  /** 'base' são os três planos fixos; 'face' nasce de uma face plana de um corpo (não desenhado); 'offset' é um plano de construção deslocado (desenhado). */
+  kind?: 'base' | 'face' | 'offset';
   /** Corpo de onde a face veio (só para kind 'face'). */
   body?: Id;
 }
@@ -35,9 +35,13 @@ export interface ExtrudeFeature {
   throughAll?: boolean;
   /** Extruda só o perfil fechado que contém este ponto (u, v) do esboço; sem ele, todos os perfis. */
   profilePoint?: [number, number];
+  pattern?: PatternSpec;
   color?: string;
   visible?: boolean;
 }
+
+/** Repetição de uma feature: em linha (passo em mm) ou em volta de um eixo (ângulo total em graus). */
+export type PatternSpec = { kind: 'linear'; count: number; step: V3 } | { kind: 'circular'; count: number; axisPoint: V3; axisDir: V3; angle: number };
 
 /** Referência geométrica a uma face plana: centro, normal para fora e área. */
 export interface FaceRef { center: V3; normal: V3; area: number; }
@@ -57,8 +61,24 @@ export interface RevolveFeature {
   target?: Id;
   /** Gira no sentido contrário. */
   flip?: boolean;
+  pattern?: PatternSpec;
   visible?: boolean;
 }
+
+/** Casca: esvazia o corpo deixando paredes de `thickness`; as faces em `openFaces` ficam abertas. */
+export interface ShellFeature { id: Id; type: 'shell'; name: string; body: Id; thickness: number; openFaces: FaceRef[]; }
+/** Espelho em relação a um plano. `join` funde a cópia ao original; senão cria um corpo novo (id da feature). */
+export interface MirrorFeature { id: Id; type: 'mirror'; name: string; body: Id; origin: V3; normal: V3; join: boolean; }
+/** Mover, girar (em torno de um eixo) e escalar um corpo. */
+export interface TransformFeature { id: Id; type: 'transform'; name: string; body: Id; translate: V3; axisPoint: V3; axisDir: V3; angle: number; scale: number; }
+/** Divide um corpo por um plano. 'both' mantém os dois (o segundo vira corpo com o id da feature). */
+export interface SplitFeature { id: Id; type: 'split'; name: string; body: Id; origin: V3; normal: V3; keep: 'both' | 'front' | 'back'; }
+/** Varredura: perfil fechado de um esboço ao longo do caminho (linhas e arcos) de outro. */
+export interface SweepFeature { id: Id; type: 'sweep'; name: string; profile: Id; path: Id; op: ExtrudeOp; target?: Id; }
+/** Loft entre perfis de dois ou mais esboços. */
+export interface LoftFeature { id: Id; type: 'loft'; name: string; sketches: Id[]; ruled: boolean; op: ExtrudeOp; target?: Id; }
+/** Corpo importado de um STEP (texto guardado no documento). */
+export interface ImportFeature { id: Id; type: 'import'; name: string; step: string; }
 
 /** Referência geométrica a uma aresta: ponto médio e comprimento. Sobrevive a recálculos enquanto a aresta existir. */
 export interface EdgeRef { mid: V3; len: number; }
@@ -76,7 +96,7 @@ export interface BooleanFeature {
   body: Id; tool: Id;
 }
 
-export type Feature = ExtrudeFeature | RevolveFeature | PushPullFeature | FilletFeature | BooleanFeature;
+export type Feature = ExtrudeFeature | RevolveFeature | PushPullFeature | FilletFeature | BooleanFeature | ShellFeature | MirrorFeature | TransformFeature | SplitFeature | SweepFeature | LoftFeature | ImportFeature;
 
 export interface ForjaDocument {
   format: 'forja'; version: number; name: string; units: 'mm';
@@ -124,9 +144,18 @@ function fromObject(d: Record<string, unknown> & { [k: string]: any }, depth: nu
   const doc: ForjaDocument = { ...createDocument(str(d.name, 'Peça')), ...d, name: str(d.name, 'Peça'), version: FORJA_VERSION };
   if (!Array.isArray(doc.planes)) doc.planes = []; if (!Array.isArray(doc.sketches)) doc.sketches = []; if (!Array.isArray(doc.features)) doc.features = [];
   doc.planes = doc.planes.filter((p) => p && typeof p.id === 'string' && isV3(p.origin) && isV3(p.u) && isV3(p.v))
-    .map((p) => ({ id: p.id, name: str(p.name, 'Plano'), origin: p.origin, u: p.u, v: p.v, kind: p.kind === 'face' ? 'face' : 'base', body: id(p.body) }));
+    .map((p) => ({ id: p.id, name: str(p.name, 'Plano'), origin: p.origin, u: p.u, v: p.v, kind: p.kind === 'face' ? 'face' : p.kind === 'offset' ? 'offset' : 'base', body: id(p.body) }));
   doc.sketches = doc.sketches.filter((s) => s && typeof s.id === 'string' && typeof s.plane === 'string').map((s) => ({ ...s, name: str(s.name, 'Esboço'), points: Array.isArray(s.points) ? s.points : [], entities: Array.isArray(s.entities) ? s.entities : [], constraints: Array.isArray(s.constraints) ? s.constraints : [], dimensions: Array.isArray(s.dimensions) ? s.dimensions : [] }));
   const features: Feature[] = [];
+  const pattern = (v: unknown): PatternSpec | undefined => {
+    const q = v as Partial<{ kind: string; count: number; step: unknown; axisPoint: unknown; axisDir: unknown; angle: number }> | undefined; if (!q || typeof q !== 'object') return undefined;
+    const count = Math.max(2, Math.min(200, Math.round(num(q.count, 2))));
+    if (q.kind === 'linear' && isV3(q.step)) return { kind: 'linear', count, step: q.step };
+    if (q.kind === 'circular' && isV3(q.axisPoint) && isV3(q.axisDir)) return { kind: 'circular', count, axisPoint: q.axisPoint, axisDir: q.axisDir, angle: num(q.angle, 360) || 360 };
+    return undefined;
+  };
+  const faceRef = (v: unknown): FaceRef | null => { const fr = v as Partial<FaceRef> | undefined; return fr && isV3(fr.center) && isV3(fr.normal) && typeof fr.area === 'number' ? { center: fr.center, normal: fr.normal, area: fr.area } : null; };
+  const opOf = (f: Record<string, unknown>): ExtrudeOp => { let op: ExtrudeOp = f.op === 'cut' ? 'cut' : f.op === 'add' ? 'add' : 'new'; if (op !== 'new' && typeof f.target !== 'string') op = 'new'; return op; };
   for (const raw of doc.features as unknown[]) {
     const f = raw as Record<string, unknown>; if (!f || typeof f.id !== 'string') continue;
     if (f.type === 'extrude' && typeof f.sketch === 'string') {
@@ -134,7 +163,7 @@ function fromObject(d: Record<string, unknown> & { [k: string]: any }, depth: nu
       let op: ExtrudeOp = f.op === 'cut' ? 'cut' : f.op === 'add' && fileVersion >= 2 ? 'add' : 'new';
       if (op !== 'new' && typeof f.target !== 'string') op = 'new';
       const pp = f.profilePoint as unknown; const profilePoint = Array.isArray(pp) && pp.length === 2 && pp.every((x) => typeof x === 'number' && Number.isFinite(x)) ? (pp as [number, number]) : undefined;
-      features.push({ id: f.id, type: 'extrude', name: str(f.name, 'Extrusão'), sketch: f.sketch, depth: Math.abs(num(f.depth, 10)) || 10, op, target: op === 'new' ? undefined : id(f.target), symmetric: !!f.symmetric, flip: !!f.flip, throughAll: !!f.throughAll, profilePoint, visible: f.visible !== false });
+      features.push({ id: f.id, type: 'extrude', name: str(f.name, 'Extrusão'), sketch: f.sketch, depth: Math.abs(num(f.depth, 10)) || 10, op, target: op === 'new' ? undefined : id(f.target), symmetric: !!f.symmetric, flip: !!f.flip, throughAll: !!f.throughAll, profilePoint, pattern: pattern(f.pattern), visible: f.visible !== false });
     } else if (f.type === 'pushpull' && typeof f.body === 'string') {
       const fr = f.face as Partial<FaceRef> | undefined;
       if (fr && isV3(fr.center) && isV3(fr.normal) && typeof fr.area === 'number') features.push({ id: f.id, type: 'pushpull', name: str(f.name, 'Puxar face'), body: f.body, face: { center: fr.center, normal: fr.normal, area: fr.area }, distance: num(f.distance, 1) || 1 });
@@ -145,7 +174,23 @@ function fromObject(d: Record<string, unknown> & { [k: string]: any }, depth: nu
       let op: ExtrudeOp = f.op === 'cut' ? 'cut' : f.op === 'add' ? 'add' : 'new';
       if (op !== 'new' && typeof f.target !== 'string') op = 'new';
       const angle = Math.min(360, Math.abs(num(f.angle, 360))) || 360;
-      features.push({ id: f.id, type: 'revolve', name: str(f.name, 'Revolução'), sketch: f.sketch, axis, angle, op, target: op === 'new' ? undefined : id(f.target), flip: !!f.flip, visible: f.visible !== false });
+      features.push({ id: f.id, type: 'revolve', name: str(f.name, 'Revolução'), sketch: f.sketch, axis, angle, op, target: op === 'new' ? undefined : id(f.target), flip: !!f.flip, pattern: pattern(f.pattern), visible: f.visible !== false });
+    } else if (f.type === 'shell' && typeof f.body === 'string') {
+      const open = (Array.isArray(f.openFaces) ? f.openFaces : []).map(faceRef).filter((x): x is FaceRef => !!x);
+      features.push({ id: f.id, type: 'shell', name: str(f.name, 'Casca'), body: f.body, thickness: Math.abs(num(f.thickness, 2)) || 2, openFaces: open });
+    } else if (f.type === 'mirror' && typeof f.body === 'string' && isV3(f.origin) && isV3(f.normal)) {
+      features.push({ id: f.id, type: 'mirror', name: str(f.name, 'Espelho'), body: f.body, origin: f.origin, normal: f.normal, join: f.join !== false });
+    } else if (f.type === 'transform' && typeof f.body === 'string') {
+      features.push({ id: f.id, type: 'transform', name: str(f.name, 'Mover'), body: f.body, translate: isV3(f.translate) ? f.translate : [0, 0, 0], axisPoint: isV3(f.axisPoint) ? f.axisPoint : [0, 0, 0], axisDir: isV3(f.axisDir) ? f.axisDir : [0, 0, 1], angle: num(f.angle, 0), scale: num(f.scale, 1) || 1 });
+    } else if (f.type === 'split' && typeof f.body === 'string' && isV3(f.origin) && isV3(f.normal)) {
+      features.push({ id: f.id, type: 'split', name: str(f.name, 'Dividir'), body: f.body, origin: f.origin, normal: f.normal, keep: f.keep === 'front' || f.keep === 'back' ? f.keep : 'both' });
+    } else if (f.type === 'sweep' && typeof f.profile === 'string' && typeof f.path === 'string') {
+      const op = opOf(f); features.push({ id: f.id, type: 'sweep', name: str(f.name, 'Varredura'), profile: f.profile, path: f.path, op, target: op === 'new' ? undefined : id(f.target) });
+    } else if (f.type === 'loft' && Array.isArray(f.sketches)) {
+      const sk = (f.sketches as unknown[]).filter((x): x is string => typeof x === 'string'); if (sk.length < 2) continue;
+      const op = opOf(f); features.push({ id: f.id, type: 'loft', name: str(f.name, 'Loft'), sketches: sk, ruled: !!f.ruled, op, target: op === 'new' ? undefined : id(f.target) });
+    } else if (f.type === 'import' && typeof f.step === 'string' && f.step.length < 50_000_000) {
+      features.push({ id: f.id, type: 'import', name: str(f.name, 'Importado'), step: f.step });
     } else if ((f.type === 'fillet' || f.type === 'chamfer') && typeof f.body === 'string' && Array.isArray(f.edges)) {
       const edges = (f.edges as unknown[]).filter((e): e is EdgeRef => !!e && isV3((e as EdgeRef).mid) && typeof (e as EdgeRef).len === 'number').map((e) => ({ mid: e.mid, len: e.len }));
       if (edges.length) features.push({ id: f.id, type: f.type, name: str(f.name, f.type === 'fillet' ? 'Filete' : 'Chanfro'), body: f.body, edges, radius: Math.abs(num(f.radius, 1)) || 1 });
@@ -227,8 +272,9 @@ export function getSketch(doc: ForjaDocument, id: Id): Sketch {
 }
 export function findFeature(doc: ForjaDocument, id: Id): Feature | undefined { return doc.features.find((f) => f.id === id); }
 
-/** A feature cria um corpo novo? */
-export const createsBody = (f: Feature): boolean => (f.type === 'extrude' || f.type === 'revolve') && f.op === 'new';
+/** A feature cria um corpo novo (com o próprio id)? */
+export const createsBody = (f: Feature): boolean =>
+  ((f.type === 'extrude' || f.type === 'revolve' || f.type === 'sweep' || f.type === 'loft') && f.op === 'new') || f.type === 'import' || (f.type === 'mirror' && !f.join) || (f.type === 'split' && f.keep === 'both');
 
 /** Corpos existentes ao final da lista de features: cada extrusão/revolução 'new' cria um, booleanas consomem a ferramenta. */
 export function bodyIds(doc: ForjaDocument): Id[] {
@@ -249,7 +295,7 @@ export function bodyName(doc: ForjaDocument, body: Id): string {
 
 /** Features que dependem de um corpo (inclusive a que o criou). */
 export function featuresOfBody(doc: ForjaDocument, body: Id): Feature[] {
-  return doc.features.filter((f) => f.id === body || ((f.type === 'extrude' || f.type === 'revolve') && f.target === body) || (f.type === 'pushpull' && f.body === body) || ((f.type === 'fillet' || f.type === 'chamfer') && f.body === body) || (f.type === 'boolean' && (f.body === body || f.tool === body)));
+  return doc.features.filter((f) => f.id === body || ('target' in f && f.target === body) || ('body' in f && f.body === body) || ((f.type === 'fillet' || f.type === 'chamfer') && f.body === body) || (f.type === 'boolean' && (f.body === body || f.tool === body)));
 }
 
 export function addExtrude(doc: ForjaDocument, sketch: Id, depth: number, opts: Partial<Omit<ExtrudeFeature, 'id' | 'type' | 'name' | 'sketch' | 'depth'>> = {}): ExtrudeFeature {
@@ -265,6 +311,34 @@ export function addRevolve(doc: ForjaDocument, sketch: Id, axis: SketchAxis, ang
   const n = doc.features.filter((f) => f.type === 'revolve').length + 1;
   const f: RevolveFeature = { id: newId('f'), type: 'revolve', name: `Revolução ${n}`, sketch, axis, angle: Math.min(360, Math.abs(angle)) || 360, op, target: op === 'new' ? undefined : opts.target, flip: !!opts.flip, visible: true };
   doc.features.push(f); return f;
+}
+
+export function addShell(doc: ForjaDocument, body: Id, thickness: number, openFaces: FaceRef[]): ShellFeature {
+  const n = doc.features.filter((f) => f.type === 'shell').length + 1;
+  const f: ShellFeature = { id: newId('f'), type: 'shell', name: `Casca ${n}`, body, thickness: Math.abs(thickness), openFaces }; doc.features.push(f); return f;
+}
+export function addMirror(doc: ForjaDocument, body: Id, origin: V3, normal: V3, join = true): MirrorFeature {
+  const n = doc.features.filter((f) => f.type === 'mirror').length + 1;
+  const f: MirrorFeature = { id: newId('f'), type: 'mirror', name: `Espelho ${n}`, body, origin, normal, join }; doc.features.push(f); return f;
+}
+export function addTransform(doc: ForjaDocument, body: Id, t: Partial<Omit<TransformFeature, 'id' | 'type' | 'name' | 'body'>> = {}): TransformFeature {
+  const n = doc.features.filter((f) => f.type === 'transform').length + 1;
+  const f: TransformFeature = { id: newId('f'), type: 'transform', name: `Mover ${n}`, body, translate: t.translate ?? [0, 0, 0], axisPoint: t.axisPoint ?? [0, 0, 0], axisDir: t.axisDir ?? [0, 0, 1], angle: t.angle ?? 0, scale: t.scale ?? 1 }; doc.features.push(f); return f;
+}
+export function addSplit(doc: ForjaDocument, body: Id, origin: V3, normal: V3, keep: SplitFeature['keep'] = 'both'): SplitFeature {
+  const n = doc.features.filter((f) => f.type === 'split').length + 1;
+  const f: SplitFeature = { id: newId('f'), type: 'split', name: `Dividir ${n}`, body, origin, normal, keep }; doc.features.push(f); return f;
+}
+export function addSweep(doc: ForjaDocument, profile: Id, path: Id, opts: { op?: ExtrudeOp; target?: Id } = {}): SweepFeature {
+  const op = opts.op ?? 'new'; const n = doc.features.filter((f) => f.type === 'sweep').length + 1;
+  const f: SweepFeature = { id: newId('f'), type: 'sweep', name: `Varredura ${n}`, profile, path, op, target: op === 'new' ? undefined : opts.target }; doc.features.push(f); return f;
+}
+export function addLoft(doc: ForjaDocument, sketches: Id[], opts: { ruled?: boolean; op?: ExtrudeOp; target?: Id } = {}): LoftFeature {
+  const op = opts.op ?? 'new'; const n = doc.features.filter((f) => f.type === 'loft').length + 1;
+  const f: LoftFeature = { id: newId('f'), type: 'loft', name: `Loft ${n}`, sketches, ruled: !!opts.ruled, op, target: op === 'new' ? undefined : opts.target }; doc.features.push(f); return f;
+}
+export function addImport(doc: ForjaDocument, name: string, step: string): ImportFeature {
+  const f: ImportFeature = { id: newId('f'), type: 'import', name: name.slice(0, 80) || 'Importado', step }; doc.features.push(f); return f;
 }
 
 export function addPushPull(doc: ForjaDocument, body: Id, face: FaceRef, distance: number): PushPullFeature {
@@ -288,6 +362,11 @@ export function addBoolean(doc: ForjaDocument, op: BooleanFeature['op'], body: I
 
 export function addFacePlane(doc: ForjaDocument, name: string, origin: V3, u: V3, v: V3, body: Id): Plane {
   const p: Plane = { id: newId('pl'), name, origin, u, v, kind: 'face', body };
+  doc.planes.push(p); return p;
+}
+/** Plano de construção deslocado: aparece na cena e serve para esboços, lofts e cortes. */
+export function addOffsetPlane(doc: ForjaDocument, name: string, origin: V3, u: V3, v: V3): Plane {
+  const p: Plane = { id: newId('pl'), name, origin, u, v, kind: 'offset' };
   doc.planes.push(p); return p;
 }
 

@@ -30,6 +30,21 @@ Abre em `http://localhost:5173`. Para abrir no iPad na mesma rede, use o endere�
   sempre respeitando as restrições.
 - **Dedo** orbita; dois dedos aproximam. Mouse: botão esquerdo faz o que a caneta faz, direito/meio movem a câmera.
 
+## Ferramentas, comparadas ao Shapr3D
+
+Esboço: linha e arco à mão livre (reconhecimento do traço), linha, retângulo, círculo, polígono, rasgo, cotas,
+restrições automáticas (horizontal, vertical, ângulo reto, tangente, concêntrico), deslocar contorno, espelhar,
+filete 2D, construção. Faltam ainda: spline, elipse, texto, aparar, projetar arestas e padrão no esboço.
+
+Sólidos: extrudar (novo, adicionar, cortar, por região, com padrão linear ou circular), puxar/empurrar face,
+revolução, varredura, loft, filete, chanfro, casca, espelho, mover/girar/escalar, dividir por plano, união,
+subtração, interseção, plano de construção deslocado, medir, vista em corte, importar STEP. Faltam: substituir
+face, ângulo de saída (draft), rosca, análise de superfície e materiais visuais.
+
+Montagem: peças embutidas, juntas por faces (rígida, pino, deslizante, cilíndrica), lista de materiais,
+animação pelas juntas, vídeo, interferências. Desenho: vistas com ocultas, cotas, balões, lista, PDF e DXF.
+Exportação: STEP, IGES, STL, OBJ, GLB. Faltam: Parasolid, 3MF, USDZ, cortes e detalhes no desenho.
+
 ## Como usar (fluxos por botão)
 
 - Toque num plano (ou numa face plana de um corpo) para abrir um esboço. Risque com a caneta; o traço vira

@@ -243,6 +243,14 @@ export class Viewport {
     return Math.hypot(a.x + t * dx - x, a.y + t * dy - y);
   }
 
+  /** Vista em corte: plano de recorte aplicado aos corpos (null desliga). */
+  setSection(plane: THREE.Plane | null): void {
+    this.renderer.localClippingEnabled = !!plane;
+    const planes = plane ? [plane] : [];
+    for (const m of [this.bodyMaterial, this.bodySelMaterial, this.edgeMaterial, this.faceSelMaterial, this.hoverFaceMat]) { m.clippingPlanes = planes; m.needsUpdate = true; }
+    this.requestRender();
+  }
+
   /** Prévia fantasma durante um arrasto (extrusão, puxar face). */
   setGhost(geometry: THREE.BufferGeometry | null): void {
     this.ghostGroup.clear();

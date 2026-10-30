@@ -6,6 +6,7 @@ import { SketchRenderer, emptySelection, setSketchTheme, type Selection, dimEndp
 import { icons, type IconName } from './icons';
 import {
   createDocument, serialize, deserialize, getPlane, getSketch, addExtrude, addRevolve, addFillet, addBoolean, addFacePlane, pruneFacePlanes, addPushPull,
+  addShell, addMirror, addTransform, addSplit, addSweep, addLoft, addImport, addOffsetPlane, type PatternSpec, type FaceRef,
   bodyIds, bodyName, featuresOfBody, planeNormal,
   type ForjaDocument, type Plane, type Feature, type ExtrudeFeature, type RevolveFeature, type ExtrudeOp, type V3, type SketchAxis,
 } from '../core/document';
@@ -26,9 +27,10 @@ import { toDXF } from '../core/drawing/dxf';
 import { toSVG } from '../core/drawing/svg';
 import type { ProjectedView, AssemblyPayload, InterferenceHit } from '../core/kernel/occ/types';
 import { saveLocal, loadLocal, downloadFile, pickFile, safeFileName } from './storage';
-import { type Vec2, v2, dist, distPointSegment, distPointArc, closestOnSegment, sub, add, scale, norm, angleOf, normAngle, TAU, round } from '../core/geom';
+import { type Vec2, v2, dist, distPointSegment, distPointArc, closestOnSegment, sub, add, scale, norm, perp, angleOf, normAngle, TAU, round } from '../core/geom';
 
-type Tool = 'select' | 'draw' | 'line' | 'rect' | 'circle' | 'dimension' | 'erase';
+type Tool = 'select' | 'draw' | 'line' | 'rect' | 'circle' | 'polygon' | 'slot' | 'dimension' | 'erase';
+interface FormField { key: string; label: string; type: 'number' | 'text' | 'select' | 'check'; value: unknown; options?: [string, string][]; step?: number; }
 
 interface PointerInfo { id: number; type: string; x: number; y: number; startX: number; startY: number; moved: boolean; role: 'tool' | 'nav' | 'pan'; button: number; }
 interface Hit { kind: 'point' | 'entity' | 'dimension'; id: Id; d: number; }
@@ -38,6 +40,14 @@ type ViewDrag =
   | { kind: 'edge'; body: Id; index: number; created: Id | null; radius: number }
   | { kind: 'draw'; body: Id; index: number; started: boolean };
 const snapMm = (v: number) => (Math.abs(v) < 20 ? Math.round(v * 2) / 2 : Math.round(v));
+/** Família de cor de cada ícone: esboço (lilás), sólidos (laranja de aço), saídas (verde-água), vista (grafite). */
+const ICON_FAMILY: Partial<Record<IconName, 'sketch' | 'solid' | 'out' | 'view'>> = {
+  sketch: 'sketch', draw: 'sketch', line: 'sketch', rect: 'sketch', circle: 'sketch', dimension: 'sketch', erase: 'sketch', select: 'sketch', construction: 'sketch',
+  extrude: 'solid', revolve: 'solid', fillet: 'solid', chamfer: 'solid', face: 'solid', boolean: 'solid', cut: 'solid', joint: 'solid', plus: 'solid',
+  drawing: 'out', play: 'out', pause: 'out', record: 'out', collide: 'out', measure: 'out', section: 'out',
+  polygon: 'sketch', slot: 'sketch', mirror: 'sketch', offset: 'sketch', body: 'solid',
+  view: 'view', fit: 'view', touch: 'view', undo: 'view', redo: 'view', done: 'view', menu: 'view', trash: 'view', theme: 'view',
+};
 
 const H_V_SNAP_DEG = 10;
 const PERP_SNAP_DEG = 8;
@@ -89,6 +99,10 @@ export class App {
   edgeDragKind: 'fillet' | 'chamfer' = 'fillet';
   private liveTimer = 0;
   private chipEl: HTMLElement | null = null; private chipTimer = 0;
+  private polygonSides = 6;
+  private measure: { on: boolean; first: { kind: 'face' | 'edge'; body: Id; index: number } | null } = { on: false, first: null };
+  private section: { on: boolean; origin: V3; normal: V3; offset: number } = { on: false, origin: [0, 0, 0], normal: [0, -1, 0], offset: 0 };
+  private mirrorPending = false;
   // Manipulação direta no esboço
   private sketchDrag: { kind: 'line'; id: Id; a: Id; b: Id; a0: Vec2; b0: Vec2; start: Vec2 } | { kind: 'radius'; id: Id; center: Id } | { kind: 'move'; points: { id: Id; x0: number; y0: number }[]; start: Vec2 } | null = null;
 
@@ -109,9 +123,7 @@ export class App {
     this.vp.onAfterRender = () => this.placeLabels();
     this.bindPointer();
     this.bindKeys();
-    const mq = window.matchMedia?.('(prefers-color-scheme: dark)');
-    const applyTheme = () => { const dark = !!mq?.matches; this.vp.applyTheme(dark ? 'dark' : 'light'); setSketchTheme(dark ? 'dark' : 'light'); this.refreshSketch(); for (const r of this.inactiveSketches.values()) r.group.visible && this.refreshAll(false); };
-    mq?.addEventListener?.('change', applyTheme); setSketchTheme(mq?.matches ? 'dark' : 'light');
+    this.applyTheme(this.loadTheme());
     this.kernel.onState = (s) => {
       this.renderStatus();
       if (s === 'ready') { this.toast(`Kernel 3D pronto (${(this.kernel.loadMs / 1000).toFixed(1)} s).`); void this.rebuild(); }
@@ -122,16 +134,29 @@ export class App {
     window.addEventListener('beforeunload', () => this.autosave());
   }
 
+  // ---------- Aparência ----------
+  private loadTheme(): 'light' | 'dark' { try { return localStorage.getItem('forjacad.theme') === 'dark' ? 'dark' : 'light'; } catch { return 'light'; } }
+  /** Tema claro por padrão (oficina à luz do dia); o escuro é escolha explícita e fica gravado. */
+  applyTheme(name: 'light' | 'dark'): void {
+    document.documentElement.dataset.theme = name;
+    try { localStorage.setItem('forjacad.theme', name); } catch { /* ignore */ }
+    this.vp.applyTheme(name); setSketchTheme(name);
+    this.refreshSketch(); if (this.doc.current.sketches.length) this.refreshAll(false);
+  }
+  toggleTheme(): void { this.applyTheme(document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark'); }
+
   // ---------- DOM ----------
   private buildDOM(): void {
     this.root.innerHTML = '';
     const top = el('div', 'topbar');
+    const brand = el('div', 'brand'); const mark = el('span', 'mark'); const name = el('span', 'name'); name.innerHTML = 'Forja<b>CAD</b>'; brand.append(mark, name); top.append(brand);
     this.titleEl = el('input', 'title') as HTMLInputElement; this.titleEl.value = this.doc.current.name; this.titleEl.spellcheck = false;
     this.titleEl.addEventListener('change', () => { this.doc.current.name = this.titleEl.value.trim() || 'Peça'; this.autosave(); });
     top.append(this.titleEl);
     top.append(this.iconButton('undo', 'Desfazer', () => this.undo()), this.iconButton('redo', 'Refazer', () => this.redo()));
     const spacer = el('div', 'spacer'); top.append(spacer);
     this.statusEl = el('div', 'status'); top.append(this.statusEl);
+    const themeBtn = this.iconButton('theme', 'Aparência', () => this.toggleTheme()); top.append(themeBtn);
     top.append(this.button('Novo', (ev) => this.newDocument(ev)), this.button('Abrir', () => this.openFile()), this.button('Salvar', () => this.saveFile()), this.button('Exportar', (ev) => this.exportMenu(ev)));
     this.root.append(top);
     this.workspace = el('div', 'workspace'); this.root.append(this.workspace);
@@ -144,7 +169,8 @@ export class App {
   }
 
   private iconButton(icon: IconName, label: string, onClick: (ev: MouseEvent) => void, cls = 'tool'): HTMLButtonElement {
-    const b = document.createElement('button'); b.className = cls; b.innerHTML = `${icons[icon]}<span>${label}</span>`; b.title = label;
+    const fam = ICON_FAMILY[icon] ?? 'view';
+    const b = document.createElement('button'); b.className = `${cls} c-${fam}`; b.innerHTML = `${icons[icon]}<span>${label}</span>`; b.title = label;
     b.addEventListener('click', onClick); return b;
   }
   private button(label: string, onClick: (ev: MouseEvent) => void, cls = 'btn'): HTMLButtonElement {
@@ -519,8 +545,8 @@ export class App {
     this.toolbar.innerHTML = '';
     const g1 = el('div', 'group'); const g2 = el('div', 'group'); const g3 = el('div', 'group');
     if (this.mode === 'sketch') {
-      const tools: [Tool, IconName, string][] = [['select', 'select', 'Selecionar'], ['draw', 'draw', 'Caneta'], ['line', 'line', 'Linha'], ['rect', 'rect', 'Retângulo'], ['circle', 'circle', 'Círculo'], ['dimension', 'dimension', 'Cota'], ['erase', 'erase', 'Apagar']];
-      for (const [t, ic, label] of tools) { const b = this.iconButton(ic, label, () => this.setTool(t)); if (this.tool === t) b.classList.add('active'); g1.append(b); }
+      const tools: [Tool, IconName, string][] = [['select', 'select', 'Selecionar'], ['draw', 'draw', 'Caneta'], ['line', 'line', 'Linha'], ['rect', 'rect', 'Retângulo'], ['circle', 'circle', 'Círculo'], ['polygon', 'polygon', 'Polígono'], ['slot', 'slot', 'Rasgo'], ['dimension', 'dimension', 'Cota'], ['erase', 'erase', 'Apagar']];
+      for (const [t, ic, label] of tools) { const b = this.iconButton(ic, label, () => { if (t === 'polygon' && this.tool !== 'polygon') this.valuePopover(this.vp.width / 2, 80, this.polygonSides, 'lados', (v) => { this.polygonSides = Math.max(3, Math.min(24, Math.round(v))); this.setTool('polygon'); }); else this.setTool(t); }); if (this.tool === t) b.classList.add('active'); g1.append(b); }
       const touch = this.iconButton('touch', 'Dedo desenha', () => { this.touchDraws = !this.touchDraws; this.renderToolbar(); }); if (this.touchDraws) touch.classList.add('active'); g2.append(touch);
       const persp = this.iconButton('view', this.vp.sketchPerspective ? 'Vista reta' : 'Vista 3D', () => { this.vp.setSketchPerspective(!this.vp.sketchPerspective); this.refreshSketch(); this.renderToolbar(); if (!this.vp.sketchPerspective) this.vp.fitAll(); }); if (this.vp.sketchPerspective) persp.classList.add('active'); g2.append(persp);
       g2.append(this.iconButton('fit', 'Enquadrar', () => this.vp.fitAll()));
@@ -546,6 +572,9 @@ export class App {
       const cha = this.iconButton('chamfer', 'Chanfro', () => (hasEdges ? this.filletSelected('chamfer') : this.setEdgeKind('chamfer'))); if (this.edgeDragKind === 'chamfer') cha.classList.add('active'); g1.append(cha);
       if (this.sel3d.face && this.faceIsPlanar(this.sel3d.face)) g1.append(this.iconButton('face', 'Esboçar na face', () => this.createSketchOnFace(this.sel3d.face!.body, this.sel3d.face!.index)));
       if (this.sel3d.body && bodyIds(this.doc.current).length > 1) g1.append(this.iconButton('boolean', 'Combinar', (ev) => this.booleanMenu(ev)));
+      g1.append(this.iconButton('body', 'Corpo', (ev) => this.bodyMenu(ev)));
+      const mb = this.iconButton('measure', 'Medir', () => this.toggleMeasure()); if (this.measure.on) mb.classList.add('active'); g2.append(mb);
+      const sb = this.iconButton('section', 'Corte', () => this.toggleSection()); if (this.section.on) sb.classList.add('active'); g2.append(sb);
       g2.append(this.iconButton('drawing', 'Desenho', () => void this.drawingDialog()));
       g2.append(this.iconButton('view', 'Vistas', (ev) => this.viewMenu(ev)));
       g2.append(this.iconButton('fit', 'Enquadrar', () => this.vp.fitAll()));
@@ -585,6 +614,11 @@ export class App {
         if (this.sel.entities.size) row.append(this.button('Construção', () => this.toggleConstruction()));
         row.append(this.button('Apagar', () => this.deleteSelection(), 'btn danger'));
         p.append(row);
+        const row2 = el('div', 'row'); row2.style.flexWrap = 'wrap';
+        if (this.sel.entities.size === 1) row2.append(this.button('Deslocar contorno…', (ev) => this.offsetContourMenu(ev)));
+        if (this.sel.entities.size) row2.append(this.button(this.mirrorPending ? 'Toque na linha-espelho…' : 'Espelhar…', () => this.startMirrorSketch()));
+        if (this.filletCornerCandidate()) row2.append(this.button('Filete 2D…', () => this.fillet2D()));
+        p.append(row2);
       }
       if (s.constraints.length) {
         p.append(h3(`Restrições (${s.constraints.length})`));
@@ -602,6 +636,7 @@ export class App {
     if (this.isAssembly) { this.renderAssemblyPanel(p); return; }
 
     // ----- Modo vista -----
+    this.renderSectionPanel(p);
     this.renderSelectionPanel(p);
     if (!this.sel3d.body && !this.sel3d.face && !this.sel3d.edges.length && this.bodies.length) {
       const d = el('div', 'hint'); d.textContent = 'Caneta: risque numa face para esboçar nela. Arraste uma região sombreada do esboço para extrudar (para fora adiciona, para dentro corta). Toque numa face e arraste a seta laranja para puxar ou empurrar. Arraste uma aresta para filete ou chanfro.'; p.append(d);
@@ -694,6 +729,7 @@ export class App {
       checkRow('Simétrico ao plano', !!f.symmetric, (v) => edit(() => { f.symmetric = v; }));
       checkRow('Inverter sentido', !!f.flip, (v) => edit(() => { f.flip = v; }));
       if (f.op === 'cut') checkRow('Atravessar tudo', !!f.throughAll, (v) => edit(() => { f.throughAll = v; }));
+      this.renderPatternRows(p, f, edit);
       const row3 = el('div', 'row');
       row3.append(this.button('Editar esboço', () => this.enterSketch(f.sketch)));
       row3.append(this.button('Apagar', () => this.deleteFeature(f), 'btn danger'));
@@ -708,10 +744,37 @@ export class App {
       selectRow('Operação', opOptions, f.op, (v) => edit(() => { f.op = v as ExtrudeOp; if (f.op === 'new') f.target = undefined; else if (!f.target || !others.includes(f.target)) f.target = others[0]; }));
       if (f.op !== 'new' && others.length > 1) selectRow('Corpo alvo', others.map((id) => [id, bodyName(doc, id)]), f.target ?? others[0], (v) => edit(() => { f.target = v; }));
       checkRow('Sentido contrário', !!f.flip, (v) => edit(() => { f.flip = v; }));
+      this.renderPatternRows(p, f, edit);
       const row3 = el('div', 'row');
       row3.append(this.button('Editar esboço', () => this.enterSketch(f.sketch)));
       row3.append(this.button('Apagar', () => this.deleteFeature(f), 'btn danger'));
       p.append(row3);
+    } else if (f.type === 'shell') {
+      numRow('Espessura (mm)', f.thickness, (v) => edit(() => { f.thickness = v; }));
+      const d = el('div', 'hint'); d.textContent = f.openFaces.length ? `${f.openFaces.length} face${f.openFaces.length > 1 ? 's' : ''} aberta${f.openFaces.length > 1 ? 's' : ''}.` : 'Corpo oco fechado.'; p.append(d);
+      const row = el('div', 'row'); row.append(this.button('Apagar', () => this.deleteFeature(f), 'btn danger')); p.append(row);
+    } else if (f.type === 'mirror') {
+      checkRow('Fundir com o original', f.join, (v) => edit(() => { f.join = v; }));
+      const row = el('div', 'row'); row.append(this.button('Apagar', () => this.deleteFeature(f), 'btn danger')); p.append(row);
+    } else if (f.type === 'transform') {
+      (['X', 'Y', 'Z'] as const).forEach((ax, i) => { const row = el('div', 'row'); const lab = document.createElement('label'); lab.textContent = `Mover ${ax} (mm)`; const inp = document.createElement('input'); inp.type = 'number'; inp.step = '1'; inp.value = String(f.translate[i]); inp.addEventListener('change', () => { const v = parseFloat(inp.value.replace(',', '.')); if (isFinite(v)) edit(() => { f.translate[i] = v; }); }); row.append(lab, inp); p.append(row); });
+      const rr = el('div', 'row'); const rl = document.createElement('label'); rl.textContent = 'Girar (°)'; const ri = document.createElement('input'); ri.type = 'number'; ri.step = '5'; ri.value = String(f.angle); ri.addEventListener('change', () => { const v = parseFloat(ri.value.replace(',', '.')); if (isFinite(v)) edit(() => { f.angle = v; }); }); rr.append(rl, ri); p.append(rr);
+      selectRow('Eixo do giro', [['x', 'X'], ['y', 'Y'], ['z', 'Z']], f.axisDir[0] ? 'x' : f.axisDir[1] ? 'y' : 'z', (v) => edit(() => { f.axisDir = v === 'x' ? [1, 0, 0] : v === 'y' ? [0, 1, 0] : [0, 0, 1]; }));
+      numRow('Escala (×)', f.scale, (v) => edit(() => { f.scale = v; }));
+      const row = el('div', 'row'); row.append(this.button('Apagar', () => this.deleteFeature(f), 'btn danger')); p.append(row);
+    } else if (f.type === 'split') {
+      selectRow('Manter', [['both', 'Os dois lados'], ['front', 'Lado da normal'], ['back', 'Lado oposto']], f.keep, (v) => edit(() => { f.keep = v as typeof f.keep; }));
+      const row = el('div', 'row'); row.append(this.button('Apagar', () => this.deleteFeature(f), 'btn danger')); p.append(row);
+    } else if (f.type === 'sweep' || f.type === 'loft') {
+      const others = bodyIds(doc).filter((id) => id !== f.id);
+      const opOptions: [string, string][] = [['new', 'Novo corpo']]; if (others.length) opOptions.push(['add', 'Adicionar a corpo'], ['cut', 'Cortar corpo']);
+      selectRow('Operação', opOptions, f.op, (v) => edit(() => { f.op = v as ExtrudeOp; if (f.op === 'new') f.target = undefined; else if (!f.target || !others.includes(f.target)) f.target = others[0]; }));
+      if (f.type === 'loft') checkRow('Faces retas (regrado)', f.ruled, (v) => edit(() => { f.ruled = v; }));
+      const d = el('div', 'hint'); d.textContent = f.type === 'sweep' ? `Perfil ${getSketch(doc, f.profile).name} ao longo de ${getSketch(doc, f.path).name}.` : `${f.sketches.length} esboços.`; p.append(d);
+      const row = el('div', 'row'); row.append(this.button('Apagar', () => this.deleteFeature(f), 'btn danger')); p.append(row);
+    } else if (f.type === 'import') {
+      const d = el('div', 'hint'); d.textContent = `STEP com ${(f.step.length / 1024).toFixed(0)} KB embutido no documento.`; p.append(d);
+      const row = el('div', 'row'); row.append(this.button('Apagar', () => this.deleteFeature(f), 'btn danger')); p.append(row);
     } else if (f.type === 'pushpull') {
       const row = el('div', 'row'); const lab = document.createElement('label'); lab.textContent = 'Distância (mm, − empurra)';
       const inp = document.createElement('input'); inp.type = 'number'; inp.step = '0.5'; inp.value = String(f.distance); inp.inputMode = 'decimal';
@@ -1138,6 +1201,12 @@ export class App {
   private tapView(info: PointerInfo): void {
     if (this.mode !== 'view') return;
     const faceHit = this.vp.pickFace(info.x, info.y);
+    if (this.measure.on && !this.isAssembly) {
+      const eh = this.vp.pickEdge(info.x, info.y, info.type === 'touch' ? 18 : 12, faceHit);
+      if (eh) { this.measureTap({ kind: 'edge', body: eh.body, index: eh.index }, info.x, info.y); return; }
+      if (faceHit && faceHit.index >= 0) { this.measureTap({ kind: 'face', body: faceHit.body, index: faceHit.index }, info.x, info.y); return; }
+      return;
+    }
     if (this.isAssembly) {
       if (faceHit && faceHit.index >= 0) { this.tapAssemblyFace(faceHit.body, faceHit.index, info.x, info.y); return; }
       if (this.jointFlow) return;
@@ -1201,7 +1270,7 @@ export class App {
         }
         this.stroke = [uv]; this.sk.setStroke(this.plane, this.stroke); this.vp.requestRender(); break;
       }
-      case 'line': case 'rect': case 'circle': {
+      case 'line': case 'rect': case 'circle': case 'polygon': case 'slot': {
         this.pushUndo(); this.previewSketchBackup = M.cloneSketch(s);
         this.toolStart = { uv }; break;
       }
@@ -1230,7 +1299,7 @@ export class App {
         if (this.stroke.length) { this.stroke.push(uv); this.sk.setStroke(this.plane, this.stroke); this.vp.requestRender(); }
         break;
       }
-      case 'line': case 'rect': case 'circle': {
+      case 'line': case 'rect': case 'circle': case 'polygon': case 'slot': {
         if (!this.toolStart || !this.previewSketchBackup) return;
         Object.assign(s, M.cloneSketch(this.previewSketchBackup));
         this.buildShape(s, this.toolStart.uv, uv, this.tolMm(info.type), true);
@@ -1258,6 +1327,7 @@ export class App {
         if (!info.moved || pts.length < 2) {
           // Toque: seleciona o que estiver embaixo e mostra a medida para editar; em vazio, limpa.
           const hit = this.hitTest(uv, tol, s);
+          if (this.mirrorPending) { this.mirrorPending = false; if (hit?.kind === 'entity') this.mirrorSketchAbout(hit.id); else this.toast('Espelho cancelado.'); this.renderSidePanel(); return; }
           if (!hit) { this.sel = emptySelection(); this.refreshAll(false); return; }
           this.sel = emptySelection(); if (hit.kind === 'point') this.sel.points.add(hit.id); else this.sel.entities.add(hit.id);
           this.refreshAll(false);
@@ -1273,7 +1343,7 @@ export class App {
         this.insertPrimitives(prims, tol);
         break;
       }
-      case 'line': case 'rect': case 'circle': {
+      case 'line': case 'rect': case 'circle': case 'polygon': case 'slot': {
         if (!this.toolStart || !this.previewSketchBackup) return;
         Object.assign(s, M.cloneSketch(this.previewSketchBackup));
         if (!cancelled && info.moved) { this.buildShape(s, this.toolStart.uv, uv, tol, false); this.solve(); }
@@ -1317,11 +1387,35 @@ export class App {
       const r = dist(a, b); if (r < tol * 0.5) return;
       const c = preview ? M.addPoint(s, a.x, a.y).id : this.snapPoint(s, a, tol).id;
       M.addCircle(s, c, r);
+    } else if (this.tool === 'polygon') {
+      // Polígono regular: vértices numa circunferência de construção, lados iguais.
+      const r = dist(a, b); if (r < tol * 0.5) return; const n = this.polygonSides; const a0 = angleOf(sub(b, a));
+      const pts: Id[] = []; for (let i = 0; i < n; i++) { const t = a0 + (i / n) * TAU; pts.push(M.addPoint(s, a.x + r * Math.cos(t), a.y + r * Math.sin(t)).id); }
+      const lines: Id[] = []; for (let i = 0; i < n; i++) lines.push(M.addLine(s, pts[i], pts[(i + 1) % n]).id);
+      if (!preview) {
+        const c = this.snapPoint(s, a, tol).id; const circ = M.addCircle(s, c, r); circ.construction = true;
+        for (const pid of pts) M.addConstraint(s, 'pointOnCircle', [pid, circ.id]);
+        for (let i = 1; i < n; i++) M.addConstraint(s, 'equal', [lines[0], lines[i]]);
+      }
+    } else if (this.tool === 'slot') {
+      // Rasgo (oblongo) entre dois centros; largura = um terço do comprimento, ajustável pela cota do raio.
+      const L = dist(a, b); if (L < tol) return; const d = norm(sub(b, a)); const nrm = perp(d); const r = Math.max(tol, L / 6);
+      const p1 = M.addPoint(s, a.x + nrm.x * r, a.y + nrm.y * r), p2 = M.addPoint(s, b.x + nrm.x * r, b.y + nrm.y * r), p3 = M.addPoint(s, b.x - nrm.x * r, b.y - nrm.y * r), p4 = M.addPoint(s, a.x - nrm.x * r, a.y - nrm.y * r);
+      const ca = preview ? M.addPoint(s, a.x, a.y) : M.getPoint(s, this.snapPoint(s, a, tol).id), cb = preview ? M.addPoint(s, b.x, b.y) : M.getPoint(s, this.snapPoint(s, b, tol).id);
+      const l1 = M.addLine(s, p1.id, p2.id), l2 = M.addLine(s, p3.id, p4.id);
+      const arcB = M.addArc(s, cb.id, p3.id, p2.id, r), arcA = M.addArc(s, ca.id, p1.id, p4.id, r);
+      if (!preview) {
+        for (const [l, arc] of [[l1, arcA], [l1, arcB], [l2, arcA], [l2, arcB]] as const) M.addConstraint(s, 'tangent', [l.id, arc.id]);
+        M.addConstraint(s, 'equal', [arcA.id, arcB.id]);
+        const ang = Math.abs(((angleOf(d) * 180) / Math.PI) % 180); const dev = Math.min(ang, 180 - ang);
+        if (dev < H_V_SNAP_DEG) { M.addConstraint(s, 'horizontal', [l1.id]); M.addConstraint(s, 'horizontal', [l2.id]); } else if (Math.abs(dev - 90) < H_V_SNAP_DEG) { M.addConstraint(s, 'vertical', [l1.id]); M.addConstraint(s, 'vertical', [l2.id]); }
+      }
     }
   }
 
   private tapSelect(uv: Vec2, tol: number, s: Sketch): void {
     const hit = this.hitTest(uv, tol, s);
+    if (this.mirrorPending) { this.mirrorPending = false; if (hit?.kind === 'entity') this.mirrorSketchAbout(hit.id); else this.toast('Espelho cancelado.'); this.renderSidePanel(); return; }
     if (!hit) { this.sel = emptySelection(); this.refreshAll(false); return; }
     const set = hit.kind === 'point' ? this.sel.points : this.sel.entities;
     if (set.has(hit.id)) set.delete(hit.id); else set.add(hit.id);
@@ -1590,6 +1684,254 @@ export class App {
     void this.tryFeature(() => addBoolean(this.doc.current, op, body, tool), (f) => { this.selectedFeature = f.id; this.sel3d = emptySel3D(); this.sel3d.body = body; this.vp.setSelection(this.sel3d); this.updateFaceHandle(); this.renderSidePanel(); this.renderToolbar(); });
   }
 
+  // ---------- Ferramentas de corpo (casca, espelho, padrão, mover, dividir, varredura, loft, plano, importar) ----------
+  private bodyMenu(ev: MouseEvent): void {
+    const doc = this.doc.current; const hasBody = !!this.sel3d.body; const sf = this.selectedFeatureObj();
+    const items: { label: string; action: () => void }[] = [];
+    if (hasBody) {
+      items.push({ label: 'Casca (esvaziar)…', action: () => this.shellSelected() }, { label: 'Espelhar…', action: () => this.mirrorSelected() }, { label: 'Mover, girar, escalar…', action: () => this.transformSelected() }, { label: 'Dividir por plano…', action: () => this.splitSelected() });
+    }
+    if (sf && (sf.type === 'extrude' || sf.type === 'revolve')) items.push({ label: `Padrão de ${sf.name}…`, action: () => this.patternSelected(sf) });
+    if (this.sel3d.face && this.faceIsPlanar(this.sel3d.face)) items.push({ label: 'Plano deslocado desta face…', action: () => this.offsetPlaneFromFace() });
+    if (doc.sketches.length >= 1) items.push({ label: 'Varredura (perfil + caminho)…', action: () => this.sweepDialog() });
+    if (doc.sketches.length >= 2) items.push({ label: 'Loft entre esboços…', action: () => this.loftDialog() });
+    items.push({ label: 'Importar STEP…', action: () => void this.importStep() });
+    if (!hasBody) items.unshift({ label: 'Toque num corpo para casca, espelho, mover e dividir', action: () => {} });
+    this.menu(ev.clientX, ev.clientY, items);
+  }
+  private selectedFeatureObj(): Feature | undefined { return this.doc.current.features.find((f) => f.id === this.selectedFeature); }
+  private faceRefOf(ref: { body: Id; index: number } | null): FaceRef | null { const fd = ref ? this.bodyOf(ref.body)?.faces[ref.index] : undefined; return fd?.type === 'plane' && fd.normal ? { center: fd.center, normal: fd.normal, area: fd.area } : null; }
+  /** Plano escolhido num diálogo: face plana selecionada ou um dos planos do mundo, com deslocamento. */
+  private planeChoices(): [string, string][] { const out: [string, string][] = []; if (this.faceRefOf(this.sel3d.face)) out.push(['face', 'Face selecionada']); out.push(['xy', 'Plano XY (frente)'], ['xz', 'Plano XZ (topo)'], ['yz', 'Plano YZ (lateral)']); return out; }
+  private planeFromChoice(choice: string, offset: number): { origin: V3; normal: V3 } {
+    const fr = choice === 'face' ? this.faceRefOf(this.sel3d.face) : null;
+    const n: V3 = fr ? fr.normal : choice === 'xy' ? [0, 0, 1] : choice === 'xz' ? [0, 1, 0] : [1, 0, 0];
+    const c: V3 = fr ? fr.center : this.bodiesCenter();
+    const o: V3 = fr ? fr.center : [choice === 'yz' ? 0 : c[0], choice === 'xz' ? 0 : c[1], choice === 'xy' ? 0 : c[2]];
+    return { origin: [o[0] + n[0] * offset, o[1] + n[1] * offset, o[2] + n[2] * offset], normal: n };
+  }
+  private bodiesCenter(): V3 {
+    const bs = this.bodies; if (!bs.length) return [0, 0, 0];
+    const mn: V3 = [Infinity, Infinity, Infinity], mx: V3 = [-Infinity, -Infinity, -Infinity];
+    for (const b of bs) for (let i = 0; i < 3; i++) { mn[i] = Math.min(mn[i], b.bbox[0][i]); mx[i] = Math.max(mx[i], b.bbox[1][i]); }
+    return [(mn[0] + mx[0]) / 2, (mn[1] + mx[1]) / 2, (mn[2] + mx[2]) / 2];
+  }
+
+  /** Diálogo genérico de campos, no mesmo estilo dos demais. */
+  private formDialog(title: string, fields: FormField[], okLabel: string, onOk: (v: Record<string, unknown>) => void, hint?: string): void {
+    const back = el('div', 'dialog-backdrop'); const d = el('div', 'dialog');
+    const hh = document.createElement('h2'); hh.textContent = title; d.append(hh);
+    if (hint) { const h = el('div', 'hint'); h.textContent = hint; d.append(h); }
+    const values: Record<string, unknown> = {}; const inputs: HTMLElement[] = [];
+    for (const f of fields) {
+      values[f.key] = f.value;
+      const row = el('div', 'row'); const lab = document.createElement('label'); lab.textContent = f.label; row.append(lab);
+      if (f.type === 'select') { const sel = document.createElement('select'); for (const [v, t] of f.options ?? []) { const o = document.createElement('option'); o.value = v; o.textContent = t; sel.append(o); } sel.value = String(f.value); sel.addEventListener('change', () => { values[f.key] = sel.value; }); row.append(sel); inputs.push(sel); }
+      else if (f.type === 'check') { const c = document.createElement('input'); c.type = 'checkbox'; c.checked = !!f.value; c.addEventListener('change', () => { values[f.key] = c.checked; }); row.append(c); }
+      else { const inp = document.createElement('input'); inp.type = 'text'; inp.inputMode = f.type === 'number' ? 'decimal' : 'text'; inp.value = f.type === 'number' ? String(f.value).replace('.', ',') : String(f.value ?? ''); inp.addEventListener('input', () => { values[f.key] = f.type === 'number' ? parseFloat(inp.value.replace(',', '.')) : inp.value; }); inp.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') ok(); if (ev.key === 'Escape') back.remove(); }); row.append(inp); inputs.push(inp); }
+      d.append(row);
+    }
+    const acts = el('div', 'actions');
+    const ok = () => { for (const f of fields) if (f.type === 'number' && !Number.isFinite(values[f.key] as number)) { this.toast(`Valor inválido em "${f.label}".`, 'err'); return; } back.remove(); onOk(values); };
+    acts.append(this.button('Cancelar', () => back.remove()), this.button(okLabel, ok, 'btn primary')); d.append(acts);
+    back.append(d); this.overlay.append(back);
+    setTimeout(() => { const first = inputs[0] as HTMLInputElement | undefined; first?.focus?.(); first?.select?.(); }, 30);
+  }
+
+  private shellSelected(): void {
+    const body = this.sel3d.body; if (!body) return; const open = this.faceRefOf(this.sel3d.face);
+    this.formDialog('Casca', [{ key: 't', label: 'Espessura da parede (mm)', type: 'number', value: 2 }], 'Esvaziar', (v) => {
+      void this.tryFeature(() => addShell(this.doc.current, body, Math.abs(v.t as number), open ? [open] : []), (f) => { this.selectedFeature = f.id; this.renderSidePanel(); });
+    }, open ? 'A face selecionada fica aberta.' : 'Sem face selecionada o corpo fica oco e fechado. Selecione uma face antes para deixá-la aberta.');
+  }
+  private mirrorSelected(): void {
+    const body = this.sel3d.body; if (!body) return; const choices = this.planeChoices();
+    this.formDialog('Espelhar', [{ key: 'plane', label: 'Plano de espelho', type: 'select', value: choices[0][0], options: choices }, { key: 'off', label: 'Deslocamento do plano (mm)', type: 'number', value: 0 }, { key: 'join', label: 'Fundir com o original', type: 'check', value: true }], 'Espelhar', (v) => {
+      const pl = this.planeFromChoice(v.plane as string, v.off as number);
+      void this.tryFeature(() => addMirror(this.doc.current, body, pl.origin, pl.normal, !!v.join), (f) => { this.selectedFeature = f.id; this.renderSidePanel(); this.vp.fitAll(); });
+    });
+  }
+  private transformSelected(): void {
+    const body = this.sel3d.body; if (!body) return;
+    this.formDialog('Mover, girar, escalar', [
+      { key: 'x', label: 'Mover X (mm)', type: 'number', value: 0 }, { key: 'y', label: 'Mover Y (mm)', type: 'number', value: 0 }, { key: 'z', label: 'Mover Z (mm)', type: 'number', value: 0 },
+      { key: 'axis', label: 'Eixo do giro', type: 'select', value: 'z', options: [['x', 'X'], ['y', 'Y'], ['z', 'Z']] }, { key: 'ang', label: 'Girar (°)', type: 'number', value: 0 }, { key: 'sc', label: 'Escala (×)', type: 'number', value: 1 },
+    ], 'Aplicar', (v) => {
+      const c = this.bodiesCenter();
+      void this.tryFeature(() => addTransform(this.doc.current, body, { translate: [v.x as number, v.y as number, v.z as number], axisPoint: c, axisDir: v.axis === 'x' ? [1, 0, 0] : v.axis === 'y' ? [0, 1, 0] : [0, 0, 1], angle: v.ang as number, scale: (v.sc as number) || 1 }), (f) => { this.selectedFeature = f.id; this.renderSidePanel(); this.vp.fitAll(); });
+    });
+  }
+  private splitSelected(): void {
+    const body = this.sel3d.body; if (!body) return; const choices = this.planeChoices();
+    this.formDialog('Dividir por plano', [{ key: 'plane', label: 'Plano de corte', type: 'select', value: choices[0][0], options: choices }, { key: 'off', label: 'Deslocamento (mm)', type: 'number', value: 0 }, { key: 'keep', label: 'Manter', type: 'select', value: 'both', options: [['both', 'Os dois lados'], ['front', 'Lado da normal'], ['back', 'Lado oposto']] }], 'Dividir', (v) => {
+      const pl = this.planeFromChoice(v.plane as string, v.off as number);
+      void this.tryFeature(() => addSplit(this.doc.current, body, pl.origin, pl.normal, v.keep as 'both' | 'front' | 'back'), (f) => { this.selectedFeature = f.id; this.renderSidePanel(); });
+    });
+  }
+  private patternSelected(f: ExtrudeFeature | RevolveFeature): void {
+    const cyl = this.sel3d.face ? this.bodyOf(this.sel3d.face.body)?.faces[this.sel3d.face.index] : undefined; const hasCyl = cyl?.type === 'cylinder' && !!cyl.axisDir;
+    this.formDialog(`Padrão de ${f.name}`, [
+      { key: 'kind', label: 'Tipo', type: 'select', value: 'linear', options: [['linear', 'Em linha'], ['circular', 'Em volta de um eixo']] },
+      { key: 'count', label: 'Quantidade', type: 'number', value: 3 },
+      { key: 'dx', label: 'Passo X (mm)', type: 'number', value: 20 }, { key: 'dy', label: 'Passo Y (mm)', type: 'number', value: 0 }, { key: 'dz', label: 'Passo Z (mm)', type: 'number', value: 0 },
+      { key: 'axis', label: 'Eixo (circular)', type: 'select', value: hasCyl ? 'face' : 'z', options: [...(hasCyl ? [['face', 'Eixo da face cilíndrica selecionada'] as [string, string]] : []), ['x', 'X pelo centro'], ['y', 'Y pelo centro'], ['z', 'Z pelo centro']] },
+      { key: 'ang', label: 'Ângulo total (°)', type: 'number', value: 360 },
+    ], 'Repetir', (v) => {
+      const count = Math.max(2, Math.round(v.count as number)); const c = this.bodiesCenter();
+      const spec: PatternSpec = v.kind === 'linear' ? { kind: 'linear', count, step: [v.dx as number, v.dy as number, v.dz as number] }
+        : { kind: 'circular', count, angle: v.ang as number, axisPoint: v.axis === 'face' && cyl ? cyl.axisOrigin! : c, axisDir: v.axis === 'face' && cyl ? cyl.axisDir! : v.axis === 'x' ? [1, 0, 0] : v.axis === 'y' ? [0, 1, 0] : [0, 0, 1] };
+      void this.tryFeature(() => { f.pattern = spec; return f; }, () => this.renderSidePanel());
+    });
+  }
+  private offsetPlaneFromFace(): void {
+    const fr = this.faceRefOf(this.sel3d.face); const fd = this.sel3d.face ? this.bodyOf(this.sel3d.face.body)?.faces[this.sel3d.face.index] : undefined; if (!fr || !fd?.u || !fd.v) return;
+    this.valuePopover(this.vp.width / 2, this.vp.height / 2, 10, 'mm', (d) => {
+      this.pushUndo(); const n = fr.normal; const doc = this.doc.current; const k = doc.planes.filter((p) => p.kind === 'offset').length + 1;
+      let u = fd.u!, v = fd.v!; if (v3dot(v3cross(u, v), n) < 0) v = v3neg(v);
+      addOffsetPlane(doc, `Plano ${k} (+${fmtDim('distance', d)} mm)`, [fr.center[0] + n[0] * d, fr.center[1] + n[1] * d, fr.center[2] + n[2] * d], u, v);
+      this.refreshAll(); this.toast('Plano criado. Ele aparece em "Esboço".');
+    });
+  }
+  private sweepDialog(): void {
+    const doc = this.doc.current; const sk: [string, string][] = doc.sketches.map((s) => [s.id, s.name]); const bodies = bodyIds(doc);
+    const ops: [string, string][] = [['new', 'Novo corpo']]; if (bodies.length) ops.push(['add', 'Adicionar'], ['cut', 'Cortar']);
+    this.formDialog('Varredura', [{ key: 'profile', label: 'Perfil (esboço fechado)', type: 'select', value: sk[0][0], options: sk }, { key: 'path', label: 'Caminho (esboço aberto)', type: 'select', value: sk[sk.length - 1][0], options: sk }, { key: 'op', label: 'Operação', type: 'select', value: 'new', options: ops }], 'Varrer', (v) => {
+      void this.tryFeature(() => addSweep(doc, v.profile as string, v.path as string, { op: v.op as ExtrudeOp, target: bodies[0] }), (f) => { this.selectedFeature = f.id; this.renderSidePanel(); this.vp.fitAll(); });
+    }, 'O perfil precisa estar no começo do caminho. Dica: desenhe o caminho num plano perpendicular ao do perfil.');
+  }
+  private loftDialog(): void {
+    const doc = this.doc.current; const bodies = bodyIds(doc);
+    const fields: FormField[] = doc.sketches.map((s) => ({ key: `s:${s.id}`, label: s.name, type: 'check' as const, value: true }));
+    const ops: [string, string][] = [['new', 'Novo corpo']]; if (bodies.length) ops.push(['add', 'Adicionar'], ['cut', 'Cortar']);
+    fields.push({ key: 'ruled', label: 'Faces retas (regrado)', type: 'check', value: false }, { key: 'op', label: 'Operação', type: 'select', value: 'new', options: ops });
+    this.formDialog('Loft', fields, 'Criar loft', (v) => {
+      const ids = doc.sketches.filter((s) => v[`s:${s.id}`]).map((s) => s.id); if (ids.length < 2) return this.toast('Escolha dois esboços ou mais.', 'err');
+      void this.tryFeature(() => addLoft(doc, ids, { ruled: !!v.ruled, op: v.op as ExtrudeOp, target: bodies[0] }), (f) => { this.selectedFeature = f.id; this.renderSidePanel(); this.vp.fitAll(); });
+    }, 'Marque os esboços na ordem em que foram criados; cada um entra com seu primeiro perfil fechado.');
+  }
+  async importStep(): Promise<void> {
+    const f = await pickFile('.step,.stp,.STEP,.STP'); if (!f) return;
+    if (!/ISO-10303-21/.test(f.text.slice(0, 200))) return this.toast('Esse arquivo não parece um STEP.', 'err');
+    const name = f.name.replace(/\.(step|stp)$/i, '');
+    await this.tryFeature(() => addImport(this.doc.current, name, f.text), (feat) => { this.selectedFeature = feat.id; this.renderSidePanel(); this.vp.fitAll(); this.toast(`"${name}" importado.`); });
+  }
+  private renderPatternRows(p: HTMLElement, f: ExtrudeFeature | RevolveFeature, edit: (mut: () => void) => void): void {
+    if (!f.pattern) return;
+    const row = el('div', 'row'); const lab = document.createElement('label'); lab.textContent = f.pattern.kind === 'linear' ? 'Padrão em linha' : 'Padrão circular';
+    const inp = document.createElement('input'); inp.type = 'number'; inp.step = '1'; inp.value = String(f.pattern.count); inp.title = 'Quantidade';
+    inp.addEventListener('change', () => { const v = Math.round(parseFloat(inp.value)); if (v >= 2) edit(() => { f.pattern!.count = v; }); });
+    row.append(lab, inp); p.append(row);
+    const r2 = el('div', 'row'); r2.append(this.button('Remover padrão', () => edit(() => { delete f.pattern; }), 'btn danger')); p.append(r2);
+  }
+
+  // ---------- Medir e vista em corte ----------
+  private toggleMeasure(): void { this.measure.on = !this.measure.on; this.measure.first = null; this.renderToolbar(); this.toast(this.measure.on ? 'Medir: toque numa face ou aresta, depois em outra.' : 'Medição desligada.'); }
+  /** Em modo medir: um toque mostra a medida do elemento; o segundo mostra a distância entre os dois. */
+  private measureTap(hit: { kind: 'face' | 'edge'; body: Id; index: number }, x: number, y: number): void {
+    const data = (h: typeof hit) => this.bodyOf(h.body);
+    const describe = (h: typeof hit) => { const b = data(h); if (!b) return ''; if (h.kind === 'edge') { const e = b.edges[h.index]; return `aresta ${fmtDim('distance', e.len)} mm`; } const f = b.faces[h.index]; return `face ${faceTypeName(f.type)} ${f.area.toFixed(0)} mm²${f.type === 'cylinder' && f.radius ? `, Ø${fmtDim('distance', f.radius * 2)}` : ''}`; };
+    if (!this.measure.first) { this.measure.first = hit; this.sel3d = { body: hit.body, face: hit.kind === 'face' ? { body: hit.body, index: hit.index } : null, edges: hit.kind === 'edge' ? [{ body: hit.body, index: hit.index }] : [] }; this.vp.setSelection(this.sel3d); this.showChip(x, y, describe(hit)); this.toast('Agora toque no segundo elemento.'); return; }
+    const a = this.measure.first, b = hit; this.measure.first = null;
+    const A = data(a), B = data(b); if (!A || !B) return;
+    const pointOf = (h: typeof hit, d: BodyData): V3 => (h.kind === 'edge' ? d.edges[h.index].mid : d.faces[h.index].center);
+    const pa = pointOf(a, A), pb = pointOf(b, B);
+    let dist = Math.hypot(pa[0] - pb[0], pa[1] - pb[1], pa[2] - pb[2]); let how = 'entre centros';
+    const fa = a.kind === 'face' ? A.faces[a.index] : null, fb = b.kind === 'face' ? B.faces[b.index] : null;
+    if (fa?.type === 'plane' && fa.normal && fb?.type === 'plane' && fb.normal && Math.abs(v3dot(fa.normal, fb.normal)) > 0.999) { dist = Math.abs(v3dot(v3sub(pb, pa), fa.normal)); how = 'entre planos paralelos'; }
+    else if (fa?.type === 'plane' && fa.normal) { dist = Math.abs(v3dot(v3sub(pb, pa), fa.normal)); how = 'perpendicular ao plano'; }
+    else if (fb?.type === 'plane' && fb.normal) { dist = Math.abs(v3dot(v3sub(pa, pb), fb.normal)); how = 'perpendicular ao plano'; }
+    if (b.kind === 'edge') this.sel3d.edges.push({ body: b.body, index: b.index }); else this.sel3d.face = { body: b.body, index: b.index };
+    this.vp.setSelection(this.sel3d);
+    this.showChip(x, y, `${fmtDim('distance', dist)} mm`); this.toast(`Distância ${how}: ${fmtDim('distance', dist)} mm (${describe(a)} → ${describe(b)}).`);
+  }
+  private toggleSection(): void {
+    if (this.section.on) { this.section.on = false; this.vp.setSection(null); this.renderToolbar(); this.renderSidePanel(); return; }
+    const fr = this.faceRefOf(this.sel3d.face);
+    if (fr) { this.section.origin = fr.center; this.section.normal = v3neg(fr.normal); }
+    else { this.section.origin = this.bodiesCenter(); this.section.normal = [0, -1, 0]; }
+    this.section.offset = 0; this.section.on = true; this.applySection(); this.renderToolbar(); this.renderSidePanel();
+    this.toast(fr ? 'Corte pelo plano da face selecionada. Ajuste o deslocamento no painel.' : 'Corte horizontal pelo meio. Selecione uma face antes para cortar por ela.');
+  }
+  private applySection(): void {
+    const { origin: o, normal: n, offset } = this.section;
+    const plane = new THREE.Plane(new THREE.Vector3(...n), -(n[0] * (o[0] + n[0] * offset) + n[1] * (o[1] + n[1] * offset) + n[2] * (o[2] + n[2] * offset)));
+    this.vp.setSection(plane);
+  }
+  private renderSectionPanel(p: HTMLElement): void {
+    if (!this.section.on) return;
+    p.append(h3('Vista em corte'));
+    const row = el('div', 'row'); const lab = document.createElement('label'); lab.textContent = 'Deslocamento (mm)';
+    const inp = document.createElement('input'); inp.type = 'number'; inp.step = '1'; inp.value = String(this.section.offset); inp.addEventListener('change', () => { const v = parseFloat(inp.value.replace(',', '.')); if (isFinite(v)) { this.section.offset = v; this.applySection(); } }); row.append(lab, inp); p.append(row);
+    const r2 = el('div', 'row'); r2.append(this.button('Inverter lado', () => { this.section.normal = v3neg(this.section.normal); this.section.offset = -this.section.offset; this.applySection(); this.renderSidePanel(); }), this.button('Desligar corte', () => this.toggleSection())); p.append(r2);
+  }
+
+  // ---------- Esboço: deslocar contorno, espelhar, filete 2D ----------
+  private offsetContourMenu(ev: MouseEvent): void {
+    this.menu(ev.clientX, ev.clientY, [{ label: 'Para fora…', action: () => this.offsetContour(1) }, { label: 'Para dentro…', action: () => this.offsetContour(-1) }]);
+  }
+  private offsetContour(sign: 1 | -1): void {
+    const s = this.sketch; if (!s || this.kernel.state !== 'ready') return;
+    const entId = [...this.sel.entities][0]; if (!entId) return;
+    const prof = extractProfiles(s).find((pr) => (pr.outer.kind === 'circle' ? pr.outer.entity.id === entId : pr.outer.edges.some((e) => e.entity.id === entId)) || pr.holes.some((h) => (h.kind === 'circle' ? h.entity.id === entId : h.edges.some((e) => e.entity.id === entId))));
+    if (!prof) return this.toast('Selecione uma linha ou arco de um contorno fechado.', 'err');
+    const ip = profileInnerPoint(s, prof);
+    this.valuePopover(this.vp.width / 2, this.vp.height / 2, 2, 'mm', (d) => {
+      void this.kernel.offsetProfile(this.doc.current, s.id, [ip.x, ip.y], sign * d).then((ents) => {
+        this.pushUndo();
+        const joints = new Map<string, Id>(); const key = (p: [number, number]) => `${p[0].toFixed(3)},${p[1].toFixed(3)}`;
+        const pt = (p: [number, number]) => { const k = key(p); let id = joints.get(k); if (!id) { id = M.addPoint(s, p[0], p[1]).id; joints.set(k, id); } return id; };
+        for (const e of ents) {
+          if (e.type === 'line') M.addLine(s, pt(e.a), pt(e.b));
+          else if (e.type === 'circle') M.addCircle(s, M.addPoint(s, e.c[0], e.c[1]).id, e.r);
+          else M.addArc(s, M.addPoint(s, e.c[0], e.c[1]).id, pt(e.a), pt(e.b), e.r);
+        }
+        this.sel = emptySelection(); this.solve(); this.refreshAll(false); this.toast(`Contorno deslocado ${fmtDim('distance', d)} mm para ${sign > 0 ? 'fora' : 'dentro'}.`);
+      }).catch((e) => this.toast(`Não deu: ${(e as Error).message}`, 'err'));
+    });
+  }
+  private startMirrorSketch(): void { if (!this.sel.entities.size) return; this.mirrorPending = true; this.renderSidePanel(); this.toast('Toque na linha que serve de espelho.'); }
+  private mirrorSketchAbout(lineId: Id): void {
+    const s = this.sketch; if (!s) return; const l = M.findEntity(s, lineId); if (!l || l.type !== 'line') return this.toast('O espelho precisa ser uma linha.', 'err');
+    const a = M.getPoint(s, l.a), b = M.getPoint(s, l.b); const d = norm(sub(b, a));
+    const mirror = (p: { x: number; y: number }): Vec2 => { const rel = sub(p, a); const along = rel.x * d.x + rel.y * d.y; const px = a.x + d.x * along, py = a.y + d.y * along; return v2(2 * px - p.x, 2 * py - p.y); };
+    this.pushUndo();
+    const map = new Map<Id, Id>(); const mp = (pid: Id) => { let id = map.get(pid); if (!id) { const q = mirror(M.getPoint(s, pid)); id = M.addPoint(s, q.x, q.y).id; map.set(pid, id); } return id; };
+    for (const id of [...this.sel.entities]) {
+      const e = M.findEntity(s, id); if (!e || e.id === lineId) continue;
+      if (e.type === 'line') M.addLine(s, mp(e.a), mp(e.b));
+      else if (e.type === 'circle') M.addCircle(s, mp(e.center), e.r);
+      else M.addArc(s, mp(e.center), mp(e.end), mp(e.start), e.r); // espelho inverte o sentido
+    }
+    this.sel = emptySelection(); this.solve(); this.refreshAll(false); this.toast('Espelhado.');
+  }
+  /** Duas linhas selecionadas que compartilham um ponto (canto) → candidatas a filete 2D. */
+  private filletCornerCandidate(): { l1: M.LineEntity; l2: M.LineEntity; corner: Id } | null {
+    const s = this.sketch; if (!s || this.sel.entities.size !== 2) return null;
+    const [e1, e2] = [...this.sel.entities].map((id) => M.findEntity(s, id)); if (!e1 || !e2 || e1.type !== 'line' || e2.type !== 'line') return null;
+    const shared = [e1.a, e1.b].find((p) => p === e2.a || p === e2.b); return shared ? { l1: e1, l2: e2, corner: shared } : null;
+  }
+  private fillet2D(): void {
+    const s = this.sketch; const c = this.filletCornerCandidate(); if (!s || !c) return;
+    this.valuePopover(this.vp.width / 2, this.vp.height / 2, 5, 'mm', (r) => {
+      const P = M.getPoint(s, c.corner); const A = M.getPoint(s, c.l1.a === c.corner ? c.l1.b : c.l1.a), B = M.getPoint(s, c.l2.a === c.corner ? c.l2.b : c.l2.a);
+      const d1 = norm(sub(A, P)), d2 = norm(sub(B, P)); const cosT = Math.max(-1, Math.min(1, d1.x * d2.x + d1.y * d2.y)); const theta = Math.acos(cosT);
+      if (theta < 0.05 || theta > Math.PI - 0.05) return this.toast('As linhas estão quase alinhadas; não há canto para filetar.', 'err');
+      const t = r / Math.tan(theta / 2); if (t > dist(P, A) - 1e-6 || t > dist(P, B) - 1e-6) return this.toast('Raio grande demais para essas linhas.', 'err');
+      this.pushUndo();
+      const p1 = add(v2(P.x, P.y), scale(d1, t)), p2 = add(v2(P.x, P.y), scale(d2, t));
+      const bis = norm(add(d1, d2)); const C = add(v2(P.x, P.y), scale(bis, r / Math.sin(theta / 2)));
+      const q1 = M.addPoint(s, p1.x, p1.y), q2 = M.addPoint(s, p2.x, p2.y), cc = M.addPoint(s, C.x, C.y);
+      if (c.l1.a === c.corner) c.l1.a = q1.id; else c.l1.b = q1.id;
+      if (c.l2.a === c.corner) c.l2.a = q2.id; else c.l2.b = q2.id;
+      const cross = (p1.x - C.x) * (p2.y - C.y) - (p1.y - C.y) * (p2.x - C.x);
+      const arc = cross > 0 ? M.addArc(s, cc.id, q1.id, q2.id, r) : M.addArc(s, cc.id, q2.id, q1.id, r);
+      M.addConstraint(s, 'tangent', [c.l1.id, arc.id]); M.addConstraint(s, 'tangent', [c.l2.id, arc.id]);
+      M.pruneOrphanPoints(s);
+      const res = this.solve(); if (!res?.converged) this.toast('Filete criado, mas as restrições não fecharam; ajuste à mão.', 'err');
+      this.sel = emptySelection(); this.refreshAll(false);
+    });
+  }
+
   // ---------- Arquivos ----------
   newDocument(ev?: MouseEvent): void {
     const items = [
@@ -1610,6 +1952,7 @@ export class App {
   exportMenu(ev: MouseEvent): void {
     this.menu(ev.clientX, ev.clientY, [
       { label: 'STEP (SolidWorks, Fusion, fornecedores)', action: () => void this.exportStep() },
+      { label: 'IGES (CAM, máquinas antigas)', action: () => void this.exportStep('iges') },
       { label: 'STL (impressão, visualizadores)', action: () => this.exportMesh('stl') },
       { label: 'OBJ (ZBrush, polygroups por face)', action: () => this.exportMesh('obj') },
       { label: 'GLB (visualizadores 3D, realidade aumentada)', action: () => void this.exportGlb() },
@@ -1636,15 +1979,16 @@ export class App {
     if (fmt === 'stl') downloadFile(`${base}.stl`, toSTL(meshes), 'model/stl'); else downloadFile(`${base}.obj`, toOBJ(meshes), 'model/obj');
     this.toast(`${fmt.toUpperCase()} gerado${this.bodies.length ? '' : ' (da prévia)'}.`);
   }
-  private async exportStep(): Promise<void> {
-    if (this.kernel.state !== 'ready') return this.toast('O STEP precisa do kernel 3D carregado.', 'err');
+  private async exportStep(format: 'step' | 'iges' = 'step'): Promise<void> {
+    if (this.kernel.state !== 'ready') return this.toast('A exportação precisa do kernel 3D carregado.', 'err');
     if (!this.isAssembly && !this.bodies.length) return this.toast('Nenhum corpo para exportar.', 'err');
     if (this.isAssembly && !this.asm!.instances.length) return this.toast('Montagem vazia.', 'err');
+    if (this.isAssembly && format === 'iges') return this.toast('IGES da montagem ainda não; use STEP.', 'err');
     try {
-      const text = this.isAssembly ? await this.kernel.exportStepAssembly(this.assemblyPayload()) : await this.kernel.exportStep();
-      downloadFile(`${safeFileName(this.doc.current.name)}.step`, text, 'application/step');
-      this.toast('STEP gerado.');
-    } catch (e) { this.toast(`STEP falhou: ${(e as Error).message}`, 'err'); }
+      const text = this.isAssembly ? await this.kernel.exportStepAssembly(this.assemblyPayload()) : await this.kernel.exportStep(format);
+      downloadFile(`${safeFileName(this.doc.current.name)}.${format === 'iges' ? 'igs' : 'step'}`, text, format === 'iges' ? 'model/iges' : 'application/step');
+      this.toast(`${format.toUpperCase()} gerado.`);
+    } catch (e) { this.toast(`${format.toUpperCase()} falhou: ${(e as Error).message}`, 'err'); }
   }
 
   // ---------- Animação ----------
@@ -1920,7 +2264,7 @@ export class App {
         else if (ev.key.toLowerCase() === 'f' && this.sel3d.edges.length) this.filletSelected('fillet');
         return;
       }
-      const map: Record<string, Tool> = { v: 'select', p: 'draw', l: 'line', r: 'rect', c: 'circle', d: 'dimension', x: 'erase' };
+      const map: Record<string, Tool> = { v: 'select', p: 'draw', l: 'line', r: 'rect', c: 'circle', g: 'polygon', o: 'slot', d: 'dimension', x: 'erase' };
       const k = ev.key.toLowerCase();
       if (map[k]) this.setTool(map[k]);
       else if (ev.key === 'Escape') { if (this.tool !== 'select') this.setTool('select'); else { this.sel = emptySelection(); this.refreshAll(false); } }
@@ -1938,13 +2282,19 @@ function toRenderBody(b: BodyData): RenderBody {
   return { id: b.id, name: b.name, geometry: g, data: b };
 }
 function bodyOfFeature(f: Feature): Id | null {
-  if (f.type === 'extrude' || f.type === 'revolve') return f.op === 'new' ? f.id : f.target ?? null;
-  return f.body;
+  if ('body' in f) return f.body;
+  if (f.type === 'import') return f.id;
+  return f.op === 'new' ? f.id : f.target ?? null;
 }
 function featureMini(f: Feature): string {
   if (f.type === 'extrude') return `${f.op === 'cut' ? 'corte ' : f.op === 'add' ? 'adição ' : ''}${f.throughAll ? '∞' : `${fmtDim('distance', f.depth)} mm`}`;
   if (f.type === 'revolve') return `${f.op === 'cut' ? 'corte ' : f.op === 'add' ? 'adição ' : ''}${fmtDim('angle', f.angle)}`;
   if (f.type === 'pushpull') return `${f.distance >= 0 ? '+' : '−'}${fmtDim('distance', Math.abs(f.distance))} mm`;
+  if (f.type === 'shell') return `${fmtDim('distance', f.thickness)} mm`;
+  if (f.type === 'mirror') return f.join ? 'fundido' : 'cópia';
+  if (f.type === 'transform') return `${f.angle ? `${fmtDim('angle', f.angle)} ` : ''}${f.scale !== 1 ? `×${fmtDim('distance', f.scale)}` : ''}`.trim() || 'mover';
+  if (f.type === 'split') return f.keep === 'both' ? '2 corpos' : 'um lado';
+  if (f.type === 'sweep') return 'varredura'; if (f.type === 'loft') return `${f.sketches.length} perfis`; if (f.type === 'import') return 'STEP';
   if (f.type === 'fillet') return `R${fmtDim('distance', f.radius)} · ${f.edges.length}`;
   if (f.type === 'chamfer') return `${fmtDim('distance', f.radius)} mm · ${f.edges.length}`;
   if (f.type === 'boolean') return f.op === 'union' ? 'união' : f.op === 'subtract' ? 'subtração' : 'interseção';

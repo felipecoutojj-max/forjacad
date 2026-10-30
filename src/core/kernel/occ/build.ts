@@ -2,13 +2,13 @@
 // esboço → faces, prisma, booleanas, filete/chanfro, malha com ids de face e polilinhas de aresta, STEP.
 // Não importa three.js nem DOM: roda no worker e nos testes em Node.
 
-import type { OpenCascadeInstance, TopoDS_Shape, TopoDS_Face, TopoDS_Edge, TopoDS_Wire, BRepAdaptor_Curve } from 'opencascade.js';
-import type { ForjaDocument, FilletFeature, EdgeRef, FaceRef, V3, Plane, SketchAxis } from '../../document';
+import type { OpenCascadeInstance, TopoDS_Shape, TopoDS_Face, TopoDS_Edge, TopoDS_Wire, BRepAdaptor_Curve, gp_Trsf } from 'opencascade.js';
+import type { ForjaDocument, FilletFeature, EdgeRef, FaceRef, V3, Plane, SketchAxis, PatternSpec, ExtrudeOp } from '../../document';
 import { getSketch, getPlane, planeNormal, planeToWorld } from '../../document';
 import type { Sketch, Id } from '../../sketch/model';
 import { getPoint, findEntity } from '../../sketch/model';
 import { extractProfiles, loopArcAngles, profileContainsPoint, type Loop, type Profile } from '../profiles';
-import type { BodyData, FaceData, EdgeData, FeatureError, FaceType, ViewSpec, ProjectedView, ProjCircle, InterferenceHit } from './types';
+import type { BodyData, FaceData, EdgeData, FeatureError, FaceType, ViewSpec, ProjectedView, ProjCircle, InterferenceHit, SketchEntity2D } from './types';
 
 type OC = OpenCascadeInstance;
 export interface BuiltBody { id: Id; shape: TopoDS_Shape; }
@@ -270,6 +270,11 @@ export function rebuildDocument(oc: OC, doc: ForjaDocument): RebuildShapes {
   const bodies = new Map<Id, TopoDS_Shape>(); const order: Id[] = []; const errors: FeatureError[] = [];
   for (const f of doc.features) {
     try {
+      const place = (op: ExtrudeOp, targetId: Id | undefined, tool: TopoDS_Shape) => {
+        if (op === 'new') { bodies.set(f.id, tool); order.push(f.id); return; }
+        const target = targetId ? bodies.get(targetId) : undefined; if (!target) throw new Error('o corpo alvo não existe mais');
+        bodies.set(targetId!, boolOp(oc, op === 'add' ? 'fuse' : 'cut', target, tool));
+      };
       if (f.type === 'extrude' || f.type === 'revolve') {
         if (f.visible === false) continue;
         const { faces, plane } = sketchFaces(oc, doc, f.sketch, f.type === 'extrude' ? f.profilePoint : undefined);
@@ -287,8 +292,31 @@ export function rebuildDocument(oc: OC, doc: ForjaDocument): RebuildShapes {
           if (profileCrossesAxis(sk, ax.p2, ax.d2)) throw new Error('o perfil cruza o eixo de revolução');
           tool = revolveFaces(oc, faces, ax.p, f.flip ? neg(ax.d) : ax.d, f.angle);
         }
-        if (f.op === 'new') { bodies.set(f.id, tool); order.push(f.id); }
-        else bodies.set(f.target!, boolOp(oc, f.op === 'add' ? 'fuse' : 'cut', target!, tool));
+        if (f.pattern) tool = applyPattern(oc, tool, f.pattern);
+        place(f.op, f.target, tool);
+      } else if (f.type === 'sweep') {
+        const { faces } = sketchFaces(oc, doc, f.profile); const wire = sketchWire(oc, doc, f.path);
+        place(f.op, f.target, sweepFaces(oc, faces, wire));
+      } else if (f.type === 'loft') {
+        place(f.op, f.target, loftSketches(oc, doc, f.sketches, f.ruled));
+      } else if (f.type === 'import') {
+        bodies.set(f.id, importSTEP(oc, f.step)); order.push(f.id);
+      } else if (f.type === 'shell') {
+        const shape = bodies.get(f.body); if (!shape) throw new Error('o corpo não existe mais');
+        bodies.set(f.body, shellBody(oc, shape, f.thickness, f.openFaces));
+      } else if (f.type === 'mirror') {
+        const shape = bodies.get(f.body); if (!shape) throw new Error('o corpo não existe mais');
+        const copy = mirrorShape(oc, shape, f.origin, f.normal);
+        if (f.join) bodies.set(f.body, boolOp(oc, 'fuse', shape, copy)); else { bodies.set(f.id, copy); order.push(f.id); }
+      } else if (f.type === 'transform') {
+        const shape = bodies.get(f.body); if (!shape) throw new Error('o corpo não existe mais');
+        bodies.set(f.body, transformBody(oc, shape, f.translate, f.axisPoint, f.axisDir, f.angle, f.scale));
+      } else if (f.type === 'split') {
+        const shape = bodies.get(f.body); if (!shape) throw new Error('o corpo não existe mais');
+        const { front, back } = splitBody(oc, shape, f.origin, f.normal);
+        if (f.keep === 'front') { if (!front) throw new Error('nada sobra desse lado'); bodies.set(f.body, front); }
+        else if (f.keep === 'back') { if (!back) throw new Error('nada sobra desse lado'); bodies.set(f.body, back); }
+        else { if (!front || !back) throw new Error('o plano não corta o corpo'); bodies.set(f.body, front); bodies.set(f.id, back); order.push(f.id); }
       } else if (f.type === 'pushpull') {
         const shape = bodies.get(f.body); if (!shape) throw new Error('o corpo não existe mais');
         bodies.set(f.body, pushPull(oc, shape, f.face, f.distance));
@@ -529,4 +557,165 @@ export function interferences(oc: OC, parts: { id: Id; doc: ForjaDocument }[], s
     for (const box of boxes) box.delete();
   });
   return hits;
+}
+
+// ---------- Padrão, casca, espelho, transformação, divisão, varredura, loft, importação ----------
+
+function transformWithTrsf(oc: OC, shape: TopoDS_Shape, t: gp_Trsf): TopoDS_Shape { return new oc.BRepBuilderAPI_Transform_2(shape, t, true).Shape(); }
+
+/** Repete a forma-ferramenta: cópias fundidas numa só. */
+export function applyPattern(oc: OC, tool: TopoDS_Shape, spec: PatternSpec): TopoDS_Shape {
+  const count = Math.max(2, Math.min(200, Math.round(spec.count)));
+  let result = tool;
+  for (let i = 1; i < count; i++) {
+    const t = new oc.gp_Trsf_1();
+    if (spec.kind === 'linear') t.SetTranslation_1(new oc.gp_Vec_4(spec.step[0] * i, spec.step[1] * i, spec.step[2] * i));
+    else { const ax = new oc.gp_Ax1_2(pnt(oc, spec.axisPoint), new oc.gp_Dir_4(spec.axisDir[0], spec.axisDir[1], spec.axisDir[2])); const full = Math.abs(spec.angle) >= 360 - 1e-6; const stepAng = full ? (360 / count) : spec.angle / (count - 1); t.SetRotation_1(ax, (stepAng * i * Math.PI) / 180); }
+    result = boolOp(oc, 'fuse', result, transformWithTrsf(oc, tool, t));
+  }
+  return result;
+}
+
+/** Casca com paredes de `thickness`; faces em `openFaces` são removidas (abertura). Sem faces: corpo oco fechado. */
+export function shellBody(oc: OC, shape: TopoDS_Shape, thickness: number, openFaces: FaceRef[]): TopoDS_Shape {
+  const mk = new oc.BRepOffsetAPI_MakeThickSolid();
+  if (!openFaces.length) {
+    mk.MakeThickSolidBySimple(shape, -Math.abs(thickness));
+  } else {
+    const faces = planarFaces(oc, shape); const list = new oc.TopTools_ListOfShape_1();
+    for (const ref of openFaces) { const f = matchFace(faces, ref); if (!f) throw new Error('face da abertura não encontrada'); list.Append_1(f.face); }
+    mk.MakeThickSolidByJoin(shape, list, -Math.abs(thickness), 1e-3, oc.BRepOffset_Mode.BRepOffset_Skin as never, false, false, oc.GeomAbs_JoinType.GeomAbs_Arc as never, false, new oc.Message_ProgressRange_1());
+  }
+  const out = mk.Shape();
+  if (!hasSolid(oc, out)) throw new Error('não deu para fazer a casca com essa espessura');
+  return out;
+}
+
+export function mirrorShape(oc: OC, shape: TopoDS_Shape, origin: V3, normal: V3): TopoDS_Shape {
+  const t = new oc.gp_Trsf_1(); t.SetMirror_3(new oc.gp_Ax2_3(pnt(oc, origin), new oc.gp_Dir_4(normal[0], normal[1], normal[2])));
+  return transformWithTrsf(oc, shape, t);
+}
+
+export function transformBody(oc: OC, shape: TopoDS_Shape, translate: V3, axisPoint: V3, axisDir: V3, angleDeg: number, scale: number): TopoDS_Shape {
+  const T = new oc.gp_Trsf_1(); T.SetTranslation_1(new oc.gp_Vec_4(translate[0], translate[1], translate[2]));
+  if (Math.abs(angleDeg) > 1e-9) { const R = new oc.gp_Trsf_1(); R.SetRotation_1(new oc.gp_Ax1_2(pnt(oc, axisPoint), new oc.gp_Dir_4(axisDir[0], axisDir[1], axisDir[2])), (angleDeg * Math.PI) / 180); T.Multiply(R); }
+  if (Math.abs(scale - 1) > 1e-9) { if (!(scale > 0)) throw new Error('escala inválida'); const [mn, mx] = bbox(oc, shape); const S = new oc.gp_Trsf_1(); S.SetScale(pnt(oc, [(mn[0] + mx[0]) / 2, (mn[1] + mx[1]) / 2, (mn[2] + mx[2]) / 2]), scale); T.Multiply(S); }
+  return transformWithTrsf(oc, shape, T);
+}
+
+/** Divide por um plano: `front` fica do lado da normal, `back` do lado oposto (null quando vazio). */
+export function splitBody(oc: OC, shape: TopoDS_Shape, origin: V3, normal: V3): { front: TopoDS_Shape | null; back: TopoDS_Shape | null } {
+  const n = norm3(normal);
+  const pln = new oc.gp_Pln_3(pnt(oc, origin), new oc.gp_Dir_4(n[0], n[1], n[2]));
+  const face = new oc.BRepBuilderAPI_MakeFace_9(pln, -1e5, 1e5, -1e5, 1e5).Face();
+  const half = new oc.BRepPrimAPI_MakeHalfSpace_1(face, pnt(oc, [origin[0] - n[0] * 10, origin[1] - n[1] * 10, origin[2] - n[2] * 10])).Solid();
+  const tryOp = (kind: 'cut' | 'common') => { try { return boolOp(oc, kind, shape, half); } catch { return null; } };
+  return { front: tryOp('cut'), back: tryOp('common') };
+}
+
+/** Caminho de um esboço: todas as linhas e arcos (não construção) encadeados num fio aberto ou fechado. */
+export function sketchWire(oc: OC, doc: ForjaDocument, sketchId: Id): TopoDS_Wire {
+  const s = getSketch(doc, sketchId); const plane = getPlane(doc, s.plane);
+  const mk = new oc.BRepBuilderAPI_MakeWire_1(); let n = 0;
+  for (const e of s.entities) {
+    if (e.construction) continue;
+    if (e.type === 'line') { const a = getPoint(s, e.a), b = getPoint(s, e.b); mk.Add_1(new oc.BRepBuilderAPI_MakeEdge_3(pnt(oc, planeToWorld(plane, a.x, a.y)), pnt(oc, planeToWorld(plane, b.x, b.y))).Edge()); n++; }
+    else if (e.type === 'arc') {
+      const c = getPoint(s, e.center), a = getPoint(s, e.start), b = getPoint(s, e.end);
+      const a0 = Math.atan2(a.y - c.y, a.x - c.x); let sweep = Math.atan2(b.y - c.y, b.x - c.x) - a0; while (sweep <= 0) sweep += 2 * Math.PI;
+      const tm = a0 + sweep / 2; const M = pnt(oc, planeToWorld(plane, c.x + e.r * Math.cos(tm), c.y + e.r * Math.sin(tm)));
+      const arc = new oc.GC_MakeArcOfCircle_4(pnt(oc, planeToWorld(plane, a.x, a.y)), M, pnt(oc, planeToWorld(plane, b.x, b.y)));
+      mk.Add_1(new oc.BRepBuilderAPI_MakeEdge_24(new oc.Handle_Geom_Curve_2(arc.Value().get())).Edge()); n++;
+    }
+  }
+  if (!n) throw new Error('o caminho não tem linhas nem arcos');
+  if (!mk.IsDone()) throw new Error('o caminho não está conectado de ponta a ponta');
+  return mk.Wire();
+}
+
+export function sweepFaces(oc: OC, faces: TopoDS_Face[], path: TopoDS_Wire): TopoDS_Shape {
+  let result: TopoDS_Shape | null = null;
+  for (const face of faces) {
+    const mk = new oc.BRepOffsetAPI_MakePipe_1(path, face); mk.Build(new oc.Message_ProgressRange_1());
+    const sh = mk.Shape(); if (!hasSolid(oc, sh)) throw new Error('a varredura não gerou um sólido (perfil deve estar no início do caminho)');
+    result = result ? boolOp(oc, 'fuse', result, sh) : sh;
+  }
+  return result!;
+}
+
+export function loftSketches(oc: OC, doc: ForjaDocument, sketchIds: Id[], ruled: boolean): TopoDS_Shape {
+  if (sketchIds.length < 2) throw new Error('o loft precisa de dois esboços ou mais');
+  const ts = new oc.BRepOffsetAPI_ThruSections(true, ruled, 1e-6);
+  for (const id of sketchIds) { const { faces } = sketchFaces(oc, doc, id); ts.AddWire(oc.BRepTools.OuterWire(faces[0])); }
+  ts.CheckCompatibility(true); ts.Build(new oc.Message_ProgressRange_1());
+  const sh = ts.Shape(); if (!hasSolid(oc, sh)) throw new Error('o loft não gerou um sólido');
+  return sh;
+}
+
+const stepCache = new Map<string, TopoDS_Shape>();
+function hashText(t: string): string { let h = 5381; for (let i = 0; i < t.length; i++) h = ((h << 5) + h + t.charCodeAt(i)) | 0; return `${t.length}:${h}`; }
+
+/** Lê um STEP (texto) e devolve a forma (um corpo, possivelmente composto). */
+export function importSTEP(oc: OC, text: string): TopoDS_Shape {
+  const key = hashText(text); const cached = stepCache.get(key); if (cached) return cached;
+  const name = '/in.step'; oc.FS.writeFile(name, text);
+  const reader = new oc.STEPControl_Reader_1();
+  const status = enumVal(reader.ReadFile(name));
+  try { oc.FS.unlink(name); } catch { /* ignore */ }
+  if (status !== enumVal(oc.IFSelect_ReturnStatus.IFSelect_RetDone)) throw new Error('não deu para ler o STEP');
+  reader.TransferRoots(new oc.Message_ProgressRange_1());
+  const shape = reader.OneShape();
+  if (shape.IsNull() || !hasSolid(oc, shape)) throw new Error('o STEP não tem sólidos');
+  if (stepCache.size > 20) stepCache.clear(); stepCache.set(key, shape);
+  return shape;
+}
+
+export function exportIGES(oc: OC, bodies: BuiltBody[]): string {
+  const w = new oc.IGESControl_Writer_2('MM', 0);
+  for (const b of bodies) w.AddShape(b.shape, new oc.Message_ProgressRange_1());
+  w.ComputeModel();
+  const name = '/forja.igs'; w.Write_2(name, false);
+  const text = oc.FS.readFile(name, { encoding: 'utf8' }) as string;
+  try { oc.FS.unlink(name); } catch { /* ignore */ }
+  return text;
+}
+
+/** Desloca um perfil fechado do esboço em `distance` mm (positivo para fora) e devolve linhas e arcos no plano. */
+export function offsetProfile(oc: OC, doc: ForjaDocument, sketchId: Id, profilePoint: [number, number], distance: number): SketchEntity2D[] {
+  const { faces, plane } = sketchFaces(oc, doc, sketchId, profilePoint);
+  const wire = oc.BRepTools.OuterWire(faces[0]);
+  const mk = new oc.BRepOffsetAPI_MakeOffset_1(); mk.Init_2(oc.GeomAbs_JoinType.GeomAbs_Arc as never, false); mk.AddWire(wire); mk.Perform(distance, 0);
+  const out = mk.Shape(); if (out.IsNull()) throw new Error('não deu para deslocar esse contorno');
+  const o = plane.origin;
+  const toUV = (p: { X(): number; Y(): number; Z(): number }): [number, number] => { const d: V3 = [p.X() - o[0], p.Y() - o[1], p.Z() - o[2]]; return [d[0] * plane.u[0] + d[1] * plane.u[1] + d[2] * plane.u[2], d[0] * plane.v[0] + d[1] * plane.v[1] + d[2] * plane.v[2]]; };
+  const ents: SketchEntity2D[] = [];
+  const ex = new oc.TopExp_Explorer_2(out, oc.TopAbs_ShapeEnum.TopAbs_EDGE as never, oc.TopAbs_ShapeEnum.TopAbs_SHAPE as never);
+  const LINE = enumVal(oc.GeomAbs_CurveType.GeomAbs_Line), CIRC = enumVal(oc.GeomAbs_CurveType.GeomAbs_Circle);
+  for (; ex.More(); ex.Next()) {
+    const edge = oc.TopoDS.Edge_1(ex.Current()); const c = new oc.BRepAdaptor_Curve_2(edge); const f = c.FirstParameter(), l = c.LastParameter();
+    const t = enumVal(c.GetType()); const pa = c.Value(f), pb = c.Value(l);
+    if (t === LINE) ents.push({ type: 'line', a: toUV(pa), b: toUV(pb) });
+    else if (t === CIRC) {
+      const circ = c.Circle(); const loc = circ.Location(); const cc = toUV(loc); const r = circ.Radius();
+      if (Math.abs(l - f) >= 2 * Math.PI - 1e-6) ents.push({ type: 'circle', c: cc, r });
+      else {
+        // Sentido no plano: o arco vai de a para b passando pelo ponto médio; se o médio não está no lado anti-horário, inverte.
+        const pm = c.Value((f + l) / 2); const a = toUV(pa), b = toUV(pb), m = toUV(pm);
+        const ang = (q: [number, number]) => Math.atan2(q[1] - cc[1], q[0] - cc[0]);
+        const sweepAB = ((ang(b) - ang(a)) % (2 * Math.PI) + 2 * Math.PI) % (2 * Math.PI); const sweepAM = ((ang(m) - ang(a)) % (2 * Math.PI) + 2 * Math.PI) % (2 * Math.PI);
+        ents.push(sweepAM < sweepAB ? { type: 'arc', c: cc, r, a, b } : { type: 'arc', c: cc, r, a: b, b: a });
+        pm.delete();
+      }
+      loc.delete(); circ.delete();
+    } else {
+      // Outras curvas (raras no deslocamento de linhas e arcos): aproxima por segmentos.
+      const disc = new oc.GCPnts_TangentialDeflection_2(c, 0.2, 0.05, 2, 1e-9, 1e-7);
+      for (let k = 1; k < disc.NbPoints(); k++) { const p1 = disc.Value(k), p2 = disc.Value(k + 1); ents.push({ type: 'line', a: toUV(p1), b: toUV(p2) }); p1.delete(); p2.delete(); }
+      disc.delete();
+    }
+    pa.delete(); pb.delete(); c.delete();
+  }
+  ex.delete();
+  if (!ents.length) throw new Error('deslocamento vazio');
+  return ents;
 }

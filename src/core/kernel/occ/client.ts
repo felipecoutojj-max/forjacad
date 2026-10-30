@@ -2,9 +2,9 @@
 // (se chegam vários pedidos enquanto um roda, só o último vale).
 
 import type { ForjaDocument } from '../../document';
-import type { KernelRequest, KernelResponse, RebuildResult, ViewSpec, ProjectedView, AssemblyPayload, InterferenceHit } from './types';
+import type { KernelRequest, KernelResponse, RebuildResult, ViewSpec, ProjectedView, AssemblyPayload, InterferenceHit, SketchEntity2D } from './types';
 
-type RequestBody = { type: 'rebuild'; doc: ForjaDocument } | { type: 'export'; format: 'step' } | { type: 'project'; views: ViewSpec[] } | { type: 'projectAssembly'; assembly: AssemblyPayload; views: ViewSpec[] } | { type: 'exportAssembly'; assembly: AssemblyPayload } | { type: 'interference'; parts: AssemblyPayload['parts']; steps: { part: string; matrix: number[] }[][] };
+type RequestBody = { type: 'rebuild'; doc: ForjaDocument } | { type: 'export'; format: 'step' | 'iges' } | { type: 'project'; views: ViewSpec[] } | { type: 'projectAssembly'; assembly: AssemblyPayload; views: ViewSpec[] } | { type: 'exportAssembly'; assembly: AssemblyPayload } | { type: 'interference'; parts: AssemblyPayload['parts']; steps: { part: string; matrix: number[] }[][] } | { type: 'offsetProfile'; doc: ForjaDocument; sketch: string; profilePoint: [number, number]; distance: number };
 
 export type KernelState = 'loading' | 'ready' | 'failed';
 
@@ -48,6 +48,7 @@ export class KernelClient {
     else if (m.type === 'exported') p.resolve(m.data as never);
     else if (m.type === 'projected') p.resolve(m.views as never);
     else if (m.type === 'interference') p.resolve(m.hits as never);
+    else if (m.type === 'offsetProfile') p.resolve(m.entities as never);
     if (p.coalesced && this.queued) { const q = this.queued; this.queued = null; this.startRebuild(q.doc, q.resolve, q.reject); }
   }
 
@@ -73,6 +74,9 @@ export class KernelClient {
   interference(parts: AssemblyPayload['parts'], steps: { part: string; matrix: number[] }[][]): Promise<InterferenceHit[]> {
     return new Promise((resolve, reject) => this.send({ type: 'interference', parts, steps }, resolve as (v: never) => void, reject));
   }
+  offsetProfile(doc: ForjaDocument, sketch: string, profilePoint: [number, number], distance: number): Promise<SketchEntity2D[]> {
+    return new Promise((resolve, reject) => this.send({ type: 'offsetProfile', doc, sketch, profilePoint, distance }, resolve as (v: never) => void, reject));
+  }
   exportStepAssembly(assembly: AssemblyPayload): Promise<string> {
     return new Promise((resolve, reject) => this.send({ type: 'exportAssembly', assembly }, resolve as (v: never) => void, reject));
   }
@@ -94,7 +98,7 @@ export class KernelClient {
     return new Promise((resolve, reject) => this.send({ type: 'project', views }, resolve as (v: never) => void, reject));
   }
 
-  exportStep(): Promise<string> {
-    return new Promise((resolve, reject) => this.send({ type: 'export', format: 'step' }, resolve as (v: never) => void, reject));
+  exportStep(format: 'step' | 'iges' = 'step'): Promise<string> {
+    return new Promise((resolve, reject) => this.send({ type: 'export', format }, resolve as (v: never) => void, reject));
   }
 }

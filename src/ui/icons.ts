@@ -31,6 +31,14 @@ export const icons = {
   pause: w('<path d="M7 4h4v16H7zM13 4h4v16h-4z"/>'),
   record: w('<circle cx="12" cy="12" r="7"/>'),
   collide: w('<rect x="3" y="7" width="10" height="10" rx="1"/><rect x="11" y="7" width="10" height="10" rx="1"/><path d="M11 9v6M13 9v6" stroke-dasharray="1 1"/>'),
+  theme: w('<circle cx="12" cy="12" r="4"/><path d="M12 3v2M12 19v2M3 12h2M19 12h2M5.6 5.6l1.4 1.4M17 17l1.4 1.4M5.6 18.4L7 17M17 7l1.4-1.4"/>'),
+  polygon: w('<path d="M12 3l8 6-3 10H7L4 9z"/>'),
+  slot: w('<rect x="3" y="8" width="18" height="8" rx="4"/>'),
+  body: w('<path d="M4 16l8 4 8-4V8l-8-4-8 4z"/><path d="M4 8l8 4 8-4M12 12v8"/><circle cx="18" cy="6" r="2.5" fill="currentColor" stroke="none"/>'),
+  measure: w('<path d="M3 17L17 3l4 4L7 21z"/><path d="M7 13l2 2M10 10l2 2M13 7l2 2"/>'),
+  section: w('<path d="M4 16l8 4 8-4V8l-8-4-8 4z"/><path d="M3 12h18" stroke-dasharray="3 2"/><path d="M4 12l8 4 8-4" fill="currentColor" fill-opacity="0.25"/>'),
+  mirror: w('<path d="M12 3v18" stroke-dasharray="2 2"/><path d="M9 7L4 12l5 5zM15 7l5 5-5 5z"/>'),
+  offset: w('<rect x="4" y="6" width="16" height="12" rx="1"/><rect x="7.5" y="9" width="9" height="6" rx="1" stroke-dasharray="2 1.5"/>'),
   cut: w('<path d="M4 16l8 4 8-4V8l-8-4-8 4z"/><path d="M9 6v9M15 6v9"/>'),
 };
 export type IconName = keyof typeof icons;
