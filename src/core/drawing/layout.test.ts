@@ -80,7 +80,8 @@ describe('layout do desenho', () => {
     // Linhas do pares código/valor: número par de linhas, mesmo com texto malicioso no título.
     const lines = dxf.trim().split('\r\n'); expect(lines.length % 2).toBe(0);
     const evil = layoutDrawing(sampleViews(), { ...defaultDrawingSettings('x'), title: 'a\r\n0\r\nLINE\r\n8\r\nHACK' }, { date: '', docName: 'x' });
-    const dxf2 = toDXF(evil); expect(dxf2).not.toContain('HACK\r\n'); expect(dxf2.trim().split('\r\n').length % 2).toBe(0);
+    const lines2 = toDXF(evil).trim().split('\r\n'); expect(lines2).not.toContain('HACK'); expect(lines2.length % 2).toBe(0);
+    expect(lines2.filter((l) => l === 'LINE').length).toBe(lines.filter((l) => l === 'LINE').length); // nenhuma entidade injetada
   });
 
   it('gera SVG com a folha e os textos', () => {
