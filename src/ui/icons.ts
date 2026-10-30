@@ -27,6 +27,10 @@ export const icons = {
   revolve: w('<path d="M12 3v18" stroke-dasharray="2 2"/><path d="M14 6c3 0 5 1 5 2.5S17 11 14 11M14 13c3 0 5 1 5 2.5S17 18 14 18"/><path d="M14 6v12"/>'),
   drawing: w('<rect x="3" y="4" width="18" height="16" rx="1"/><path d="M6 8h6v5H6zM14 8h4M14 11h4M6 16h12"/>'),
   joint: w('<circle cx="8" cy="12" r="4"/><circle cx="8" cy="12" r="1"/><path d="M12 12h9M17 9l4 3-4 3"/>'),
+  play: w('<path d="M7 4l13 8-13 8z"/>'),
+  pause: w('<path d="M7 4h4v16H7zM13 4h4v16h-4z"/>'),
+  record: w('<circle cx="12" cy="12" r="7"/>'),
+  collide: w('<rect x="3" y="7" width="10" height="10" rx="1"/><rect x="11" y="7" width="10" height="10" rx="1"/><path d="M11 9v6M13 9v6" stroke-dasharray="1 1"/>'),
   cut: w('<path d="M4 16l8 4 8-4V8l-8-4-8 4z"/><path d="M9 6v9M15 6v9"/>'),
 };
 export type IconName = keyof typeof icons;

@@ -20,11 +20,11 @@ import { toSTL, toOBJ, fromBody, fromGeometry, type MeshData } from '../core/exp
 import { toGLB } from '../core/export/glb';
 import { layoutDrawing, layoutAssemblyDrawing, projectPoint, viewSpecsFor, defaultDrawingSettings, SHEET_MM, STANDARD_SCALES, scaleLabel, type DrawingSettings, type BalloonAnchor } from '../core/drawing/layout';
 import { createAssemblyDocument } from '../core/document';
-import { addPart, addInstance, removeInstance, addJoint, removeJoint, jointOf, computeTransforms, frameFromFace, applyPoint, bomRows, JOINT_NAMES, type Assembly, type Frame, type JointType, type Mat4 } from '../core/assembly/model';
+import { addPart, addInstance, removeInstance, addJoint, removeJoint, jointOf, computeTransforms, computeTransformsAt, syncTracks, frameFromFace, applyPoint, bomRows, JOINT_NAMES, MOTION_NAMES, type Assembly, type Frame, type JointType, type Mat4, type MotionMode } from '../core/assembly/model';
 import { toPDF } from '../core/drawing/pdf';
 import { toDXF } from '../core/drawing/dxf';
 import { toSVG } from '../core/drawing/svg';
-import type { ProjectedView, AssemblyPayload } from '../core/kernel/occ/types';
+import type { ProjectedView, AssemblyPayload, InterferenceHit } from '../core/kernel/occ/types';
 import { saveLocal, loadLocal, downloadFile, pickFile, safeFileName } from './storage';
 import { type Vec2, v2, dist, distPointSegment, distPointArc, closestOnSegment, sub, add, scale, norm, angleOf, normAngle, TAU, round } from '../core/geom';
 
@@ -64,6 +64,9 @@ export class App {
   private asmCache = new Map<Id, { key: string; bodies: BodyData[]; geoms: THREE.BufferGeometry[] }>();
   private asmTransforms = new Map<Id, Mat4>();
   private jointFlow: { type: JointType; moving?: { inst: Id; frame: Frame; planar: boolean } } | null = null;
+  // Animação
+  private anim = { open: false, playing: false, t: 0, raf: 0, lastTs: 0, recorder: null as MediaRecorder | null, hits: [] as InterferenceHit[], hitSteps: 1, checking: false };
+  private timeline!: HTMLElement;
   private busy = 0;
   private pointers = new Map<number, PointerInfo>();
   private pinch: { d0: number; mid: { x: number; y: number } } | null = null;
@@ -120,6 +123,7 @@ export class App {
     this.toolbar = el('div', 'toolbar'); this.toolbar.style.pointerEvents = 'auto'; this.overlay.append(this.toolbar);
     this.sidepanel = el('div', 'sidepanel'); this.sidepanel.style.pointerEvents = 'auto'; this.overlay.append(this.sidepanel);
     this.toasts = el('div', 'toasts'); this.overlay.append(this.toasts);
+    this.timeline = el('div', 'timeline'); this.timeline.style.display = 'none'; this.overlay.append(this.timeline);
   }
 
   private iconButton(icon: IconName, label: string, onClick: (ev: MouseEvent) => void, cls = 'tool'): HTMLButtonElement {
@@ -159,6 +163,7 @@ export class App {
     this.undoStack.push(serialize(this.doc.current)); this.doc.current = deserialize(s); this.afterDocReplace();
   }
   private afterDocReplace(): void {
+    if (!this.isAssembly) this.closeTimelineIfOpen();
     if (this.activeSketch && !this.doc.current.sketches.some((s) => s.id === this.activeSketch)) this.exitSketch(false);
     this.sel = emptySelection(); this.titleEl.value = this.doc.current.name;
     if (this.sketch) this.solve();
@@ -251,6 +256,7 @@ export class App {
       this.bodies = []; this.featureErrors = [];
       this.pruneSel3d();
       this.vp.setBodies(list, this.sel3d);
+      if (this.anim.open) this.applyAnimT(this.anim.t);
       this.renderSidePanel(); this.renderToolbar();
     } catch (e) { this.toast(`Montagem: ${(e as Error).message}`, 'err'); }
     finally { this.busy--; this.renderStatus(); }
@@ -283,6 +289,7 @@ export class App {
     const go = () => {
       const d = createAssemblyDocument(withCurrent ? `Montagem de ${cur.name}` : undefined);
       if (withCurrent) { const part = addPart(d.assembly!, deserialize(serialize(cur)), cur.name); addInstance(d.assembly!, part.id); }
+      this.closeTimelineIfOpen();
       this.doc.current = d; this.undoStack = []; this.redoStack = []; this.activeSketch = null; this.mode = 'view'; this.selectedFeature = null; this.selectedInstance = null; this.sel = emptySelection(); this.sel3d = emptySel3D(); this.asmCache.clear();
       this.vp.exitSketch(); this.titleEl.value = d.name; this.refreshAll(); this.vp.fitAll();
     };
@@ -348,6 +355,8 @@ export class App {
     }
   }
 
+  private closeTimelineIfOpen(): void { if (this.anim.open) { this.pause(); this.anim.open = false; this.timeline.style.display = 'none'; } }
+
   private deleteInstance(id: Id): void {
     const asm = this.asm; if (!asm) return;
     this.pushUndo(); removeInstance(asm, id); if (this.selectedInstance === id) this.selectedInstance = null; this.sel3d = emptySel3D(); this.refreshAll();
@@ -361,6 +370,7 @@ export class App {
       inp.addEventListener('change', () => { const v = parseFloat(inp.value.replace(',', '.')); if (!isFinite(v)) return; onChange(v); });
       row.append(lab, inp); p.append(row);
     };
+    if (this.anim.open) this.renderMotionsPanel(p);
     if (this.jointFlow) {
       p.append(h3('Nova junta'));
       const d = el('div', 'hint'); d.textContent = `${JOINT_NAMES[this.jointFlow.type]}: ${this.jointFlow.moving ? 'toque na face da peça base.' : 'toque na face da peça que vai se mover.'} Faces planas encostam; faces cilíndricas alinham o eixo.`; p.append(d);
@@ -488,6 +498,7 @@ export class App {
       g1.append(this.iconButton('plus', 'Inserir', (ev) => { const items = asm.parts.map((p) => ({ label: `Inserir ${p.name}`, action: () => this.insertInstance(p.id) })); items.push({ label: 'Importar peça (.forja)…', action: () => void this.importPart() }); this.menu(ev.clientX, ev.clientY, items); }));
       const jb = this.iconButton('joint', this.jointFlow ? 'Cancelar junta' : 'Junta', (ev) => { if (this.jointFlow) return this.cancelJoint(); this.menu(ev.clientX, ev.clientY, (['fixed', 'revolute', 'slider', 'cylindrical'] as JointType[]).map((t) => ({ label: JOINT_NAMES[t], action: () => this.startJoint(t) }))); });
       jb.disabled = asm.instances.length < 2 && !this.jointFlow; if (this.jointFlow) jb.classList.add('active'); g1.append(jb);
+      const ab = this.iconButton('play', 'Animar', () => this.toggleTimeline()); ab.disabled = !asm.joints.some((j) => j.type !== 'fixed') && !this.anim.open; if (this.anim.open) ab.classList.add('active'); g1.append(ab);
       g2.append(this.iconButton('drawing', 'Desenho', () => void this.drawingDialog()));
       g2.append(this.iconButton('view', 'Vistas', (ev) => this.viewMenu(ev)));
       g2.append(this.iconButton('fit', 'Enquadrar', () => this.vp.fitAll()));
@@ -1331,7 +1342,7 @@ export class App {
   newDocument(ev?: MouseEvent): void {
     const items = [
       { label: 'Nova peça', action: () => this.confirm('Nova peça', 'Descartar o documento atual? O autosave será substituído. Salve antes se precisar.', () => {
-        this.doc.current = createDocument(); this.undoStack = []; this.redoStack = []; this.activeSketch = null; this.mode = 'view'; this.selectedFeature = null; this.selectedInstance = null; this.sel = emptySelection(); this.sel3d = emptySel3D(); this.asmCache.clear(); this.vp.exitSketch(); this.titleEl.value = this.doc.current.name; this.refreshAll(); this.vp.fitAll();
+        this.closeTimelineIfOpen(); this.doc.current = createDocument(); this.undoStack = []; this.redoStack = []; this.activeSketch = null; this.mode = 'view'; this.selectedFeature = null; this.selectedInstance = null; this.sel = emptySelection(); this.sel3d = emptySel3D(); this.asmCache.clear(); this.vp.exitSketch(); this.titleEl.value = this.doc.current.name; this.refreshAll(); this.vp.fitAll();
       }) },
       { label: 'Nova montagem vazia', action: () => this.newAssembly(false) },
     ];
@@ -1340,7 +1351,7 @@ export class App {
   }
   async openFile(): Promise<void> {
     const f = await pickFile('.forja,application/json'); if (!f) return;
-    try { const d = deserialize(f.text); this.doc.current = d; this.undoStack = []; this.redoStack = []; this.activeSketch = null; this.mode = 'view'; this.selectedFeature = null; this.selectedInstance = null; this.sel3d = emptySel3D(); this.asmCache.clear(); this.jointFlow = null; this.vp.exitSketch(); this.titleEl.value = d.name; this.refreshAll(); this.vp.fitAll(); this.toast(`Aberto: ${f.name}${d.kind === 'assembly' ? ' (montagem)' : ''}`); }
+    try { const d = deserialize(f.text); this.closeTimelineIfOpen(); this.doc.current = d; this.undoStack = []; this.redoStack = []; this.activeSketch = null; this.mode = 'view'; this.selectedFeature = null; this.selectedInstance = null; this.sel3d = emptySel3D(); this.asmCache.clear(); this.jointFlow = null; this.vp.exitSketch(); this.titleEl.value = d.name; this.refreshAll(); this.vp.fitAll(); this.toast(`Aberto: ${f.name}${d.kind === 'assembly' ? ' (montagem)' : ''}`); }
     catch (e) { this.toast(`Não abriu: ${(e as Error).message}`, 'err'); }
   }
   saveFile(): void { downloadFile(`${safeFileName(this.doc.current.name)}.forja`, serialize(this.doc.current), 'application/json'); this.toast('Arquivo .forja gerado.'); }
@@ -1382,6 +1393,148 @@ export class App {
       downloadFile(`${safeFileName(this.doc.current.name)}.step`, text, 'application/step');
       this.toast('STEP gerado.');
     } catch (e) { this.toast(`STEP falhou: ${(e as Error).message}`, 'err'); }
+  }
+
+  // ---------- Animação ----------
+  toggleTimeline(): void {
+    const asm = this.asm; if (!asm) return;
+    if (this.anim.open) {
+      this.pause(); this.anim.open = false; this.timeline.style.display = 'none';
+      void this.rebuildAssembly(); this.renderToolbar(); this.renderSidePanel(); return;
+    }
+    syncTracks(asm); this.autosave();
+    this.anim.open = true; this.anim.t = 0; this.anim.hits = [];
+    this.timeline.style.display = ''; this.renderTimeline(); this.applyAnimT(0);
+    this.renderToolbar(); this.renderSidePanel();
+  }
+
+  /** Posiciona as instâncias no instante t (0 a 1) sem mexer no documento. */
+  private applyAnimT(t: number): void {
+    const asm = this.asm; if (!asm) return;
+    this.anim.t = t;
+    const T = computeTransformsAt(asm, t); const map = new Map<Id, number[]>();
+    for (const inst of asm.instances) { const m = T.get(inst.id); const c = this.asmCache.get(inst.part); if (!m || !c) continue; for (const b of c.bodies) map.set(`${inst.id}/${b.id}`, m); }
+    this.vp.updateMatrices(map); this.vp.setSelection(this.sel3d);
+    const dur = asm.animation?.duration ?? 4;
+    const slider = this.timeline.querySelector('input[type=range]') as HTMLInputElement | null; if (slider && document.activeElement !== slider) slider.value = String(Math.round(t * 1000));
+    const time = this.timeline.querySelector('.time'); if (time) time.textContent = `${(t * dur).toFixed(1).replace('.', ',')} s / ${String(dur).replace('.', ',')} s`;
+  }
+
+  private play(): void {
+    if (this.anim.playing) return;
+    this.anim.playing = true; this.anim.lastTs = 0;
+    const step = (ts: number) => {
+      if (!this.anim.playing) return;
+      const asm = this.asm; if (!asm) return;
+      const dur = asm.animation?.duration ?? 4;
+      if (this.anim.lastTs) {
+        let t = this.anim.t + (ts - this.anim.lastTs) / 1000 / dur;
+        if (t >= 1) {
+          if (this.anim.recorder) { this.applyAnimT(1); this.stopRecording(); this.pause(); return; }
+          if (asm.animation?.loop !== false) t -= Math.floor(t); else { this.applyAnimT(1); this.pause(); return; }
+        }
+        this.applyAnimT(t);
+      }
+      this.anim.lastTs = ts; this.anim.raf = requestAnimationFrame(step);
+    };
+    this.anim.raf = requestAnimationFrame(step); this.renderTimeline();
+  }
+  private pause(): void {
+    this.anim.playing = false; if (this.anim.raf) cancelAnimationFrame(this.anim.raf); this.anim.raf = 0;
+    if (this.anim.recorder) this.stopRecording();
+    this.renderTimeline();
+  }
+
+  private renderTimeline(): void {
+    const asm = this.asm; const tl = this.timeline; tl.innerHTML = ''; if (!asm) return;
+    const anim = asm.animation ?? syncTracks(asm);
+    tl.append(this.iconButton(this.anim.playing ? 'pause' : 'play', this.anim.playing ? 'Pausar' : 'Reproduzir', () => (this.anim.playing ? this.pause() : this.play())));
+    const slider = document.createElement('input'); slider.type = 'range'; slider.min = '0'; slider.max = '1000'; slider.value = String(Math.round(this.anim.t * 1000));
+    slider.addEventListener('input', () => { if (this.anim.playing) this.pause(); this.applyAnimT(Number(slider.value) / 1000); });
+    tl.append(slider);
+    const time = el('span', 'time'); time.textContent = `${(this.anim.t * anim.duration).toFixed(1).replace('.', ',')} s / ${String(anim.duration).replace('.', ',')} s`; tl.append(time);
+    const durLab = document.createElement('label'); durLab.textContent = 'Duração'; const dur = document.createElement('input'); dur.type = 'number'; dur.min = '0.5'; dur.step = '0.5'; dur.value = String(anim.duration);
+    dur.addEventListener('change', () => { const v = parseFloat(dur.value.replace(',', '.')); if (isFinite(v) && v > 0) { anim.duration = Math.min(120, v); this.autosave(); this.applyAnimT(this.anim.t); } }); durLab.append(dur, document.createTextNode('s')); tl.append(durLab);
+    const loopLab = document.createElement('label'); const loop = document.createElement('input'); loop.type = 'checkbox'; loop.checked = anim.loop; loop.addEventListener('change', () => { anim.loop = loop.checked; this.autosave(); }); loopLab.append(loop, document.createTextNode('Laço')); tl.append(loopLab);
+    const rec = this.iconButton('record', this.anim.recorder ? 'Parar gravação' : 'Gravar vídeo', () => (this.anim.recorder ? this.pause() : this.recordVideo()), 'tool rec'); if (this.anim.recorder) rec.classList.add('active'); tl.append(rec);
+    const col = this.iconButton('collide', 'Verificar interferências', () => void this.checkInterference()); col.disabled = this.anim.checking; tl.append(col);
+    tl.append(this.iconButton('done', 'Fechar', () => this.toggleTimeline()));
+  }
+
+  private renderMotionsPanel(p: HTMLElement): void {
+    const asm = this.asm!; const anim = asm.animation ?? syncTracks(asm);
+    p.append(h3('Movimentos'));
+    if (!anim.tracks.length) { const d = el('div', 'hint'); d.textContent = 'Crie juntas de pino, deslizante ou cilíndrica para animar.'; p.append(d); }
+    for (const tr of anim.tracks) {
+      const j = asm.joints.find((x) => x.id === tr.joint); if (!j) continue;
+      const head = el('div', 'row'); const chk = document.createElement('input'); chk.type = 'checkbox'; chk.checked = tr.enabled; chk.addEventListener('change', () => { tr.enabled = chk.checked; this.autosave(); this.applyAnimT(this.anim.t); });
+      const lab = document.createElement('label'); lab.textContent = `${j.name} (${asm.instances.find((i) => i.id === j.moving)?.name ?? '?'})`; head.append(chk, lab); p.append(head);
+      const modeRow = el('div', 'row'); const ml = document.createElement('label'); ml.textContent = 'Modo'; const sel = document.createElement('select');
+      for (const m of Object.keys(MOTION_NAMES) as MotionMode[]) { if (m === 'spin' && j.type === 'slider') continue; const o = document.createElement('option'); o.value = m; o.textContent = MOTION_NAMES[m]; sel.append(o); }
+      sel.value = tr.mode; sel.addEventListener('change', () => { tr.mode = sel.value as MotionMode; this.autosave(); this.applyAnimT(this.anim.t); this.renderSidePanel(); }); modeRow.append(ml, sel); p.append(modeRow);
+      const num = (label: string, value: number, onChange: (v: number) => void) => {
+        const row = el('div', 'row'); const l = document.createElement('label'); l.textContent = label; const inp = document.createElement('input'); inp.type = 'number'; inp.step = '5'; inp.value = String(value); inp.inputMode = 'decimal';
+        inp.addEventListener('change', () => { const v = parseFloat(inp.value.replace(',', '.')); if (isFinite(v)) { onChange(v); this.autosave(); this.applyAnimT(this.anim.t); } }); row.append(l, inp); p.append(row);
+      };
+      if (j.type === 'revolute' || j.type === 'cylindrical') {
+        if (tr.mode === 'spin') num('Giro total (°)', tr.angleTo, (v) => { tr.angleTo = v; });
+        else { num('Ângulo inicial (°)', tr.angleFrom, (v) => { tr.angleFrom = v; }); num('Ângulo final (°)', tr.angleTo, (v) => { tr.angleTo = v; }); }
+      }
+      if (j.type === 'slider' || j.type === 'cylindrical') { num('Curso inicial (mm)', tr.distFrom, (v) => { tr.distFrom = v; }); num('Curso final (mm)', tr.distTo, (v) => { tr.distTo = v; }); }
+    }
+    if (this.anim.hits.length || this.anim.hitSteps > 1) {
+      p.append(h3(`Interferências (${this.anim.hits.length})`));
+      if (!this.anim.hits.length) { const d = el('div', 'hint'); d.textContent = `Nenhuma em ${this.anim.hitSteps} posições do movimento.`; p.append(d); }
+      const list = el('div', 'list');
+      for (const h of this.anim.hits) {
+        const a = asm.instances[h.a], b = asm.instances[h.b]; const t = this.anim.hitSteps > 1 ? h.step / (this.anim.hitSteps - 1) : 0;
+        const it = listItem(`${a?.name ?? '?'} × ${b?.name ?? '?'}`, `${Math.round(t * 100)}% · ${fmtMm3(h.volume)}`);
+        it.addEventListener('click', () => { this.pause(); this.applyAnimT(t); this.selectedInstance = a?.id ?? null; const c = a && this.asmCache.get(a.part); this.sel3d = emptySel3D(); if (a && c?.bodies[0]) this.sel3d.body = `${a.id}/${c.bodies[0].id}`; this.vp.setSelection(this.sel3d); });
+        list.append(it);
+      }
+      p.append(list);
+    }
+  }
+
+  private recordVideo(): void {
+    const stream = this.vp.captureStream(30);
+    if (!stream || typeof MediaRecorder === 'undefined') return this.toast('Este navegador não grava vídeo do canvas.', 'err');
+    const mime = ['video/mp4;codecs=avc1', 'video/mp4', 'video/webm;codecs=vp9', 'video/webm'].find((m) => MediaRecorder.isTypeSupported(m));
+    if (!mime) return this.toast('Nenhum formato de vídeo disponível.', 'err');
+    const chunks: Blob[] = [];
+    const rec = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: 8_000_000 });
+    rec.ondataavailable = (ev) => { if (ev.data.size) chunks.push(ev.data); };
+    rec.onstop = () => {
+      const ext = mime.startsWith('video/mp4') ? 'mp4' : 'webm';
+      const blob = new Blob(chunks, { type: mime });
+      void blob.arrayBuffer().then((buf) => { downloadFile(`${safeFileName(this.doc.current.name)}.${ext}`, buf, mime); this.toast(`Vídeo ${ext.toUpperCase()} gerado (${(blob.size / 1e6).toFixed(1).replace('.', ',')} MB).`); });
+    };
+    this.anim.recorder = rec; this.applyAnimT(0); rec.start(200); this.play();
+    this.toast('Gravando um ciclo da animação…');
+  }
+  private stopRecording(): void {
+    const rec = this.anim.recorder; if (!rec) return; this.anim.recorder = null;
+    try { if (rec.state !== 'inactive') rec.stop(); } catch { /* ignore */ }
+    this.renderTimeline();
+  }
+
+  /** Amostra o movimento e pede ao kernel o volume comum entre pares de peças. */
+  private async checkInterference(): Promise<void> {
+    const asm = this.asm; if (!asm || this.anim.checking) return;
+    if (this.kernel.state !== 'ready') return this.toast('Kernel 3D ainda não está pronto.', 'err');
+    if (asm.instances.length < 2) return this.toast('Precisa de duas peças ou mais.', 'err');
+    const hasMotion = !!asm.animation?.tracks.some((t) => t.enabled);
+    const N = hasMotion ? 13 : 1;
+    const steps: { part: Id; matrix: number[] }[][] = [];
+    for (let k = 0; k < N; k++) { const T = computeTransformsAt(asm, N > 1 ? k / (N - 1) : this.anim.t); steps.push(asm.instances.map((i) => ({ part: i.part, matrix: T.get(i.id) ?? [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1] }))); }
+    this.anim.checking = true; this.renderTimeline(); this.toast(`Verificando ${N} posição${N > 1 ? 'ões' : ''}…`);
+    try {
+      const hits = await this.kernel.interference(asm.parts.map((p) => ({ id: p.id, doc: p.doc })), steps);
+      this.anim.hits = hits; this.anim.hitSteps = N;
+      const pairs = new Set(hits.map((h) => `${h.a}-${h.b}`));
+      this.toast(hits.length ? `${pairs.size} par${pairs.size > 1 ? 'es' : ''} de peças se interpenetram em ${new Set(hits.map((h) => h.step)).size} posição${hits.length > 1 ? 'ões' : ''}.` : 'Sem interferências no movimento.', hits.length ? 'err' : '');
+    } catch (e) { this.toast(`Interferência: ${(e as Error).message}`, 'err'); }
+    finally { this.anim.checking = false; this.renderTimeline(); this.renderSidePanel(); }
   }
 
   // ---------- Desenho técnico ----------

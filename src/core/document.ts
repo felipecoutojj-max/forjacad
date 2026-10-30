@@ -177,6 +177,16 @@ function sanitizeAssembly(raw: unknown, partDoc: (o: unknown) => ForjaDocument):
     if (asm.joints.some((x) => x.moving === q.moving)) continue;
     asm.joints.push({ id: q.id, type, name: str(q.name, JOINT_NAMES[type]), moving: q.moving, base: q.base, movingFrame: mf, baseFrame: bf, angle: typeof q.angle === 'number' && Number.isFinite(q.angle) ? q.angle : 0, distance: typeof q.distance === 'number' && Number.isFinite(q.distance) ? q.distance : 0, flip: !!q.flip });
   }
+  const an = (raw as { animation?: unknown }).animation as { duration?: unknown; loop?: unknown; tracks?: unknown[] } | undefined;
+  if (an && typeof an === 'object') {
+    const num = (v: unknown, fb: number) => (typeof v === 'number' && Number.isFinite(v) ? v : fb);
+    const jointIds = new Set(asm.joints.map((j) => j.id));
+    asm.animation = {
+      duration: Math.min(120, Math.max(0.5, num(an.duration, 4))), loop: an.loop !== false,
+      tracks: (Array.isArray(an.tracks) ? an.tracks : []).filter((t): t is Record<string, unknown> => !!t && typeof (t as Record<string, unknown>).joint === 'string' && jointIds.has((t as Record<string, unknown>).joint as string))
+        .map((t) => ({ joint: t.joint as string, enabled: t.enabled !== false, mode: t.mode === 'linear' || t.mode === 'spin' ? t.mode : 'pingpong', angleFrom: num(t.angleFrom, 0), angleTo: num(t.angleTo, 90), distFrom: num(t.distFrom, 0), distTo: num(t.distTo, 20) })),
+    };
+  }
   return asm;
 }
 

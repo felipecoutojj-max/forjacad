@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { createAssembly, addPart, addInstance, addJoint, computeTransforms, applyPoint, applyDir, fromFrame, invertRigid, mul, transformFrame, frameFromFace, bomRows, rotationAxis, type Frame } from './model';
+import { createAssembly, addPart, addInstance, addJoint, computeTransforms, computeTransformsAt, jointValuesAt, syncTracks, applyPoint, applyDir, fromFrame, invertRigid, mul, transformFrame, frameFromFace, bomRows, rotationAxis, type Frame } from './model';
 import { createDocument } from '../document';
 import type { FaceData } from '../kernel/occ/types';
 
@@ -61,6 +61,30 @@ describe('montagem: transformações e juntas', () => {
     const g = frameFromFace(cyl)!; expect(close(g.origin, [10, 7, 15])).toBe(true); expect(Math.abs(g.x[2])).toBeLessThan(1e-9);
     expect(frameFromFace({ ...cyl, type: 'torus' })).toBeNull();
     expect(close(applyDir(rotationAxis([0, 0, 1], 90), [1, 0, 0]), [0, 1, 0])).toBe(true);
+  });
+
+  it('animação: ida, ida e volta e giro contínuo movem as juntas sem mexer no documento', () => {
+    const asm = createAssembly(); const p = addPart(asm, createDocument('Peça'));
+    const base = addInstance(asm, p.id), arm = addInstance(asm, p.id), slide = addInstance(asm, p.id);
+    const fr: Frame = { origin: [0, 0, 0], z: [0, 0, 1], x: [1, 0, 0] };
+    const pin = addJoint(asm, 'revolute', arm.id, fr, base.id, fr); pin.angle = 10;
+    const sl = addJoint(asm, 'slider', slide.id, fr, base.id, fr); sl.distance = 5;
+    const anim = syncTracks(asm);
+    expect(anim.tracks.map((t) => t.joint)).toEqual([pin.id, sl.id]);
+    expect(anim.tracks[0]).toMatchObject({ angleFrom: 10, angleTo: 100, mode: 'pingpong' });
+    anim.tracks[0].mode = 'linear';
+    expect(jointValuesAt(asm, 0.5).get(pin.id)!.angle).toBeCloseTo(55);
+    anim.tracks[0].mode = 'pingpong';
+    expect(jointValuesAt(asm, 0.25).get(pin.id)!.angle).toBeCloseTo(55); expect(jointValuesAt(asm, 0.75).get(pin.id)!.angle).toBeCloseTo(55); expect(jointValuesAt(asm, 1).get(pin.id)!.angle).toBeCloseTo(10);
+    anim.tracks[0].mode = 'spin'; anim.tracks[0].angleTo = 720;
+    expect(jointValuesAt(asm, 0.5).get(pin.id)!.angle).toBeCloseTo(370);
+    anim.tracks[1].enabled = false;
+    expect(jointValuesAt(asm, 0.5).get(sl.id)!.distance).toBe(5);
+    anim.tracks[1].enabled = true; // curso 5 → 25, ida e volta: no meio está em 25
+    const T = computeTransformsAt(asm, 0.5);
+    expect(close(applyPoint(T.get(slide.id)!, [0, 0, 0]), [0, 0, 25])).toBe(true);
+    expect(pin.angle).toBe(10); expect(sl.distance).toBe(5); // documento intacto
+    expect(close(applyPoint(computeTransforms(asm).get(slide.id)!, [0, 0, 0]), [0, 0, 5])).toBe(true);
   });
 
   it('lista de materiais agrupa por peça', () => {

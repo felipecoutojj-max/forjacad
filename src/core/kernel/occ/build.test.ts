@@ -2,7 +2,7 @@
 import { describe, it, expect, beforeAll } from 'vitest';
 import initOpenCascade from 'opencascade.js/dist/node.js';
 import type { OpenCascadeInstance } from 'opencascade.js';
-import { rebuildDocument, tessellate, exportSTEP, projectViews, assemblyShapes } from './build';
+import { rebuildDocument, tessellate, exportSTEP, projectViews, assemblyShapes, interferences } from './build';
 import { createDocument, addExtrude, addRevolve, addFillet, addBoolean, type ForjaDocument } from '../../document';
 import * as M from '../../sketch/model';
 
@@ -176,6 +176,18 @@ describe('kernel OpenCASCADE', () => {
     const [front] = projectViews(oc, shapes, [{ name: 'front', n: [0, 0, 1], up: [0, 1, 0] }]);
     expect(front.bbox[2] - front.bbox[0]).toBeCloseTo(220, 3); expect(front.circles).toHaveLength(2);
     expect(exportSTEP(oc, shapes.map((shape, i) => ({ id: String(i), shape }))).length).toBeGreaterThan(1000);
+  });
+
+  it('interferência: blocos separados não acusam, sobrepostos acusam o volume comum', () => {
+    const doc = createDocument(); addExtrude(doc, rectSketch(doc, 'plane-xy', 0, 0, 50, 50).id, 50);
+    const I = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]; const shift = (x: number) => [1, 0, 0, x, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
+    const cache = new Map();
+    const hits = interferences(oc, [{ id: 'p', doc }], [
+      [{ part: 'p', matrix: I }, { part: 'p', matrix: shift(60) }],   // passo 0: afastados
+      [{ part: 'p', matrix: I }, { part: 'p', matrix: shift(50) }],   // passo 1: encostados (volume 0)
+      [{ part: 'p', matrix: I }, { part: 'p', matrix: shift(40) }],   // passo 2: 10 mm dentro
+    ], cache);
+    expect(hits).toHaveLength(1); expect(hits[0]).toMatchObject({ step: 2, a: 0, b: 1 }); expect(hits[0].volume).toBeCloseTo(10 * 50 * 50, 0);
   });
 
   it('exporta STEP com os corpos', () => {

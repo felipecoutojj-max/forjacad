@@ -139,6 +139,17 @@ export class Viewport {
 
   bodyMatrixOf(id: Id): THREE.Matrix4 { return this.bodyMatrix.get(id) ?? new THREE.Matrix4(); }
 
+  /** Move corpos já na cena (animação): só troca matrizes, sem reconstruir geometria. */
+  updateMatrices(map: Map<Id, number[]>): void {
+    for (const [id, m] of map) { const mesh = this.bodyMeshes.get(id); if (!mesh) continue; const mat = new THREE.Matrix4().fromArray(m).transpose(); mesh.matrix.copy(mat); this.bodyMatrix.set(id, mat); }
+    this.bodies.updateMatrixWorld(true); this.requestRender();
+  }
+  /** Fluxo de vídeo do canvas, para gravar a animação. */
+  captureStream(fps = 30): MediaStream | null {
+    const c = this.renderer.domElement as HTMLCanvasElement & { captureStream?: (fps: number) => MediaStream };
+    return typeof c.captureStream === 'function' ? c.captureStream(fps) : null;
+  }
+
   /** Redesenha só os destaques de face e aresta. */
   setSelection(sel: Sel3D): void {
     this.highlights.clear();

@@ -2,9 +2,9 @@
 // (se chegam vários pedidos enquanto um roda, só o último vale).
 
 import type { ForjaDocument } from '../../document';
-import type { KernelRequest, KernelResponse, RebuildResult, ViewSpec, ProjectedView, AssemblyPayload } from './types';
+import type { KernelRequest, KernelResponse, RebuildResult, ViewSpec, ProjectedView, AssemblyPayload, InterferenceHit } from './types';
 
-type RequestBody = { type: 'rebuild'; doc: ForjaDocument } | { type: 'export'; format: 'step' } | { type: 'project'; views: ViewSpec[] } | { type: 'projectAssembly'; assembly: AssemblyPayload; views: ViewSpec[] } | { type: 'exportAssembly'; assembly: AssemblyPayload };
+type RequestBody = { type: 'rebuild'; doc: ForjaDocument } | { type: 'export'; format: 'step' } | { type: 'project'; views: ViewSpec[] } | { type: 'projectAssembly'; assembly: AssemblyPayload; views: ViewSpec[] } | { type: 'exportAssembly'; assembly: AssemblyPayload } | { type: 'interference'; parts: AssemblyPayload['parts']; steps: { part: string; matrix: number[] }[][] };
 
 export type KernelState = 'loading' | 'ready' | 'failed';
 
@@ -47,6 +47,7 @@ export class KernelClient {
     else if (m.type === 'rebuilt') p.resolve(m.result as never);
     else if (m.type === 'exported') p.resolve(m.data as never);
     else if (m.type === 'projected') p.resolve(m.views as never);
+    else if (m.type === 'interference') p.resolve(m.hits as never);
     if (p.coalesced && this.queued) { const q = this.queued; this.queued = null; this.startRebuild(q.doc, q.resolve, q.reject); }
   }
 
@@ -68,6 +69,9 @@ export class KernelClient {
   }
   projectAssembly(assembly: AssemblyPayload, views: ViewSpec[]): Promise<ProjectedView[]> {
     return new Promise((resolve, reject) => this.send({ type: 'projectAssembly', assembly, views }, resolve as (v: never) => void, reject));
+  }
+  interference(parts: AssemblyPayload['parts'], steps: { part: string; matrix: number[] }[][]): Promise<InterferenceHit[]> {
+    return new Promise((resolve, reject) => this.send({ type: 'interference', parts, steps }, resolve as (v: never) => void, reject));
   }
   exportStepAssembly(assembly: AssemblyPayload): Promise<string> {
     return new Promise((resolve, reject) => this.send({ type: 'exportAssembly', assembly }, resolve as (v: never) => void, reject));

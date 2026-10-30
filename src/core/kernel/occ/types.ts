@@ -58,7 +58,10 @@ export type KernelRequest =
   | { id: number; type: 'export'; format: 'step' }
   | { id: number; type: 'project'; views: ViewSpec[] }
   | { id: number; type: 'projectAssembly'; assembly: AssemblyPayload; views: ViewSpec[] }
-  | { id: number; type: 'exportAssembly'; assembly: AssemblyPayload };
+  | { id: number; type: 'exportAssembly'; assembly: AssemblyPayload }
+  | { id: number; type: 'interference'; parts: AssemblyPayload['parts']; steps: { part: Id; matrix: number[] }[][] };
+
+export interface InterferenceHit { step: number; a: number; b: number; volume: number; }
 
 export type KernelResponse =
   | { id: 0; type: 'ready'; ms: number }
@@ -66,4 +69,5 @@ export type KernelResponse =
   | { id: number; type: 'rebuilt'; result: RebuildResult }
   | { id: number; type: 'exported'; data: string; mime: string }
   | { id: number; type: 'projected'; views: ProjectedView[] }
+  | { id: number; type: 'interference'; hits: InterferenceHit[] }
   | { id: number; type: 'error'; message: string };

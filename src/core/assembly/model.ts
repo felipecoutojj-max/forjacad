@@ -24,7 +24,19 @@ export interface Joint {
   /** Inverte o eixo (Z da face móvel oposto ao Z da face base), como encaixar um pino num furo. */
   flip?: boolean;
 }
-export interface Assembly { parts: PartDef[]; instances: Instance[]; joints: Joint[]; }
+export interface Assembly { parts: PartDef[]; instances: Instance[]; joints: Joint[]; animation?: Animation; }
+
+/** Movimento de uma junta ao longo da animação (t de 0 a 1). */
+export type MotionMode = 'linear' | 'pingpong' | 'spin';
+export interface MotionTrack {
+  joint: Id; enabled: boolean; mode: MotionMode;
+  /** Ângulo inicial e final em graus (pino, cilíndrica). Em 'spin', `angleTo` é o total girado (360 = uma volta). */
+  angleFrom: number; angleTo: number;
+  /** Curso inicial e final em mm (deslizante, cilíndrica). */
+  distFrom: number; distTo: number;
+}
+export interface Animation { duration: number; loop: boolean; tracks: MotionTrack[]; }
+export const MOTION_NAMES: Record<MotionMode, string> = { linear: 'Ida', pingpong: 'Ida e volta', spin: 'Giro contínuo' };
 
 export const JOINT_NAMES: Record<JointType, string> = { fixed: 'Rígida', revolute: 'Pino (rotação)', slider: 'Deslizante', cylindrical: 'Cilíndrica' };
 
@@ -170,4 +182,47 @@ export function bomRows(asm: Assembly): BomRow[] {
     row.qty++; row.instances.push(inst.id);
   }
   return rows;
+}
+
+// ---------- Animação ----------
+
+export function createAnimation(): Animation { return { duration: 4, loop: true, tracks: [] }; }
+
+/** Faixa padrão para uma junta: parte do valor atual e vai um pouco além, ida e volta. */
+export function defaultTrack(j: Joint): MotionTrack {
+  return { joint: j.id, enabled: true, mode: j.type === 'revolute' ? 'pingpong' : 'pingpong', angleFrom: j.angle, angleTo: j.angle + 90, distFrom: j.distance, distTo: j.distance + 20 };
+}
+/** Garante uma faixa para cada junta móvel (pino, deslizante, cilíndrica) e tira as de juntas que sumiram. */
+export function syncTracks(asm: Assembly): Animation {
+  const anim = asm.animation ?? (asm.animation = createAnimation());
+  anim.tracks = anim.tracks.filter((t) => asm.joints.some((j) => j.id === t.joint && j.type !== 'fixed'));
+  for (const j of asm.joints) if (j.type !== 'fixed' && !anim.tracks.some((t) => t.joint === j.id)) anim.tracks.push(defaultTrack(j));
+  return anim;
+}
+
+function interp(from: number, to: number, mode: MotionMode, t: number): number {
+  if (mode === 'spin') return from + to * t;
+  const s = mode === 'pingpong' ? (t < 0.5 ? 2 * t : 2 - 2 * t) : t;
+  return from + (to - from) * s;
+}
+
+/** Valores (ângulo, curso) de cada junta no instante t ∈ [0, 1]; juntas sem faixa ficam no valor fixo. */
+export function jointValuesAt(asm: Assembly, t: number): Map<Id, { angle: number; distance: number }> {
+  const out = new Map<Id, { angle: number; distance: number }>();
+  const tt = Math.max(0, Math.min(1, t));
+  for (const j of asm.joints) {
+    const tr = asm.animation?.tracks.find((x) => x.joint === j.id && x.enabled);
+    if (!tr) { out.set(j.id, { angle: j.angle, distance: j.distance }); continue; }
+    const angle = j.type === 'revolute' || j.type === 'cylindrical' ? interp(tr.angleFrom, tr.angleTo, tr.mode, tt) : j.angle;
+    const distance = j.type === 'slider' || j.type === 'cylindrical' ? interp(tr.distFrom, tr.distTo, tr.mode === 'spin' ? 'linear' : tr.mode, tt) : j.distance;
+    out.set(j.id, { angle, distance });
+  }
+  return out;
+}
+
+/** Transformações das instâncias com as juntas nos valores do instante t, sem alterar o documento. */
+export function computeTransformsAt(asm: Assembly, t: number): Map<Id, Mat4> {
+  const values = jointValuesAt(asm, t);
+  const posed: Assembly = { ...asm, joints: asm.joints.map((j) => ({ ...j, ...values.get(j.id) })) };
+  return computeTransforms(posed);
 }

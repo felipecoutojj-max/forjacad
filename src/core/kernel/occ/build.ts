@@ -8,7 +8,7 @@ import { getSketch, getPlane, planeNormal, planeToWorld } from '../../document';
 import type { Sketch, Id } from '../../sketch/model';
 import { getPoint, findEntity } from '../../sketch/model';
 import { extractProfiles, loopArcAngles, type Loop, type Profile } from '../profiles';
-import type { BodyData, FaceData, EdgeData, FeatureError, FaceType, ViewSpec, ProjectedView, ProjCircle } from './types';
+import type { BodyData, FaceData, EdgeData, FeatureError, FaceType, ViewSpec, ProjectedView, ProjCircle, InterferenceHit } from './types';
 
 type OC = OpenCascadeInstance;
 export interface BuiltBody { id: Id; shape: TopoDS_Shape; }
@@ -455,4 +455,28 @@ export function assemblyShapes(oc: OC, parts: { id: Id; doc: ForjaDocument }[], 
   const out: TopoDS_Shape[] = [];
   for (const inst of instances) for (const sh of byPart.get(inst.part) ?? []) out.push(transformShape(oc, sh, inst.matrix));
   return out;
+}
+
+/** Volume comum entre pares de instâncias em cada passo do movimento (0 quando só encostam). */
+export function interferences(oc: OC, parts: { id: Id; doc: ForjaDocument }[], steps: { part: Id; matrix: number[] }[][], cache: Map<string, TopoDS_Shape[]>, minVolume = 0.01): InterferenceHit[] {
+  const hits: InterferenceHit[] = [];
+  steps.forEach((instances, step) => {
+    // Uma forma (composta) por instância, já no mundo.
+    const perInst: TopoDS_Shape[][] = instances.map((inst) => assemblyShapes(oc, parts, [inst], cache));
+    const boxes = perInst.map((shapes) => { const box = new oc.Bnd_Box_1(); for (const sh of shapes) oc.BRepBndLib.Add(sh, box, false); return box; });
+    for (let a = 0; a < perInst.length; a++) for (let b = a + 1; b < perInst.length; b++) {
+      if (boxes[a].IsOut_4(boxes[b])) continue;
+      let volume = 0;
+      for (const sa of perInst[a]) for (const sb of perInst[b]) {
+        try {
+          const op = new oc.BRepAlgoAPI_Common_3(sa, sb, new oc.Message_ProgressRange_1()); op.Build(new oc.Message_ProgressRange_1());
+          if (!op.HasErrors() && hasSolid(oc, op.Shape())) { const props = new oc.GProp_GProps_1(); oc.BRepGProp.VolumeProperties_1(op.Shape(), props, false, false, false); volume += Math.abs(props.Mass()); props.delete(); }
+          op.delete();
+        } catch { /* par problemático: segue */ }
+      }
+      if (volume > minVolume) hits.push({ step, a, b, volume });
+    }
+    for (const box of boxes) box.delete();
+  });
+  return hits;
 }

@@ -5,7 +5,7 @@
 import ocInit from 'opencascade.js/dist/opencascade.full.js';
 import wasmUrl from 'opencascade.js/dist/opencascade.full.wasm?url';
 import type { OpenCascadeInstance } from 'opencascade.js';
-import { rebuildDocument, tessellate, exportSTEP, projectViews, assemblyShapes, errorMessage, type BuiltBody } from './build';
+import { rebuildDocument, tessellate, exportSTEP, projectViews, assemblyShapes, interferences, errorMessage, type BuiltBody } from './build';
 import type { TopoDS_Shape } from 'opencascade.js';
 import type { KernelRequest, KernelResponse, BodyData } from './types';
 import { bodyName } from '../../document';
@@ -59,6 +59,8 @@ function handle(req: KernelRequest): void {
       const transfer: Transferable[] = [];
       for (const v of views) for (const arr of [...v.visible, ...v.hidden, ...v.tangent]) transfer.push(arr.buffer);
       post({ id: req.id, type: 'projected', views }, transfer);
+    } else if (req.type === 'interference') {
+      post({ id: req.id, type: 'interference', hits: interferences(oc, req.parts, req.steps, partCache) });
     } else if (req.type === 'exportAssembly') {
       const shapes = assemblyShapes(oc, req.assembly.parts, req.assembly.instances, partCache);
       if (!shapes.length) throw new Error('Nenhuma peça para exportar.');
