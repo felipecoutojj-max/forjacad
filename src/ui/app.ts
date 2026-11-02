@@ -7,7 +7,7 @@ import { icons, type IconName } from './icons';
 import {
   createDocument, serialize, deserialize, getPlane, getSketch, addExtrude, addRevolve, addFillet, addBoolean, addFacePlane, pruneFacePlanes, addPushPull, planeToWorld,
   addShell, addMirror, addTransform, addSplit, addSweep, addLoft, addImport, addOffsetPlane, addReplaceFace, type PatternSpec, type FaceRef, type ReplaceTarget,
-  bodyIds, bodyName, featuresOfBody, planeNormal, isHidden, setHidden, renameBody,
+  bodyIds, bodyName, featuresOfBody, planeNormal, isHidden, setHidden, renameBody, bodyMaterial, setBodyMaterial,
   type ForjaDocument, type Plane, type Feature, type ExtrudeFeature, type RevolveFeature, type ExtrudeOp, type V3, type SketchAxis,
 } from '../core/document';
 import * as M from '../core/sketch/model';
@@ -16,6 +16,7 @@ import { solveSketch, type SolveResult, type SolveOptions } from '../core/sketch
 import { recognizeStroke, type Primitive } from '../core/sketch/recognizer';
 import { isTrimmable, trimSegmentAt, applyTrim, type TrimSegment, type Trimmable } from '../core/sketch/trim';
 import { projectPolylines } from '../core/sketch/project';
+import { MATERIALS, EDGE_COLORS, loadViewSettings, saveViewSettings, materialSpec, hexString, type ViewSettings, type EdgeColorKey } from './materials';
 import { buildAllBodies, buildExtrude, extractProfiles, profileInnerPoint, profileContainsPoint, profileToShape, planeMatrix } from '../core/kernel/preview';
 import { KernelClient, SupersededError } from '../core/kernel/occ/client';
 import type { BodyData, FeatureError, RebuildResult } from '../core/kernel/occ/types';
@@ -102,6 +103,8 @@ export class App {
   private pointers = new Map<number, PointerInfo>();
   private pinch: { d0: number; mid: { x: number; y: number } } | null = null;
   private stroke: Vec2[] = [];
+  /** Ajustes de visualização (material padrão, linhas, arestas), guardados no aparelho. */
+  private view: ViewSettings = loadViewSettings();
   /** Substituir face em andamento: face plana escolhida, esperando o toque na face de destino. */
   private replaceFlow: { body: Id; face: FaceRef } | null = null;
   /** Varredura da ferramenta Aparar em andamento: quantos trechos já sumiram. */
@@ -158,7 +161,7 @@ export class App {
     this.vp.onAfterRender = () => this.placeLabels();
     this.bindPointer();
     this.bindKeys();
-    this.applyTheme(this.loadTheme());
+    this.applyTheme(this.loadTheme()); this.applyViewSettings(false);
     this.kernel.onState = (s) => {
       this.renderStatus();
       if (s === 'ready') { this.toast(`Kernel 3D pronto (${(this.kernel.loadMs / 1000).toFixed(1)} s).`); void this.rebuild(); }
@@ -194,6 +197,48 @@ export class App {
     return grip;
   }
 
+  // ---------- Ajustes ----------
+  private applyViewSettings(redraw = true): void {
+    this.vp.setViewSettings({ edgeColor: EDGE_COLORS[this.view.edgeColor].hex, edgeWidth: this.view.edgeWidth, showEdges: this.view.showEdges });
+    saveViewSettings(this.view); if (redraw) this.redrawBodies();
+  }
+  /** Painel da engrenagem: material e cor da peça, linhas, arestas e tema. Cada mudança vale na hora. */
+  private settingsPanel(ev: MouseEvent): void {
+    this.closeMenus();
+    const doc = this.doc.current; const sel = this.selBodies();
+    const m = el('div', 'menu settings'); const r = this.overlay.getBoundingClientRect(); const br = (ev.currentTarget as HTMLElement).getBoundingClientRect();
+    m.style.left = `${Math.max(8, Math.min(br.right - r.left - 300, r.width - 310))}px`; m.style.top = `${Math.max(8, br.bottom - r.top + 6)}px`;
+    const h = (text: string) => { const x = el('h4'); x.textContent = text; m.append(x); };
+    const row = (label: string, ctrl: HTMLElement) => { const x = el('div', 'row'); const l = el('span'); l.textContent = label; x.append(l, ctrl); m.append(x); return x; };
+    const select = (options: [string, string][], value: string, on: (v: string) => void) => { const s = document.createElement('select'); for (const [v, n] of options) { const o = document.createElement('option'); o.value = v; o.textContent = n; if (v === value) o.selected = true; s.append(o); } s.addEventListener('change', () => on(s.value)); return s; };
+    // Material: do corpo selecionado (se houver) ou padrão de todos.
+    let target: 'sel' | 'all' = sel.length ? 'sel' : 'all';
+    const curKey = () => target === 'sel' ? (bodyMaterial(doc, sel[0]) ?? this.view.material) : this.view.material;
+    const curColor = () => { const k = curKey(); const spec = materialSpec(k, this.view.customColor); return k === 'custom' ? this.view.customColor : /^#/.test(k) ? k : hexString(spec?.color ?? MATERIALS.aco.color); };
+    const applyMaterial = (key: string) => {
+      if (target === 'sel') { this.pushUndo(); for (const id of sel) setBodyMaterial(doc, id, key === 'aco' ? null : key); this.autosave(); this.redrawBodies(); this.renderSidePanel(); }
+      else { this.view.material = key; if (doc.materials) { this.pushUndo(); delete doc.materials; this.autosave(); } this.applyViewSettings(); }
+    };
+    h('Peça');
+    const matSel = select([...Object.entries(MATERIALS).map(([k, v]) => [k, v.name] as [string, string]), ['custom', 'Cor personalizada…']], /^#/.test(curKey()) ? 'custom' : curKey(), (v) => { if (v === 'custom') { color.value = curColor(); applyMaterial(target === 'sel' ? color.value : 'custom'); } else applyMaterial(v); color.value = curColor(); });
+    row('Material', matSel);
+    const color = document.createElement('input'); color.type = 'color'; color.value = curColor();
+    color.addEventListener('input', () => { this.view.customColor = color.value; if (target === 'sel') applyMaterial(color.value); else applyMaterial('custom'); matSel.value = 'custom'; });
+    row('Cor', color);
+    if (sel.length) {
+      const seg = el('div', 'seg'); const mk = (t: 'sel' | 'all', label: string) => { const b = document.createElement('button'); b.textContent = label; if (target === t) b.classList.add('active'); b.addEventListener('click', () => { target = t; for (const c of seg.children) c.classList.toggle('active', c === b); matSel.value = /^#/.test(curKey()) ? 'custom' : curKey(); color.value = curColor(); }); seg.append(b); };
+      mk('sel', sel.length > 1 ? `${sel.length} corpos selecionados` : 'Corpo selecionado'); mk('all', 'Todos'); row('Aplicar a', seg);
+    }
+    h('Linhas');
+    row('Cor das arestas', select(Object.entries(EDGE_COLORS).map(([k, v]) => [k, v.name] as [string, string]), this.view.edgeColor, (v) => { this.view.edgeColor = v as EdgeColorKey; this.applyViewSettings(false); }));
+    row('Espessura', select([['1', 'Fina (1 px)'], ['1.5', 'Normal (1,5 px)'], ['2', 'Grossa (2 px)'], ['3', 'Bem grossa (3 px)']], String(this.view.edgeWidth), (v) => { this.view.edgeWidth = parseFloat(v); this.applyViewSettings(false); }));
+    const chk = document.createElement('input'); chk.type = 'checkbox'; chk.checked = this.view.showEdges; chk.addEventListener('change', () => { this.view.showEdges = chk.checked; this.applyViewSettings(false); }); row('Arestas visíveis', chk);
+    h('Tela');
+    row('Tema', select([['light', 'Claro'], ['dark', 'Escuro']], document.documentElement.dataset.theme === 'dark' ? 'dark' : 'light', (v) => this.applyTheme(v as 'light' | 'dark')));
+    const hint = el('div', 'hint'); hint.textContent = sel.length ? 'O material do corpo selecionado fica salvo na peça; o padrão vale para os outros corpos.' : 'Selecione um corpo para dar um material só a ele. Material, cor e linhas valem nesta e nas próximas peças.'; m.append(hint);
+    this.overlay.append(m); this.menus.push(m);
+  }
+
   // ---------- Aparência ----------
   private loadTheme(): 'light' | 'dark' { try { return localStorage.getItem('forjacad.theme') === 'dark' ? 'dark' : 'light'; } catch { return 'light'; } }
   /** Tema claro por padrão (oficina à luz do dia); o escuro é escolha explícita e fica gravado. */
@@ -216,6 +261,7 @@ export class App {
     top.append(this.iconButton('undo', 'Desfazer', () => this.undo()), this.iconButton('redo', 'Refazer', () => this.redo()));
     const spacer = el('div', 'spacer'); top.append(spacer);
     this.statusEl = el('div', 'status'); top.append(this.statusEl);
+    top.append(this.iconButton('gear', 'Ajustes', (ev) => this.settingsPanel(ev)));
     const themeBtn = this.iconButton('theme', 'Aparência', () => this.toggleTheme()); top.append(themeBtn);
     top.append(this.button('Novo', (ev) => this.newDocument(ev)), this.button('Abrir', () => this.openFile()), this.button('Salvar', () => this.saveFile()), this.button('Exportar', (ev) => this.exportMenu(ev)));
     this.root.append(top);
@@ -332,7 +378,7 @@ export class App {
   /** Redesenha os corpos (sem recalcular): aplica ocultos e seleção. */
   private redrawBodies(): void {
     const doc = this.doc.current;
-    this.vp.setBodies(this.bodies.filter((b) => !isHidden(doc, b.id)).map(toRenderBody), this.sel3d); if (this.xray) this.vp.setXray(true); this.updateFaceHandle();
+    this.vp.setBodies(this.bodies.filter((b) => !isHidden(doc, b.id)).map((b) => toRenderBody(b, materialSpec(bodyMaterial(doc, b.id) ?? this.view.material, this.view.customColor))), this.sel3d); if (this.xray) this.vp.setXray(true); this.updateFaceHandle();
   }
   toggleXray(): void {
     this.xray = !this.xray; this.vp.setXray(this.xray); this.vp.setSelection(this.sel3d); this.renderToolbar();
@@ -1454,7 +1500,11 @@ export class App {
       this.pinch = { d0: d, mid }; this.refreshSketch(); return;
     }
     if (this.pointers.size !== 1) return;
-    if (info.role === 'nav') { if (this.mode === 'sketch' && !this.vp.sketchPerspective) this.vp.pan(dx, dy); else this.vp.orbit(dx, dy); this.refreshSketch(); return; }
+    if (info.role === 'nav') {
+      // No esboço o plano fica solto no espaço: arrastar gira a cena mesmo na vista reta (que se desliga sozinha). Dois dedos deslocam.
+      if (this.mode === 'sketch' && !this.vp.sketchPerspective && info.moved) { this.vp.setSketchPerspective(true); this.renderToolbar(); }
+      if (this.mode === 'sketch' && !this.vp.sketchPerspective) this.vp.pan(dx, dy); else this.vp.orbit(dx, dy); this.refreshSketch(); return;
+    }
     if (info.role === 'pan') { this.vp.pan(dx, dy); this.refreshSketch(); return; }
     if (this.mode === 'sketch') this.toolMove(info, ev);
     else if (info.role === 'tool') this.viewMove(info);
@@ -3108,12 +3158,12 @@ export class App {
   }
 }
 
-function toRenderBody(b: BodyData): RenderBody {
+function toRenderBody(b: BodyData, material?: { color: number; metalness: number; roughness: number }): RenderBody {
   const g = new THREE.BufferGeometry();
   g.setAttribute('position', new THREE.BufferAttribute(b.positions, 3));
   g.setAttribute('normal', new THREE.BufferAttribute(b.normals, 3));
   g.setIndex(new THREE.BufferAttribute(b.indices, 1));
-  return { id: b.id, name: b.name, geometry: g, data: b };
+  return { id: b.id, name: b.name, geometry: g, data: b, material };
 }
 function bodyOfFeature(f: Feature): Id | null {
   if ('body' in f) return f.body;

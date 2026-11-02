@@ -2,6 +2,11 @@
 // Renderiza sob demanda (requestRender) para poupar bateria no iPad.
 
 import * as THREE from 'three';
+import { LineSegments2 } from 'three/examples/jsm/lines/LineSegments2.js';
+import { LineSegmentsGeometry } from 'three/examples/jsm/lines/LineSegmentsGeometry.js';
+import { Line2 } from 'three/examples/jsm/lines/Line2.js';
+import { LineGeometry } from 'three/examples/jsm/lines/LineGeometry.js';
+import { LineMaterial } from 'three/examples/jsm/lines/LineMaterial.js';
 import type { Plane } from '../core/document';
 import { planeNormal } from '../core/document';
 import type { BodyData, EdgeData } from '../core/kernel/occ/types';
@@ -12,13 +17,13 @@ export type ViewMode = 'view' | 'sketch';
 
 /** Paleta 3D: aço claro e cinzas no claro; grafite no escuro. Laranja de aço aquecido marca a seleção, palha o hover, lilás os planos. */
 export const THEMES = {
-  light: { body: 0xd3d8df, bodySel: 0xe3c3a0, faceSel: 0xf0542b, edge: 0x3a3a3c, edgeSel: 0xf0542b, hover: 0xe9a825, region: 0xe9a825, regionHot: 0xf0542b, ghost: 0xf0542b, ghostEdge: 0xf0542b, grid1: 0xb8bec8, grid2: 0xcdd2d9, plane: 0x7c6bc4, axes: [0xff3b30, 0x34c759, 0x5e5ce6], hemiSky: 0xffffff, hemiGround: 0x9aa0a8, key: 1.25, fill: 0.55 },
-  dark: { body: 0x8d96a3, bodySel: 0xc9a070, faceSel: 0xff6a3d, edge: 0x16171a, edgeSel: 0xff6a3d, hover: 0xf2b640, region: 0xf2b640, regionHot: 0xff6a3d, ghost: 0xff6a3d, ghostEdge: 0xffb15c, grid1: 0x3c3f46, grid2: 0x2a2c31, plane: 0x9d8ce0, axes: [0xff453a, 0x30d158, 0x7d7aff], hemiSky: 0xe0e4ea, hemiGround: 0x2a2f38, key: 1.3, fill: 0.5 },
+  light: { body: 0xd3d8df, bodySel: 0xe3c3a0, faceSel: 0xf0542b, edge: 0x111111, edgeSel: 0xf0542b, hover: 0xe9a825, region: 0xe9a825, regionHot: 0xf0542b, ghost: 0xf0542b, ghostEdge: 0xf0542b, grid1: 0xb8bec8, grid2: 0xcdd2d9, plane: 0x7c6bc4, axes: [0xff3b30, 0x34c759, 0x5e5ce6], hemiSky: 0xffffff, hemiGround: 0x9aa0a8, key: 1.25, fill: 0.55 },
+  dark: { body: 0x8d96a3, bodySel: 0xc9a070, faceSel: 0xff6a3d, edge: 0x0b0b0d, edgeSel: 0xff6a3d, hover: 0xf2b640, region: 0xf2b640, regionHot: 0xff6a3d, ghost: 0xff6a3d, ghostEdge: 0xffb15c, grid1: 0x3c3f46, grid2: 0x2a2c31, plane: 0x9d8ce0, axes: [0xff453a, 0x30d158, 0x7d7aff], hemiSky: 0xe0e4ea, hemiGround: 0x2a2f38, key: 1.3, fill: 0.5 },
 };
 export type ThemeName = keyof typeof THEMES;
 
 /** Corpo para desenhar: malha do kernel (com `data`) ou prévia (só geometria). */
-export interface RenderBody { id: Id; name: string; geometry: THREE.BufferGeometry; data?: BodyData; /** 4×4 em linha-maior (instância de montagem). */ matrix?: number[]; }
+export interface RenderBody { id: Id; name: string; geometry: THREE.BufferGeometry; data?: BodyData; /** 4×4 em linha-maior (instância de montagem). */ matrix?: number[]; /** Material visual próprio (cor, brilho); sem ele, o padrão do tema. */ material?: { color: number; metalness: number; roughness: number }; }
 
 /** Seleção em modo vista. Arestas selecionadas pertencem sempre a um único corpo. */
 export interface Sel3D { body: Id | null; /** Outros corpos selecionados junto (caixa de seleção): movem, combinam, somem e apagam juntos. */ bodies?: Id[]; face: { body: Id; index: number } | null; /** Faces selecionadas além da principal (toque soma). */ faces?: { body: Id; index: number }[]; edges: { body: Id; index: number }[]; }
@@ -61,7 +66,7 @@ export class Viewport {
   private regionMat = new THREE.MeshBasicMaterial({ color: 0xe9a825, transparent: true, opacity: 0.12, side: THREE.DoubleSide, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2 });
   private regionHotMat = new THREE.MeshBasicMaterial({ color: 0xf0542b, transparent: true, opacity: 0.35, side: THREE.DoubleSide, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2 });
   private hoverFaceMat = new THREE.MeshBasicMaterial({ color: 0xe9a825, transparent: true, opacity: 0.3, side: THREE.DoubleSide, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -3, polygonOffsetUnits: -3 });
-  private hoverEdgeMat = new THREE.LineBasicMaterial({ color: 0xe9a825, depthTest: false });
+  private hoverEdgeMat = new LineMaterial({ color: 0xe9a825, linewidth: 3, worldUnits: false, depthTest: false });
   private ghostMat = new THREE.MeshStandardMaterial({ color: 0xf0542b, transparent: true, opacity: 0.45, metalness: 0.2, roughness: 0.6, side: THREE.DoubleSide, depthWrite: false });
   private ghostEdgeMat = new THREE.LineBasicMaterial({ color: 0xf0542b });
   private planeMeshes = new Map<string, THREE.Mesh>();
@@ -78,8 +83,15 @@ export class Viewport {
   private bodyMaterial = new THREE.MeshStandardMaterial({ color: 0xd3d8df, metalness: 0.12, roughness: 0.62, side: THREE.DoubleSide });
   private bodySelMaterial = new THREE.MeshStandardMaterial({ color: 0xe3c3a0, metalness: 0.12, roughness: 0.58, side: THREE.DoubleSide });
   private faceSelMaterial = new THREE.MeshBasicMaterial({ color: 0xf0542b, transparent: true, opacity: 0.45, side: THREE.DoubleSide, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -3, polygonOffsetUnits: -3 });
-  private edgeMaterial = new THREE.LineBasicMaterial({ color: 0x3a3a3c });
-  private edgeSelMaterial = new THREE.LineBasicMaterial({ color: 0xf0542b, depthTest: false });
+  private edgeMaterial = new LineMaterial({ color: 0x111111, linewidth: 1.5, worldUnits: false });
+  /** Cor das arestas escolhida nos ajustes (null = a do tema). */
+  private edgeColorOverride: number | null = null;
+  private showEdges = true;
+  private edgeLines: LineSegments2[] = [];
+  /** Materiais próprios por corpo (base e selecionado). */
+  private bodyMats = new Map<Id, { base: THREE.MeshStandardMaterial; sel: THREE.MeshStandardMaterial }>();
+  private clipPlanes: THREE.Plane[] = [];
+  private edgeSelMaterial = new LineMaterial({ color: 0xf0542b, linewidth: 3, worldUnits: false, depthTest: false });
   private hemi!: THREE.HemisphereLight; private keyLight!: THREE.DirectionalLight; private fillLight!: THREE.DirectionalLight;
   private planeMat = new THREE.MeshBasicMaterial({ color: 0x7c6bc4, transparent: true, opacity: 0.06, side: THREE.DoubleSide, depthWrite: false });
   private planeEdgeMat = new THREE.LineBasicMaterial({ color: 0x7c6bc4, transparent: true, opacity: 0.35 });
@@ -127,7 +139,7 @@ export class Viewport {
   applyTheme(name: ThemeName): void {
     this.theme = name; const t = THEMES[name];
     this.bodyMaterial.color.setHex(t.body); this.bodySelMaterial.color.setHex(t.bodySel); this.faceSelMaterial.color.setHex(t.faceSel);
-    this.edgeMaterial.color.setHex(t.edge); this.edgeSelMaterial.color.setHex(t.edgeSel);
+    this.edgeMaterial.color.setHex(this.edgeColorOverride ?? t.edge); this.edgeSelMaterial.color.setHex(t.edgeSel);
     this.hoverFaceMat.color.setHex(t.hover); this.hoverEdgeMat.color.setHex(t.hover); this.regionMat.color.setHex(t.region); this.regionHotMat.color.setHex(t.regionHot);
     this.ghostMat.color.setHex(t.ghost); this.ghostEdgeMat.color.setHex(t.ghostEdge); this.handleMat.color.setHex(t.faceSel); this.translucentMat.color.setHex(t.body); this.collideMat.color.setHex(t.faceSel);
     this.planeMat.color.setHex(t.plane); this.planeEdgeMat.color.setHex(t.plane);
@@ -169,7 +181,8 @@ export class Viewport {
 
   /** Substitui os corpos da cena e aplica a seleção (corpo, face, arestas). */
   setBodies(list: RenderBody[], sel: Sel3D): void {
-    this.bodies.clear(); this.bodyMeshes.clear(); this.bodyData.clear(); this.bodyMatrix.clear();
+    this.bodies.clear(); this.bodyMeshes.clear(); this.bodyData.clear(); this.bodyMatrix.clear(); this.edgeLines = [];
+    for (const m of this.bodyMats.values()) { m.base.dispose(); m.sel.dispose(); } this.bodyMats.clear();
     // A grade vira piso: fica logo abaixo do ponto mais baixo dos corpos.
     let minY = 0;
     for (const b of list) {
@@ -179,7 +192,12 @@ export class Viewport {
     }
     if (this.grid) this.grid.position.y = minY - 0.5;
     for (const b of list) {
-      const mesh = new THREE.Mesh(b.geometry, b.id === sel.body ? this.bodySelMaterial : this.bodyMaterial);
+      if (b.material) {
+        const base = new THREE.MeshStandardMaterial({ color: b.material.color, metalness: b.material.metalness, roughness: b.material.roughness, side: THREE.DoubleSide, clippingPlanes: this.clipPlanes });
+        const selm = base.clone(); selm.emissive = new THREE.Color(THEMES[this.theme].faceSel); selm.emissiveIntensity = 0.22;
+        this.bodyMats.set(b.id, { base, sel: selm });
+      }
+      const mesh = new THREE.Mesh(b.geometry, this.matOf(b.id, b.id === sel.body));
       mesh.userData.bodyId = b.id;
       const mat = b.matrix ? new THREE.Matrix4().fromArray(b.matrix).transpose() : new THREE.Matrix4();
       mesh.matrixAutoUpdate = false; mesh.matrix.copy(mat); this.bodyMatrix.set(b.id, mat);
@@ -187,9 +205,9 @@ export class Viewport {
         this.bodyData.set(b.id, b.data);
         const segs: number[] = [];
         for (const e of b.data.edges) for (let i = 0; i + 5 < e.points.length; i += 3) segs.push(e.points[i], e.points[i + 1], e.points[i + 2], e.points[i + 3], e.points[i + 4], e.points[i + 5]);
-        if (segs.length) { const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.Float32BufferAttribute(segs, 3)); mesh.add(new THREE.LineSegments(g, this.edgeMaterial)); }
+        if (segs.length) this.addEdgeLines(mesh, new LineSegmentsGeometry().setPositions(segs));
       } else {
-        mesh.add(new THREE.LineSegments(new THREE.EdgesGeometry(b.geometry, 25), this.edgeMaterial));
+        this.addEdgeLines(mesh, new LineSegmentsGeometry().fromEdgesGeometry(new THREE.EdgesGeometry(b.geometry, 25)));
       }
       this.bodies.add(mesh); this.bodyMeshes.set(b.id, mesh);
     }
@@ -198,6 +216,22 @@ export class Viewport {
   }
 
   bodyMatrixOf(id: Id): THREE.Matrix4 { return this.bodyMatrix.get(id) ?? new THREE.Matrix4(); }
+  private addEdgeLines(mesh: THREE.Mesh, geo: LineSegmentsGeometry): void { const ls = new LineSegments2(geo, this.edgeMaterial); ls.visible = this.showEdges; mesh.add(ls); this.edgeLines.push(ls); }
+  /** Material do corpo: o próprio (se tiver) ou o padrão do tema; `selected` usa a variante realçada. */
+  private matOf(id: Id, selected: boolean): THREE.Material { const m = this.bodyMats.get(id); if (m) return selected ? m.sel : m.base; return selected ? this.bodySelMaterial : this.bodyMaterial; }
+  /** Linha grossa (em pixels) por uma polilinha xyz achatada, já transformada pela matriz do corpo. */
+  private fatLine(points: ArrayLike<number>, mat: THREE.Matrix4, material: LineMaterial): Line2 {
+    const v = new THREE.Vector3(); const pos: number[] = [];
+    for (let i = 0; i + 2 < points.length; i += 3) { v.set(points[i], points[i + 1], points[i + 2]).applyMatrix4(mat); pos.push(v.x, v.y, v.z); }
+    const g = new LineGeometry(); g.setPositions(pos); const line = new Line2(g, material); line.computeLineDistances(); return line;
+  }
+  /** Ajustes de visualização: cor e espessura das arestas, arestas visíveis. */
+  setViewSettings(s: { edgeColor: number | null; edgeWidth: number; showEdges: boolean }): void {
+    this.edgeColorOverride = s.edgeColor; this.edgeMaterial.color.setHex(s.edgeColor ?? THEMES[this.theme].edge);
+    this.edgeMaterial.linewidth = s.edgeWidth; this.edgeSelMaterial.linewidth = s.edgeWidth + 1.5; this.hoverEdgeMat.linewidth = s.edgeWidth + 1.5;
+    this.showEdges = s.showEdges; for (const l of this.edgeLines) l.visible = s.showEdges;
+    this.requestRender();
+  }
 
   /** Regiões fechadas dos esboços: sombreadas de leve e arrastáveis para extrudar. */
   setRegions(list: RegionDef[]): void {
@@ -224,7 +258,7 @@ export class Viewport {
       if (data && mesh && f) { const g = new THREE.BufferGeometry(); g.setAttribute('position', mesh.geometry.getAttribute('position')); g.setIndex(new THREE.BufferAttribute(data.indices.slice(f.triStart * 3, (f.triStart + f.triCount) * 3), 1)); const hl = new THREE.Mesh(g, this.hoverFaceMat); hl.matrixAutoUpdate = false; hl.matrix.copy(mesh.matrix); hl.renderOrder = 4; this.hoverGroup.add(hl); }
     } else {
       const data = this.bodyData.get(h.body); const ed = data?.edges[h.index];
-      if (ed) { const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.Float32BufferAttribute(ed.points, 3)); g.applyMatrix4(this.bodyMatrixOf(h.body)); const line = new THREE.Line(g, this.hoverEdgeMat); line.renderOrder = 6; this.hoverGroup.add(line); }
+      if (ed) { const line = this.fatLine(ed.points, this.bodyMatrixOf(h.body), this.hoverEdgeMat); line.renderOrder = 6; this.hoverGroup.add(line); }
     }
     this.requestRender();
   }
@@ -323,7 +357,8 @@ export class Viewport {
   setSection(plane: THREE.Plane | null): void {
     this.renderer.localClippingEnabled = !!plane;
     const planes = plane ? [plane] : [];
-    for (const m of [this.bodyMaterial, this.bodySelMaterial, this.edgeMaterial, this.faceSelMaterial, this.hoverFaceMat]) { m.clippingPlanes = planes; m.needsUpdate = true; }
+    this.clipPlanes = planes;
+    for (const m of [this.bodyMaterial, this.bodySelMaterial, this.edgeMaterial, this.faceSelMaterial, this.hoverFaceMat, ...[...this.bodyMats.values()].flatMap((b) => [b.base, b.sel])]) { m.clippingPlanes = planes; m.needsUpdate = true; }
     this.requestRender();
   }
 
@@ -374,7 +409,7 @@ export class Viewport {
   /** Corpos (ids de cena) desenhados translúcidos: peças que se atravessam com a colisão desligada. */
   setTranslucent(ids: Set<Id>, colliding = false): void {
     this.translucent = ids;
-    for (const [id, mesh] of this.bodyMeshes) if (ids.has(id)) mesh.material = colliding ? this.collideMat : this.translucentMat; else if (mesh.material === this.translucentMat || mesh.material === this.collideMat) mesh.material = this.bodyMaterial;
+    for (const [id, mesh] of this.bodyMeshes) if (ids.has(id)) mesh.material = colliding ? this.collideMat : this.translucentMat; else if (mesh.material === this.translucentMat || mesh.material === this.collideMat) mesh.material = this.matOf(id, false);
     this.requestRender();
   }
 
@@ -382,7 +417,7 @@ export class Viewport {
   setSelection(sel: Sel3D): void {
     this.highlights.clear();
     const selBodies = new Set<Id>([...(sel.body ? [sel.body] : []), ...(sel.bodies ?? [])]);
-    for (const [id, mesh] of this.bodyMeshes) if (!this.translucent.has(id)) mesh.material = selBodies.has(id) ? this.bodySelMaterial : this.bodyMaterial;
+    for (const [id, mesh] of this.bodyMeshes) if (!this.translucent.has(id)) mesh.material = this.matOf(id, selBodies.has(id));
     for (const fs of [...(sel.face ? [sel.face] : []), ...(sel.faces ?? [])]) {
       const data = this.bodyData.get(fs.body); const mesh = this.bodyMeshes.get(fs.body);
       const f = data?.faces[fs.index];
@@ -396,13 +431,7 @@ export class Viewport {
     for (const e of sel.edges) {
       const data = this.bodyData.get(e.body); const ed = data?.edges[e.index]; if (!ed) continue;
       const mat = this.bodyMatrixOf(e.body);
-      const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.Float32BufferAttribute(ed.points, 3)); g.applyMatrix4(mat);
-      const line = new THREE.Line(g, this.edgeSelMaterial); line.renderOrder = 6; this.highlights.add(line);
-      // Pontas marcadas para a aresta ficar visível mesmo fininha.
-      for (const k of [0, ed.points.length - 3]) {
-        const s = new THREE.Mesh(new THREE.SphereGeometry(this.worldPerPixel() * 3, 8, 6), this.edgeSelMaterial as unknown as THREE.Material);
-        s.position.set(ed.points[k], ed.points[k + 1], ed.points[k + 2]).applyMatrix4(mat); s.renderOrder = 6; this.highlights.add(s);
-      }
+      const line = this.fatLine(ed.points, mat, this.edgeSelMaterial); line.renderOrder = 6; this.highlights.add(line);
     }
     this.requestRender();
   }
@@ -418,6 +447,7 @@ export class Viewport {
     const w = this.container.clientWidth || 1, h = this.container.clientHeight || 1;
     this.width = w; this.height = h;
     this.renderer.setSize(w, h, false);
+    for (const m of [this.edgeMaterial, this.edgeSelMaterial, this.hoverEdgeMat]) m.resolution.set(w, h);
     this.persp.aspect = w / h; this.persp.updateProjectionMatrix();
     this.updateOrtho();
     this.requestRender();
@@ -440,7 +470,8 @@ export class Viewport {
   orbit(dx: number, dy: number): void {
     const offset = this.persp.position.clone().sub(this.target);
     const sph = new THREE.Spherical().setFromVector3(offset);
-    sph.theta -= dx * 0.005; sph.phi = Math.max(0.05, Math.min(Math.PI - 0.05, sph.phi - dy * 0.005));
+    // Uma volta inteira em pouco mais de meia tela: a órbita responde leve, como no Shapr3D.
+    sph.theta -= dx * 0.0085; sph.phi = Math.max(0.05, Math.min(Math.PI - 0.05, sph.phi - dy * 0.0085));
     this.persp.position.copy(this.target).add(new THREE.Vector3().setFromSpherical(sph));
     this.persp.lookAt(this.target); this.requestRender();
   }

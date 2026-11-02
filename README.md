@@ -19,7 +19,7 @@ npm run dev
 
 Abre em `http://localhost:5173`. Para abrir no iPad na mesma rede, use o endereço de rede que o Vite imprime.
 
-## Como usar (v0.16, modelagem direta)
+## Como usar (v0.17, modelagem direta)
 
 - **Caneta na peça.** Risque numa face plana: abre um esboço nela, na própria vista 3D (botão "Vista reta"
   se preferir de frente). Arraste uma região sombreada do esboço: extruda ao vivo; para fora adiciona, para
@@ -65,6 +65,11 @@ Abre em `http://localhost:5173`. Para abrir no iPad na mesma rede, use o endere�
   (plana ou cilíndrica, deste corpo ou de outro). A face passa a ficar rente ao destino: as faces vizinhas
   esticam ou encurtam, só dentro da coluna da face (um degrau some, um topo fica inclinado ou abaulado).
   Esc ou toque no vazio cancela.
+- **Ajustes (engrenagem no topo).** Material e cor da peça (aço, aço temperado, inox, alumínio, latão, bronze,
+  cobre, ferro fundido, plástico, borracha, madeira ou uma cor sua), para o corpo selecionado (fica salvo na
+  peça) ou para todos; cor e espessura das linhas das arestas (pretas por padrão), arestas visíveis e tema.
+- **Plano solto no espaço.** No esboço, arrastar com um dedo gira a cena mesmo na vista reta (ela se desliga
+  sozinha; o botão "Vista reta" volta). Dois dedos deslocam e aproximam. A órbita ficou mais leve.
 - **Esboço vivo.** Linhas colam em horizontal, vertical e ângulo reto automaticamente. A caneta encaixa em
   cantos, cruzamentos de linhas (o centro de um X de construção), meios de linha e na origem do plano, com um
   anel mostrando onde vai grudar; linhas de construção são tracejadas e a origem tem uma cruz. Toque numa

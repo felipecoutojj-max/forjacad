@@ -34,6 +34,7 @@ export const icons = {
   pause: w('<path d="M7 4h4v16H7zM13 4h4v16h-4z"/>'),
   record: w('<circle cx="12" cy="12" r="7"/>'),
   collide: w('<rect x="3" y="7" width="10" height="10" rx="1"/><rect x="11" y="7" width="10" height="10" rx="1"/><path d="M11 9v6M13 9v6" stroke-dasharray="1 1"/>'),
+  gear: w('<circle cx="12" cy="12" r="3"/><path d="M12 2.5v3M12 18.5v3M2.5 12h3M18.5 12h3M5.3 5.3l2.1 2.1M16.6 16.6l2.1 2.1M5.3 18.7l2.1-2.1M16.6 7.4l2.1-2.1"/><circle cx="12" cy="12" r="7"/>'),
   theme: w('<circle cx="12" cy="12" r="4"/><path d="M12 3v2M12 19v2M3 12h2M19 12h2M5.6 5.6l1.4 1.4M17 17l1.4 1.4M5.6 18.4L7 17M17 7l1.4-1.4"/>'),
   polygon: w('<path d="M12 3l8 6-3 10H7L4 9z"/>'),
   slot: w('<rect x="3" y="8" width="18" height="8" rx="4"/>'),

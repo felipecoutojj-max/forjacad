@@ -118,6 +118,8 @@ export interface ForjaDocument {
   hidden?: Id[];
   /** Nomes dados pela pessoa a corpos (por id do corpo). Esboços e planos têm `name` próprio. */
   names?: Record<Id, string>;
+  /** Material visual por corpo: chave da tabela de materiais ou cor "#rrggbb". */
+  materials?: Record<Id, string>;
 }
 
 export const BASE_PLANES: Plane[] = [
@@ -220,6 +222,7 @@ function fromObject(d: Record<string, unknown> & { [k: string]: any }, depth: nu
   doc.features = features;
   doc.drawing = sanitizeDrawing(d.drawing, doc.name);
   if (Array.isArray(d.hidden)) { const h = (d.hidden as unknown[]).filter((x): x is string => typeof x === 'string').map((x) => x.slice(0, 80)); if (h.length) doc.hidden = h; }
+  if (d.materials && typeof d.materials === 'object' && !Array.isArray(d.materials)) { const out: Record<Id, string> = {}; for (const [k, v] of Object.entries(d.materials as Record<string, unknown>)) if (typeof v === 'string' && /^([a-zA-Z]{1,24}|#[0-9a-fA-F]{6})$/.test(v)) out[k.slice(0, 80)] = v; if (Object.keys(out).length) doc.materials = out; }
   if (d.names && typeof d.names === 'object' && !Array.isArray(d.names)) { const out: Record<Id, string> = {}; for (const [k, v] of Object.entries(d.names as Record<string, unknown>)) if (typeof v === 'string' && v.trim()) out[k.slice(0, 80)] = v.replace(/[\u0000-\u001f]/g, '').slice(0, 80); if (Object.keys(out).length) doc.names = out; }
   delete doc.kind; delete doc.assembly;
   if (d.kind === 'assembly' && depth === 0) { doc.kind = 'assembly'; doc.assembly = sanitizeAssembly(d.assembly, (o) => fromObject(o as Record<string, unknown>, depth + 1)); }
@@ -418,6 +421,12 @@ export function setHidden(doc: ForjaDocument, id: Id, hidden: boolean): void {
   if (cur.size) doc.hidden = [...cur]; else delete doc.hidden;
 }
 /** Dá nome a um corpo (string vazia volta ao nome automático). */
+export function bodyMaterial(doc: ForjaDocument, body: Id): string | undefined { return doc.materials?.[body]; }
+/** Define (ou tira, com null) o material visual de um corpo. */
+export function setBodyMaterial(doc: ForjaDocument, body: Id, material: string | null): void {
+  if (!material) { if (doc.materials) { delete doc.materials[body]; if (!Object.keys(doc.materials).length) delete doc.materials; } return; }
+  doc.materials = { ...(doc.materials ?? {}), [body]: material };
+}
 export function renameBody(doc: ForjaDocument, body: Id, name: string): void {
   const n = name.trim().slice(0, 80);
   if (!n) { if (doc.names) { delete doc.names[body]; if (!Object.keys(doc.names).length) delete doc.names; } return; }
