@@ -40,5 +40,17 @@ export const icons = {
   mirror: w('<path d="M12 3v18" stroke-dasharray="2 2"/><path d="M9 7L4 12l5 5zM15 7l5 5-5 5z"/>'),
   offset: w('<rect x="4" y="6" width="16" height="12" rx="1"/><rect x="7.5" y="9" width="9" height="6" rx="1" stroke-dasharray="2 1.5"/>'),
   cut: w('<path d="M4 16l8 4 8-4V8l-8-4-8 4z"/><path d="M9 6v9M15 6v9"/>'),
+  eye: w('<path d="M12 5c5 0 9 7 9 7s-4 7-9 7-9-7-9-7 4-7 9-7z"/><circle cx="12" cy="12" r="3"/>'),
+  eyeOff: w('<path d="M4 4l16 16"/><path d="M10 6.3A9 9 0 0 1 12 6c5 0 9 6 9 6s-1.2 1.9-3.2 3.6M6.5 8.3C4.3 10 3 12 3 12s4 6 9 6c1.2 0 2.3-.3 3.3-.7"/><path d="M9.9 9.9a3 3 0 0 0 4.2 4.2"/>'),
+  move: w('<path d="M12 3v18M3 12h18"/><path d="M9 6l3-3 3 3M9 18l3 3 3-3M6 9l-3 3 3 3M18 9l3 3-3 3"/>'),
+  rotate: w('<path d="M20 12a8 8 0 1 1-2.6-5.9"/><path d="M20 4v5h-5"/><circle cx="12" cy="12" r="1.2" fill="currentColor" stroke="none"/>'),
+  items: w('<path d="M8 6h13M8 12h13M8 18h13"/><rect x="3" y="4.5" width="3" height="3" rx="0.8"/><rect x="3" y="10.5" width="3" height="3" rx="0.8"/><rect x="3" y="16.5" width="3" height="3" rx="0.8"/>'),
+  more: w('<circle cx="6" cy="12" r="1.6" fill="currentColor" stroke="none"/><circle cx="12" cy="12" r="1.6" fill="currentColor" stroke="none"/><circle cx="18" cy="12" r="1.6" fill="currentColor" stroke="none"/>'),
+  rename: w('<path d="M4 20h16"/><path d="M14 4l4 4-9 9H5v-4z"/>'),
+  shell: w('<path d="M4 16l8 4 8-4V8l-8-4-8 4z"/><path d="M4 8l8 4 8-4M12 12v8"/><path d="M8 10l4 2 4-2v4l-4 2-4-2z" stroke-dasharray="1.5 1.5"/>'),
+  split: w('<path d="M4 16l8 4 8-4V8l-8-4-8 4z"/><path d="M12 2v20" stroke-dasharray="3 2"/>'),
+  pattern: w('<rect x="3" y="3" width="6" height="6" rx="1"/><rect x="15" y="3" width="6" height="6" rx="1"/><rect x="3" y="15" width="6" height="6" rx="1"/><rect x="15" y="15" width="6" height="6" rx="1"/>'),
+  plane: w('<path d="M3 17l6-10h12l-6 10z"/><path d="M9 7v10M15 7v10" stroke-dasharray="1.5 2"/>'),
+  axis: w('<path d="M12 21V3"/><path d="M9 6l3-3 3 3"/><path d="M6 15c0 1.7 2.7 3 6 3s6-1.3 6-3-2.7-3-6-3-6 1.3-6 3z"/>'),
 };
 export type IconName = keyof typeof icons;

@@ -49,6 +49,13 @@ export class Viewport {
   readonly handleGroup = new THREE.Group();
   private handleMat = new THREE.MeshBasicMaterial({ color: 0xf0542b, depthTest: false, transparent: true, opacity: 0.95 });
   private handleTip: THREE.Vector3 | null = null; private handleBase: THREE.Vector3 | null = null;
+  private handleCenter: THREE.Vector3 | null = null; private handleNormal: THREE.Vector3 | null = null;
+  // Gizmo de mover/girar: setas nos eixos e anéis de giro, no centro do corpo selecionado.
+  readonly gizmoGroup = new THREE.Group();
+  private gizmoCenter: THREE.Vector3 | null = null;
+  private gizmoParts: { kind: 'move' | 'rotate'; axis: 0 | 1 | 2; pts: THREE.Vector3[] }[] = [];
+  private gizmoMats = [0xff3b30, 0x34c759, 0x5e5ce6].map((c) => new THREE.MeshBasicMaterial({ color: c, depthTest: false, transparent: true, opacity: 0.92 }));
+  private selectedRegion: { sketch: Id; index: number } | null = null;
   private regionMeshes: THREE.Mesh[] = [];
   private regionMat = new THREE.MeshBasicMaterial({ color: 0xe9a825, transparent: true, opacity: 0.12, side: THREE.DoubleSide, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2 });
   private regionHotMat = new THREE.MeshBasicMaterial({ color: 0xf0542b, transparent: true, opacity: 0.35, side: THREE.DoubleSide, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2 });
@@ -89,8 +96,8 @@ export class Viewport {
     this.persp = new THREE.PerspectiveCamera(40, 1, 0.5, 20000);
     this.persp.position.set(160, 120, 200); this.persp.up.set(0, 1, 0); this.persp.lookAt(this.target);
     this.ortho = new THREE.OrthographicCamera(-1, 1, 1, -1, -5000, 5000);
-    this.scene.add(this.bodies, this.sketches, this.helpers, this.regions, this.highlights, this.hoverGroup, this.ghostGroup, this.handleGroup);
-    this.handleGroup.renderOrder = 8;
+    this.scene.add(this.bodies, this.sketches, this.helpers, this.regions, this.highlights, this.hoverGroup, this.ghostGroup, this.handleGroup, this.gizmoGroup);
+    this.handleGroup.renderOrder = 8; this.gizmoGroup.renderOrder = 9;
     this.highlights.renderOrder = 5;
     this.hemi = new THREE.HemisphereLight(0xffffff, 0x9aa0a8, 1.6); this.scene.add(this.hemi);
     this.keyLight = new THREE.DirectionalLight(0xffffff, 1.1); this.keyLight.position.set(200, 300, 250); this.scene.add(this.keyLight);
@@ -123,6 +130,7 @@ export class Viewport {
     this.hoverFaceMat.color.setHex(t.hover); this.hoverEdgeMat.color.setHex(t.hover); this.regionMat.color.setHex(t.region); this.regionHotMat.color.setHex(t.regionHot);
     this.ghostMat.color.setHex(t.ghost); this.ghostEdgeMat.color.setHex(t.ghostEdge); this.handleMat.color.setHex(t.faceSel); this.translucentMat.color.setHex(t.body); this.collideMat.color.setHex(t.faceSel);
     this.planeMat.color.setHex(t.plane); this.planeEdgeMat.color.setHex(t.plane);
+    this.gizmoMats.forEach((m, i) => m.color.setHex(t.axes[i]));
     this.hemi.color.setHex(t.hemiSky); this.hemi.groundColor.setHex(t.hemiGround); this.keyLight.intensity = t.key; this.fillLight.intensity = t.fill;
     this.buildHelpers();
     this.requestRender();
@@ -193,7 +201,7 @@ export class Viewport {
   /** Regiões fechadas dos esboços: sombreadas de leve e arrastáveis para extrudar. */
   setRegions(list: RegionDef[]): void {
     this.regions.clear(); this.regionMeshes = [];
-    for (const r of list) { const m = new THREE.Mesh(r.geometry, this.regionMat); m.userData.sketch = r.sketch; m.userData.index = r.index; m.renderOrder = 3; this.regions.add(m); this.regionMeshes.push(m); }
+    for (const r of list) { const hot = !!this.selectedRegion && this.selectedRegion.sketch === r.sketch && this.selectedRegion.index === r.index; const m = new THREE.Mesh(r.geometry, hot ? this.regionHotMat : this.regionMat); m.userData.sketch = r.sketch; m.userData.index = r.index; m.renderOrder = 3; this.regions.add(m); this.regionMeshes.push(m); }
     this.requestRender();
   }
   pickRegion(x: number, y: number): RegionHit | null {
@@ -207,7 +215,7 @@ export class Viewport {
   /** Destaque do que está sob a caneta (hover): região, face ou aresta. */
   setHover(h: Hover): void {
     this.hoverGroup.clear();
-    for (const m of this.regionMeshes) m.material = this.regionMat;
+    for (const m of this.regionMeshes) m.material = this.selectedRegion && m.userData.sketch === this.selectedRegion.sketch && m.userData.index === this.selectedRegion.index ? this.regionHotMat : this.regionMat;
     if (!h) { this.requestRender(); return; }
     if (h.kind === 'region') { const m = this.regionMeshes.find((r) => r.userData.sketch === h.sketch && r.userData.index === h.index); if (m) m.material = this.regionHotMat; }
     else if (h.kind === 'face') {
@@ -220,9 +228,14 @@ export class Viewport {
     this.requestRender();
   }
 
+  /** Região de esboço selecionada (fica realçada até a seleção mudar). */
+  setRegionSelected(r: { sketch: Id; index: number } | null): void { this.selectedRegion = r; this.setHover(null); }
+  get regionSelected(): { sketch: Id; index: number } | null { return this.selectedRegion; }
+
   /** Seta de puxar/empurrar na face selecionada: do centro da face ao longo da normal. */
   setFaceHandle(center: THREE.Vector3 | null, normal?: THREE.Vector3): void {
     this.handleGroup.clear(); this.handleTip = null; this.handleBase = null;
+    this.handleCenter = center ? center.clone() : null; this.handleNormal = normal ? normal.clone() : null;
     if (!center || !normal) { this.requestRender(); return; }
     const px = this.worldPerPixel(); const L = px * 46, R = px * 2.2, coneL = px * 14, coneR = px * 6.5;
     const n = normal.clone().normalize();
@@ -237,6 +250,65 @@ export class Viewport {
     this.handleBase = center.clone(); this.handleTip = center.clone().add(n.multiplyScalar(L + px * 3));
     this.requestRender();
   }
+  /** Redesenha seta e gizmo no tamanho certo depois de aproximar ou girar a câmera. */
+  refreshHandles(): void {
+    if (this.handleCenter && this.handleNormal) this.setFaceHandle(this.handleCenter, this.handleNormal);
+    if (this.gizmoCenter) this.setGizmo(this.gizmoCenter);
+  }
+
+  /** Gizmo de mover/girar no ponto dado: três setas (X vermelho, Y verde, Z azul) e três anéis de giro. */
+  setGizmo(center: THREE.Vector3 | null): void {
+    this.gizmoGroup.clear(); this.gizmoParts = []; this.gizmoCenter = null;
+    if (!center) { this.requestRender(); return; }
+    const px = this.worldPerPixel(); const L = px * 96, R = px * 2.4, coneL = px * 18, coneR = px * 7.5, ringR = px * 64, ringT = px * 2.2, gap = px * 9;
+    const dirs = [new THREE.Vector3(1, 0, 0), new THREE.Vector3(0, 1, 0), new THREE.Vector3(0, 0, 1)];
+    dirs.forEach((n, i) => {
+      const mat = this.gizmoMats[i]; const axis = i as 0 | 1 | 2;
+      const q = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, 1, 0), n);
+      const shaft = new THREE.Mesh(new THREE.CylinderGeometry(R, R, L - coneL, 10), mat); shaft.position.copy(center).add(n.clone().multiplyScalar((L - coneL) / 2 + gap)); shaft.quaternion.copy(q);
+      const cone = new THREE.Mesh(new THREE.ConeGeometry(coneR, coneL, 14), mat); cone.position.copy(center).add(n.clone().multiplyScalar(L - coneL / 2 + gap)); cone.quaternion.copy(q);
+      const ring = new THREE.Mesh(new THREE.TorusGeometry(ringR, ringT, 8, 72), mat); ring.position.copy(center); ring.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), n);
+      for (const m of [shaft, cone, ring]) m.renderOrder = 9;
+      this.gizmoGroup.add(shaft, cone, ring);
+      this.gizmoParts.push({ kind: 'move', axis, pts: [center.clone().add(n.clone().multiplyScalar(gap)), center.clone().add(n.clone().multiplyScalar(L + gap))] });
+      const u = Math.abs(n.x) < 0.9 ? new THREE.Vector3(1, 0, 0) : new THREE.Vector3(0, 1, 0);
+      const a = new THREE.Vector3().crossVectors(n, u).normalize(); const b = new THREE.Vector3().crossVectors(n, a).normalize();
+      const pts: THREE.Vector3[] = []; for (let k = 0; k <= 60; k++) { const t = (k / 60) * Math.PI * 2; pts.push(center.clone().add(a.clone().multiplyScalar(Math.cos(t) * ringR)).add(b.clone().multiplyScalar(Math.sin(t) * ringR))); }
+      this.gizmoParts.push({ kind: 'rotate', axis, pts });
+    });
+    const knob = new THREE.Mesh(new THREE.SphereGeometry(px * 4.5, 12, 8), this.handleMat); knob.position.copy(center); knob.renderOrder = 9; this.gizmoGroup.add(knob);
+    this.gizmoCenter = center.clone();
+    this.requestRender();
+  }
+  get gizmoAt(): THREE.Vector3 | null { return this.gizmoCenter ? this.gizmoCenter.clone() : null; }
+  /** Parte do gizmo a menos de `tolPx` do cursor; setas têm leve prioridade sobre os anéis. */
+  pickGizmo(x: number, y: number, tolPx: number): { kind: 'move' | 'rotate'; axis: 0 | 1 | 2 } | null {
+    let best: { kind: 'move' | 'rotate'; axis: 0 | 1 | 2 } | null = null; let bestPx = tolPx;
+    for (const part of this.gizmoParts) {
+      const d = this.polylineDistancePx(part.pts, x, y) - (part.kind === 'move' ? 3 : 0);
+      if (d < bestPx) { bestPx = d; best = { kind: part.kind, axis: part.axis }; }
+    }
+    return best;
+  }
+  private polylineDistancePx(pts: THREE.Vector3[], x: number, y: number): number {
+    let best = Infinity; let prev = this.worldToScreen(pts[0]);
+    for (let i = 1; i < pts.length; i++) {
+      const cur = this.worldToScreen(pts[i]);
+      const dx = cur.x - prev.x, dy = cur.y - prev.y; const L2 = dx * dx + dy * dy;
+      const t = L2 > 0 ? Math.max(0, Math.min(1, ((x - prev.x) * dx + (y - prev.y) * dy) / L2)) : 0;
+      best = Math.min(best, Math.hypot(prev.x + t * dx - x, prev.y + t * dy - y)); prev = cur;
+    }
+    return best;
+  }
+  /** Mostra um corpo deslocado/girado só na tela (prévia de mover/girar), sem mexer no documento. */
+  previewBodyMatrix(id: Id, m: THREE.Matrix4 | null): void {
+    const mesh = this.bodyMeshes.get(id); if (!mesh) return;
+    const base = this.bodyMatrix.get(id) ?? new THREE.Matrix4();
+    mesh.matrix.copy(m ? m.clone().multiply(base) : base); mesh.updateMatrixWorld(true);
+    for (const h of this.highlights.children) if ((h as THREE.Mesh).isMesh && (h as THREE.Mesh).matrixAutoUpdate === false) { (h as THREE.Mesh).matrix.copy(mesh.matrix); h.updateMatrixWorld(true); }
+    this.requestRender();
+  }
+
   /** Distância em pixels do cursor até a seta de puxar (ou Infinity se não há seta). */
   handleDistancePx(x: number, y: number): number {
     if (!this.handleTip || !this.handleBase) return Infinity;
@@ -405,6 +477,10 @@ export class Viewport {
     const box = new THREE.Box3();
     this.bodies.traverse((o) => { if ((o as THREE.Mesh).isMesh) box.expandByObject(o); });
     this.sketches.traverse((o) => { if ((o as THREE.Line).isLine) box.expandByObject(o); });
+    this.fitBox(box);
+  }
+  /** Enquadra uma caixa do mundo (vazia = região padrão). */
+  fitBox(box: THREE.Box3): void {
     if (box.isEmpty()) box.set(new THREE.Vector3(-60, -60, -60), new THREE.Vector3(60, 60, 60));
     const center = box.getCenter(new THREE.Vector3()); const size = box.getSize(new THREE.Vector3()).length() || 100;
     if (this.usingOrtho) {
@@ -416,6 +492,7 @@ export class Viewport {
       const dir = this.persp.position.clone().sub(this.target).normalize(); if (dir.lengthSq() === 0) dir.set(1, 0.8, 1).normalize();
       this.persp.position.copy(center).add(dir.multiplyScalar(size * 1.6)); this.persp.lookAt(center);
     }
+    this.refreshHandles();
     this.requestRender();
   }
 

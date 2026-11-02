@@ -110,6 +110,10 @@ export interface ForjaDocument {
   /** 'part' (padrão) ou 'assembly'. Uma montagem embute as peças em `assembly.parts`. */
   kind?: 'part' | 'assembly';
   assembly?: Assembly;
+  /** Itens ocultos na vista (ids de corpos, esboços e planos). O que está oculto continua no modelo. */
+  hidden?: Id[];
+  /** Nomes dados pela pessoa a corpos (por id do corpo). Esboços e planos têm `name` próprio. */
+  names?: Record<Id, string>;
 }
 
 export const BASE_PLANES: Plane[] = [
@@ -207,6 +211,8 @@ function fromObject(d: Record<string, unknown> & { [k: string]: any }, depth: nu
   }
   doc.features = features;
   doc.drawing = sanitizeDrawing(d.drawing, doc.name);
+  if (Array.isArray(d.hidden)) { const h = (d.hidden as unknown[]).filter((x): x is string => typeof x === 'string').map((x) => x.slice(0, 80)); if (h.length) doc.hidden = h; }
+  if (d.names && typeof d.names === 'object' && !Array.isArray(d.names)) { const out: Record<Id, string> = {}; for (const [k, v] of Object.entries(d.names as Record<string, unknown>)) if (typeof v === 'string' && v.trim()) out[k.slice(0, 80)] = v.replace(/[\u0000-\u001f]/g, '').slice(0, 80); if (Object.keys(out).length) doc.names = out; }
   delete doc.kind; delete doc.assembly;
   if (d.kind === 'assembly' && depth === 0) { doc.kind = 'assembly'; doc.assembly = sanitizeAssembly(d.assembly, (o) => fromObject(o as Record<string, unknown>, depth + 1)); }
   // Planos base sempre existem, mesmo que o arquivo venha sem eles.
@@ -294,6 +300,7 @@ export function bodyIds(doc: ForjaDocument): Id[] {
 
 /** Nome amigável de um corpo: "Corpo N" pela ordem de criação. */
 export function bodyName(doc: ForjaDocument, body: Id): string {
+  const custom = doc.names?.[body]; if (custom) return custom;
   let n = 0;
   for (const f of doc.features) if (createsBody(f)) { n++; if (f.id === body) return `Corpo ${n}`; }
   return 'Corpo';
@@ -390,4 +397,17 @@ export function planeNormal(p: Plane): V3 {
 export function planeToWorld(p: Plane, u: number, v: number, w = 0): V3 {
   const n = planeNormal(p);
   return [p.origin[0] + p.u[0] * u + p.v[0] * v + n[0] * w, p.origin[1] + p.u[1] * u + p.v[1] * v + n[1] * w, p.origin[2] + p.u[2] * u + p.v[2] * v + n[2] * w];
+}
+
+// ---------- Visibilidade e nomes ----------
+export function isHidden(doc: ForjaDocument, id: Id): boolean { return !!doc.hidden?.includes(id); }
+export function setHidden(doc: ForjaDocument, id: Id, hidden: boolean): void {
+  const cur = new Set(doc.hidden ?? []); if (hidden) cur.add(id); else cur.delete(id);
+  if (cur.size) doc.hidden = [...cur]; else delete doc.hidden;
+}
+/** Dá nome a um corpo (string vazia volta ao nome automático). */
+export function renameBody(doc: ForjaDocument, body: Id, name: string): void {
+  const n = name.trim().slice(0, 80);
+  if (!n) { if (doc.names) { delete doc.names[body]; if (!Object.keys(doc.names).length) delete doc.names; } return; }
+  doc.names = { ...(doc.names ?? {}), [body]: n };
 }

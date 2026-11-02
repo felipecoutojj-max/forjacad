@@ -7,7 +7,7 @@ import { icons, type IconName } from './icons';
 import {
   createDocument, serialize, deserialize, getPlane, getSketch, addExtrude, addRevolve, addFillet, addBoolean, addFacePlane, pruneFacePlanes, addPushPull, planeToWorld,
   addShell, addMirror, addTransform, addSplit, addSweep, addLoft, addImport, addOffsetPlane, type PatternSpec, type FaceRef,
-  bodyIds, bodyName, featuresOfBody, planeNormal,
+  bodyIds, bodyName, featuresOfBody, planeNormal, isHidden, setHidden, renameBody,
   type ForjaDocument, type Plane, type Feature, type ExtrudeFeature, type RevolveFeature, type ExtrudeOp, type V3, type SketchAxis,
 } from '../core/document';
 import * as M from '../core/sketch/model';
@@ -32,14 +32,16 @@ import { type Vec2, v2, dist, distPointSegment, distPointArc, closestOnSegment, 
 type Tool = 'select' | 'draw' | 'line' | 'rect' | 'circle' | 'polygon' | 'slot' | 'dimension' | 'erase';
 interface FormField { key: string; label: string; type: 'number' | 'text' | 'select' | 'check'; value: unknown; options?: [string, string][]; step?: number; }
 
-interface PointerInfo { id: number; type: string; x: number; y: number; startX: number; startY: number; moved: boolean; role: 'tool' | 'nav' | 'pan'; button: number; }
+interface PointerInfo { id: number; type: string; x: number; y: number; startX: number; startY: number; moved: boolean; role: 'tool' | 'nav' | 'pan'; button: number; /** Toque longo já consumiu este ponteiro. */ handled?: boolean; }
 interface Hit { kind: 'point' | 'entity' | 'dimension'; id: Id; d: number; }
 /** Encaixe candidato: onde a caneta vai grudar e como materializar o ponto no esboço. */
 interface SnapHit { uv: Vec2; kind: 'point' | 'origin' | 'intersection' | 'midpoint' | 'entity'; apply: () => Id; }
 type ViewDrag =
   | { kind: 'extrude'; sketch: Id; profilePoint: [number, number]; plane: Plane; start: THREE.Vector3; normal: THREE.Vector3; depth: number }
-  | { kind: 'pull'; body: Id; index: number; fd: BodyData['faces'][number]; origin: THREE.Vector3; normal: THREE.Vector3; dist: number }
-  | { kind: 'edge'; body: Id; index: number; created: Id | null; radius: number }
+  | { kind: 'pull'; body: Id; index: number; fd: BodyData['faces'][number]; origin: THREE.Vector3; normal: THREE.Vector3; dist: number; t0: number }
+  | { kind: 'edge'; body: Id; index: number; created: Id | null; radius: number; /** Sentido "para fora do corpo" na tela: arrastar nele arredonda, contra ele chanfra. */ out: { x: number; y: number } | null; shape: 'fillet' | 'chamfer' }
+  | { kind: 'gmove'; body: Id; axis: THREE.Vector3; axisIndex: 0 | 1 | 2; origin: THREE.Vector3; t0: number; dist: number }
+  | { kind: 'grot'; body: Id; axis: THREE.Vector3; axisIndex: 0 | 1 | 2; center: THREE.Vector3; a0: number; angle: number }
   | { kind: 'draw'; body: Id; index: number; started: boolean }
   | { kind: 'moveInst'; inst: Id; startPos: V3; lastGood: V3; hit: THREE.Vector3; normal: THREE.Vector3; checking: boolean; pending: V3 | null };
 const snapMm = (v: number) => (Math.abs(v) < 20 ? Math.round(v * 2) / 2 : Math.round(v));
@@ -50,6 +52,7 @@ const ICON_FAMILY: Partial<Record<IconName, 'sketch' | 'solid' | 'out' | 'view'>
   drawing: 'out', play: 'out', pause: 'out', record: 'out', collide: 'out', measure: 'out', section: 'out',
   polygon: 'sketch', slot: 'sketch', mirror: 'sketch', offset: 'sketch', body: 'solid',
   view: 'view', fit: 'view', touch: 'view', undo: 'view', redo: 'view', done: 'view', menu: 'view', trash: 'view', theme: 'view',
+  eye: 'view', eyeOff: 'view', items: 'view', more: 'view', rename: 'view', move: 'solid', rotate: 'solid', shell: 'solid', split: 'solid', pattern: 'solid', plane: 'sketch', axis: 'sketch',
 };
 
 const H_V_SNAP_DEG = 10;
@@ -102,7 +105,13 @@ export class App {
   private hoverPlane: Id | null = null;
   // Modelagem direta (vista 3D)
   private drag: ViewDrag | null = null;
-  edgeDragKind: 'fillet' | 'chamfer' = 'fillet';
+  /** Forma ao arrastar uma aresta: 'auto' decide pelo sentido (para fora = filete, para dentro = chanfro). */
+  edgeDragKind: 'fillet' | 'chamfer' | 'auto' = 'auto';
+  /** Região fechada de esboço selecionada na vista (toque): a barra de ações oferece extrudar, furar, revolucionar. */
+  selRegion: { sketch: Id; index: number } | null = null;
+  private actionbar!: HTMLElement;
+  private pressTimer = 0;
+  private lastTap = { t: 0, x: 0, y: 0 };
   private liveTimer = 0;
   private chipEl: HTMLElement | null = null; private chipTimer = 0;
   private polygonSides = 6;
@@ -203,6 +212,7 @@ export class App {
     this.toasts = el('div', 'toasts'); this.overlay.append(this.toasts);
     this.timeline = el('div', 'timeline'); this.timeline.style.display = 'none'; this.overlay.append(this.timeline);
     this.doneFab = this.button('Concluir esboço', () => this.exitSketch(true), 'btn primary done-fab'); this.doneFab.style.display = 'none'; this.overlay.append(this.doneFab);
+    this.actionbar = el('div', 'actionbar'); this.actionbar.style.display = 'none'; this.overlay.append(this.actionbar);
   }
 
   private iconButton(icon: IconName, label: string, onClick: (ev: MouseEvent) => void, cls = 'tool'): HTMLButtonElement {
@@ -255,15 +265,16 @@ export class App {
   /** Recalcula tudo que depende do documento e redesenha. */
   refreshAll(rebuild = true): void {
     const doc = this.doc.current;
-    this.vp.setPlanes(doc.planes);
+    this.vp.setPlanes(doc.planes.filter((p) => !isHidden(doc, p.id)));
     if (this.selectedFeature && !doc.features.some((f) => f.id === this.selectedFeature)) this.selectedFeature = null;
+    if (this.selRegion && !this.regionValid(this.selRegion)) { this.selRegion = null; this.vp.setRegionSelected(null); }
     if (rebuild) void this.rebuild();
     // Esboços inativos aparecem em 3D (para escolher e extrudar).
     for (const [id, r] of this.inactiveSketches) if (!doc.sketches.some((s) => s.id === id)) { this.vp.scene.remove(r.group); this.inactiveSketches.delete(id); }
     for (const s of doc.sketches) {
       let r = this.inactiveSketches.get(s.id);
       if (!r) { r = new SketchRenderer(); this.inactiveSketches.set(s.id, r); this.vp.scene.add(r.group); }
-      r.group.visible = s.id !== this.activeSketch;
+      r.group.visible = s.id !== this.activeSketch && !isHidden(doc, s.id);
       if (r.group.visible) r.update(s, getPlane(doc, s.plane), emptySelection(), false, 1);
     }
     this.vp.setRegions(this.isAssembly ? [] : this.computeRegions());
@@ -276,17 +287,36 @@ export class App {
   private computeRegions(): RegionDef[] {
     const doc = this.doc.current; const out: RegionDef[] = [];
     for (const s of doc.sketches) {
+      if (isHidden(doc, s.id)) continue;
       let plane: Plane; try { plane = getPlane(doc, s.plane); } catch { continue; }
       const m = planeMatrix(plane).multiply(new THREE.Matrix4().makeTranslation(0, 0, 0.05));
       // Regiões já viradas em extrusão ou revolução somem: a face do corpo passa a responder à caneta.
-      const users = doc.features.filter((f): f is ExtrudeFeature | RevolveFeature => (f.type === 'extrude' || f.type === 'revolve') && f.sketch === s.id);
+      const consumed = this.consumedProfiles(s);
       extractProfiles(s).forEach((prof, i) => {
-        const consumed = users.some((f) => f.type === 'revolve' || !f.profilePoint || profileContainsPoint(s, prof, { x: f.profilePoint[0], y: f.profilePoint[1] }));
-        if (consumed) return;
+        if (consumed[i]) return;
         try { const g = new THREE.ShapeGeometry(profileToShape(s, prof), 24); g.applyMatrix4(m); out.push({ sketch: s.id, index: i, geometry: g }); } catch { /* perfil ruim: ignora */ }
       });
     }
     return out;
+  }
+  /** Para cada perfil fechado do esboço: já virou extrusão ou revolução? */
+  private consumedProfiles(s: Sketch): boolean[] {
+    const users = this.doc.current.features.filter((f): f is ExtrudeFeature | RevolveFeature => (f.type === 'extrude' || f.type === 'revolve') && f.sketch === s.id);
+    return extractProfiles(s).map((prof) => users.some((f) => f.type === 'revolve' || !f.profilePoint || profileContainsPoint(s, prof, { x: f.profilePoint[0], y: f.profilePoint[1] })));
+  }
+  /** Como no Shapr3D: quando todos os contornos de um esboço viraram corpo, o esboço se esconde sozinho. */
+  private autoHideSketch(sketchId: Id): void {
+    const doc = this.doc.current; const s = doc.sketches.find((x) => x.id === sketchId); if (!s || isHidden(doc, s.id)) return;
+    const c = this.consumedProfiles(s); if (c.length && c.every(Boolean)) { setHidden(doc, s.id, true); this.refreshAll(false); }
+  }
+  private regionValid(r: { sketch: Id; index: number }): boolean {
+    const doc = this.doc.current; const s = doc.sketches.find((x) => x.id === r.sketch); if (!s || isHidden(doc, s.id)) return false;
+    const c = this.consumedProfiles(s); return r.index < c.length && !c[r.index];
+  }
+  /** Redesenha os corpos (sem recalcular): aplica ocultos e seleção. */
+  private redrawBodies(): void {
+    const doc = this.doc.current;
+    this.vp.setBodies(this.bodies.filter((b) => !isHidden(doc, b.id)).map(toRenderBody), this.sel3d); this.updateFaceHandle();
   }
   private refreshSketch(): void {
     const s = this.sketch, p = this.plane;
@@ -302,7 +332,7 @@ export class App {
     if (this.isAssembly) { await this.rebuildAssembly(); return null; }
     if (this.kernel.state !== 'ready') {
       this.bodies = []; this.featureErrors = [];
-      const preview = buildAllBodies(doc).map((b): RenderBody => ({ id: b.feature.id, name: bodyName(doc, b.feature.id), geometry: b.geometry }));
+      const preview = buildAllBodies(doc).filter((b) => !isHidden(doc, b.feature.id)).map((b): RenderBody => ({ id: b.feature.id, name: bodyName(doc, b.feature.id), geometry: b.geometry }));
       this.vp.setBodies(preview, this.sel3d);
       return null;
     }
@@ -311,7 +341,7 @@ export class App {
       const r = await this.kernel.rebuild(doc);
       this.bodies = r.bodies; this.featureErrors = r.errors;
       this.pruneSel3d();
-      this.vp.setBodies(this.bodies.map(toRenderBody), this.sel3d); this.updateFaceHandle();
+      this.redrawBodies();
       this.renderSidePanel(); this.renderToolbar();
       return r;
     } catch (e) {
@@ -321,7 +351,7 @@ export class App {
   }
 
   private pruneSel3d(): void {
-    const has = (id: Id | null) => !!this.bodyOf(id);
+    const has = (id: Id | null) => !!this.bodyOf(id) && !(id && !this.isAssembly && isHidden(this.doc.current, id));
     if (!has(this.sel3d.body)) this.sel3d.body = null;
     if (this.sel3d.face && !(has(this.sel3d.face.body) && this.bodyOf(this.sel3d.face.body)!.faces.length > this.sel3d.face.index)) this.sel3d.face = null;
     this.sel3d.edges = this.sel3d.edges.filter((e) => has(e.body) && this.bodyOf(e.body)!.edges.length > e.index);
@@ -547,6 +577,7 @@ export class App {
       this.refreshAll();
       return;
     }
+    if ((f.type === 'extrude' || f.type === 'revolve') && this.mode === 'view') this.autoHideSketch(f.sketch);
     onOk?.(f);
   }
 
@@ -613,8 +644,6 @@ export class App {
       const hasEdges = this.sel3d.edges.length > 0;
       const fil = this.iconButton('fillet', 'Filete', () => (hasEdges ? this.filletSelected('fillet') : this.setEdgeKind('fillet'))); if (this.edgeDragKind === 'fillet') fil.classList.add('active'); g1.append(fil);
       const cha = this.iconButton('chamfer', 'Chanfro', () => (hasEdges ? this.filletSelected('chamfer') : this.setEdgeKind('chamfer'))); if (this.edgeDragKind === 'chamfer') cha.classList.add('active'); g1.append(cha);
-      if (this.sel3d.face && this.faceIsPlanar(this.sel3d.face)) g1.append(this.iconButton('face', 'Esboçar na face', () => this.createSketchOnFace(this.sel3d.face!.body, this.sel3d.face!.index)));
-      if (this.sel3d.body && bodyIds(this.doc.current).length > 1) g1.append(this.iconButton('boolean', 'Combinar', (ev) => this.booleanMenu(ev)));
       g1.append(this.iconButton('body', 'Corpo', (ev) => this.bodyMenu(ev)));
       const mb = this.iconButton('measure', 'Medir', () => this.toggleMeasure()); if (this.measure.on) mb.classList.add('active'); g2.append(mb);
       const sb = this.iconButton('section', 'Corte', () => this.toggleSection()); if (this.section.on) sb.classList.add('active'); g2.append(sb);
@@ -623,11 +652,188 @@ export class App {
       g2.append(this.iconButton('fit', 'Enquadrar', () => this.vp.fitAll()));
       this.toolbar.append(g1, g2);
     }
+    this.renderActionBar();
   }
 
   private setEdgeKind(kind: 'fillet' | 'chamfer'): void {
-    this.edgeDragKind = kind; this.renderToolbar();
-    this.toast(kind === 'fillet' ? 'Arraste uma aresta da peça: o raio do filete segue a caneta.' : 'Arraste uma aresta da peça: a distância do chanfro segue a caneta.');
+    this.edgeDragKind = this.edgeDragKind === kind ? 'auto' : kind; this.renderToolbar();
+    if (this.edgeDragKind === 'auto') this.toast('Automático: arraste a aresta para fora da peça para arredondar, para dentro para chanfrar.');
+    else this.toast(kind === 'fillet' ? 'Só filete: arraste uma aresta e o raio segue a caneta.' : 'Só chanfro: arraste uma aresta e a distância segue a caneta.');
+  }
+
+  /** Barra adaptativa (ideia do menu adaptativo do Shapr3D): só as ferramentas válidas para o que está selecionado. */
+  private renderActionBar(): void {
+    const bar = this.actionbar; bar.innerHTML = '';
+    const doc = this.doc.current; const s3 = this.sel3d;
+    if (this.mode !== 'view' || this.isAssembly || this.measure.on) { bar.style.display = 'none'; return; }
+    const region = this.selRegion && this.regionValid(this.selRegion) ? this.selRegion : null;
+    const bodyId = s3.face?.body ?? s3.edges[0]?.body ?? s3.body; const bd = this.bodyOf(bodyId);
+    const items: HTMLElement[] = []; let who = '';
+    const btn = (icon: IconName, label: string, fn: (ev: MouseEvent) => void, primary = false) => { const b = this.iconButton(icon, label, fn); if (primary) b.classList.add('primary'); items.push(b); };
+    if (region) {
+      const sk = getSketch(doc, region.sketch); who = `Região de ${sk.name}`;
+      btn('extrude', 'Extrudar', () => this.extrudeSketch(sk.id), true);
+      if (bodyIds(doc).length) btn('cut', 'Furo passante', () => this.cutThroughSketch(sk.id));
+      btn('revolve', 'Revolucionar', () => this.revolveSketch(sk.id));
+      btn('sketch', 'Editar esboço', () => this.enterSketch(sk.id));
+    } else if (s3.edges.length && bd) {
+      who = `${s3.edges.length} aresta${s3.edges.length > 1 ? 's' : ''} · ${bodyName(doc, bd.id)}`;
+      btn('fillet', 'Filete', () => this.filletSelected('fillet'), true);
+      btn('chamfer', 'Chanfro', () => this.filletSelected('chamfer'));
+      btn('body', 'Corpo', () => this.selectBody(bd.id));
+    } else if (s3.face && bd) {
+      const f = bd.faces[s3.face.index]; const n = 1 + (s3.faces?.length ?? 0); const planar = f?.type === 'plane';
+      who = n > 1 ? `${n} faces · ${bodyName(doc, bd.id)}` : `Face ${faceTypeName(f?.type ?? 'other')} · ${bodyName(doc, bd.id)}`;
+      if (planar) { btn('face', 'Esboçar', () => this.createSketchOnFace(bd.id, s3.face!.index), true); btn('extrude', n > 1 ? 'Puxar juntas' : 'Puxar', () => this.pushPullNumeric()); btn('plane', 'Plano', () => this.offsetPlaneFromFace()); }
+      btn('shell', 'Casca', () => this.shellSelected());
+      if (planar) btn('mirror', 'Espelhar', () => this.mirrorSelected());
+      btn('body', 'Corpo', () => this.selectBody(bd.id));
+    } else if (s3.body && bd) {
+      who = bodyName(doc, bd.id);
+      btn('move', 'Mover/Girar', () => this.transformSelected(), true);
+      btn('mirror', 'Espelhar', () => this.mirrorSelected());
+      btn('shell', 'Casca', () => this.shellSelected());
+      btn('split', 'Dividir', () => this.splitSelected());
+      const sf = this.selectedFeatureObj(); if (sf && (sf.type === 'extrude' || sf.type === 'revolve')) btn('pattern', 'Padrão', () => this.patternSelected(sf));
+      if (bodyIds(doc).length > 1) btn('boolean', 'Combinar', (ev) => this.booleanMenu(ev));
+      btn('eyeOff', 'Ocultar', () => this.toggleHidden(bd.id));
+      btn('trash', 'Apagar', () => this.deleteBody(bd.id));
+    } else { bar.style.display = 'none'; return; }
+    if (!region) btn('more', 'Mais', (ev) => this.bodyMenu(ev));
+    const w = el('span', 'who'); w.textContent = who; bar.append(w, ...items); bar.style.display = '';
+  }
+
+  /** Puxar/empurrar a face selecionada digitando o valor (a seta laranja faz o mesmo por gesto). */
+  private pushPullNumeric(): void {
+    const fs = this.sel3d.face; const fd = fs ? this.bodyOf(fs.body)?.faces[fs.index] : undefined; if (!fs || !fd || fd.type !== 'plane' || !fd.normal) return;
+    const sc = this.vp.worldToScreen(new THREE.Vector3(...fd.center));
+    this.valuePopover(sc.x, sc.y, 10, 'mm', (v) => {
+      const ref: FaceRef = { center: fd.center, normal: fd.normal!, area: fd.area };
+      const more = (this.sel3d.faces ?? []).filter((f) => f.body === fs.body && f.index !== fs.index).map((f) => this.faceRefOf(f)).filter((x): x is FaceRef => !!x);
+      void this.tryFeature(() => addPushPull(this.doc.current, fs.body, ref, v, more), (f) => { this.selectedFeature = f.id; this.selectBody(fs.body); });
+    });
+  }
+
+  /** Seleciona um corpo inteiro: aparece o gizmo de mover e girar. */
+  selectBody(id: Id): void {
+    this.selectedFeature = null; this.selRegion = null; this.vp.setRegionSelected(null);
+    this.sel3d = { body: id, face: null, faces: [], edges: [] };
+    this.vp.setSelection(this.sel3d); this.updateFaceHandle(); this.renderSidePanel(); this.renderToolbar();
+  }
+  private selectRegion(sketch: Id, index: number): void {
+    this.selectedFeature = null; this.sel3d = emptySel3D(); this.selRegion = { sketch, index }; this.vp.setRegionSelected(this.selRegion);
+    this.vp.setSelection(this.sel3d); this.updateFaceHandle(); this.renderSidePanel(); this.renderToolbar();
+  }
+  /** Toque numa aresta soma à seleção (mesmo corpo); tocar de novo tira. */
+  private selectEdge(body: Id, index: number, additive = true): void {
+    if (!additive || (this.sel3d.edges.length && this.sel3d.edges[0].body !== body)) this.sel3d.edges = [];
+    const i = this.sel3d.edges.findIndex((e) => e.body === body && e.index === index);
+    if (i >= 0) this.sel3d.edges.splice(i, 1); else this.sel3d.edges.push({ body, index });
+    this.sel3d.face = null; this.sel3d.faces = []; this.sel3d.body = this.sel3d.edges.length ? body : null; this.selectedFeature = null; this.selRegion = null; this.vp.setRegionSelected(null);
+    this.vp.setSelection(this.sel3d); this.updateFaceHandle(); this.renderSidePanel(); this.renderToolbar();
+  }
+  /** Toque numa face soma à seleção (mesmo corpo); tocar de novo tira. */
+  private selectFace(body: Id, index: number, additive = true): void {
+    const all = additive ? [...(this.sel3d.face ? [this.sel3d.face] : []), ...(this.sel3d.faces ?? [])] : [];
+    const idx = all.findIndex((f) => f.body === body && f.index === index);
+    const next = idx >= 0 ? all.filter((_, i) => i !== idx) : (all.length && all[0].body !== body ? [] : all).concat([{ body, index }]);
+    const primary = next[next.length - 1] ?? null;
+    this.selectedFeature = null; this.selRegion = null; this.vp.setRegionSelected(null);
+    this.sel3d = { body, face: primary, faces: primary ? next.slice(0, -1) : [], edges: [] };
+    this.vp.setSelection(this.sel3d); this.updateFaceHandle(); this.renderSidePanel(); this.renderToolbar();
+  }
+  toggleHidden(id: Id): void {
+    const doc = this.doc.current; this.pushUndo(); const hide = !isHidden(doc, id); setHidden(doc, id, hide);
+    if (hide && (this.sel3d.body === id || this.sel3d.face?.body === id || this.sel3d.edges[0]?.body === id || this.selRegion?.sketch === id)) { this.sel3d = emptySel3D(); this.selRegion = null; this.vp.setRegionSelected(null); this.selectedFeature = null; }
+    this.refreshAll(false); this.redrawBodies();
+  }
+  private invertHidden(): void {
+    const doc = this.doc.current; this.pushUndo();
+    for (const id of [...bodyIds(doc), ...doc.sketches.map((s) => s.id)]) setHidden(doc, id, !isHidden(doc, id));
+    this.sel3d = emptySel3D(); this.selRegion = null; this.vp.setRegionSelected(null); this.selectedFeature = null;
+    this.refreshAll(false); this.redrawBodies();
+  }
+  private renameItem(kind: 'body' | 'sketch' | 'plane', id: Id): void {
+    const doc = this.doc.current;
+    const cur = kind === 'body' ? bodyName(doc, id) : kind === 'sketch' ? getSketch(doc, id).name : getPlane(doc, id).name;
+    this.formDialog('Renomear', [{ key: 'name', label: 'Nome', type: 'text', value: cur }], 'Renomear', (v) => {
+      const name = String(v.name ?? '').trim(); if (!name) return;
+      this.pushUndo();
+      if (kind === 'body') renameBody(doc, id, name); else if (kind === 'sketch') getSketch(doc, id).name = name; else getPlane(doc, id).name = name;
+      this.refreshAll(kind === 'body');
+    });
+  }
+  private zoomTo(kind: 'body' | 'sketch', id: Id): void {
+    const doc = this.doc.current; const box = new THREE.Box3();
+    if (kind === 'body') { const b = this.bodyOf(id); if (!b) return; box.set(new THREE.Vector3(...b.bbox[0]), new THREE.Vector3(...b.bbox[1])); }
+    else { const s = getSketch(doc, id); const pl = getPlane(doc, s.plane); if (!s.points.length) box.setFromCenterAndSize(new THREE.Vector3(...pl.origin), new THREE.Vector3(60, 60, 60)); else for (const pt of s.points) box.expandByPoint(new THREE.Vector3(...planeToWorld(pl, pt.x, pt.y))); }
+    this.vp.fitBox(box);
+  }
+  private deleteSketch(id: Id): void {
+    const doc = this.doc.current;
+    const uses = (f: Feature) => (f.type === 'extrude' || f.type === 'revolve') ? f.sketch === id : f.type === 'sweep' ? f.profile === id || f.path === id || !!f.paths?.includes(id) : f.type === 'loft' ? f.sketches.includes(id) : false;
+    const victims = new Set<Id>(); for (const f of doc.features) if (uses(f)) { victims.add(f.id); if ((f.type === 'extrude' || f.type === 'revolve') && f.op === 'new') for (const d of featuresOfBody(doc, f.id)) victims.add(d.id); }
+    const go = () => {
+      this.pushUndo();
+      doc.features = doc.features.filter((f) => !victims.has(f.id)); doc.sketches = doc.sketches.filter((s) => s.id !== id); setHidden(doc, id, false); pruneFacePlanes(doc);
+      this.selectedFeature = null; this.sel3d = emptySel3D(); this.selRegion = null; this.vp.setRegionSelected(null); this.refreshAll();
+    };
+    if (victims.size) this.confirm('Apagar esboço', `Este esboço é usado por ${victims.size} feature${victims.size > 1 ? 's' : ''} (corpos, cortes, varreduras). Elas somem junto.`, go); else go();
+  }
+  private deletePlane(id: Id): void {
+    const doc = this.doc.current; if (doc.sketches.some((s) => s.plane === id)) return this.toast('Há esboços neste plano. Apague-os antes.', 'err');
+    this.pushUndo(); doc.planes = doc.planes.filter((p) => p.id !== id); setHidden(doc, id, false); this.refreshAll(false);
+  }
+  /** Itens do projeto (como o Items Manager do Shapr3D): corpos, esboços e planos com olho de visibilidade; segurar ou clicar com o direito renomeia, enquadra, apaga. */
+  private renderItems(p: HTMLElement): void {
+    const doc = this.doc.current;
+    p.append(h3('Itens'));
+    const list = el('div', 'list');
+    type MenuItems = () => { label: string; action: () => void }[];
+    const row = (icon: IconName, fam: string, name: string, mini: string, id: Id, active: boolean, onTap: () => void, menuItems: MenuItems) => {
+      const hidden = isHidden(doc, id);
+      const it = el('div', `item${hidden ? ' off' : ''}${active ? ' active' : ''}`);
+      const k = el('span', `kind c-${fam}`); k.innerHTML = icons[icon];
+      const n = el('span', 'name'); n.textContent = name; const m = el('span', 'mini'); m.textContent = mini;
+      const eye = document.createElement('button'); eye.className = 'eye'; eye.title = hidden ? 'Mostrar' : 'Ocultar'; eye.innerHTML = hidden ? icons.eyeOff : icons.eye;
+      eye.addEventListener('click', (ev) => { ev.stopPropagation(); this.toggleHidden(id); });
+      it.append(k, n, m, eye);
+      const openMenu = (cx: number, cy: number) => { const o = this.overlay.getBoundingClientRect(); this.menu(cx - o.left, cy - o.top, menuItems()); };
+      let pressed = 0; let longFired = false;
+      it.addEventListener('click', () => { if (longFired) { longFired = false; return; } onTap(); });
+      it.addEventListener('contextmenu', (ev) => { ev.preventDefault(); openMenu(ev.clientX, ev.clientY); });
+      it.addEventListener('pointerdown', (ev) => { if (ev.pointerType === 'mouse') return; pressed = window.setTimeout(() => { pressed = 0; longFired = true; openMenu(ev.clientX, ev.clientY); }, 480); });
+      for (const evn of ['pointerup', 'pointercancel', 'pointerleave', 'pointermove'] as const) it.addEventListener(evn, (ev) => { if (pressed && (evn !== 'pointermove' || Math.hypot((ev as PointerEvent).movementX, (ev as PointerEvent).movementY) > 2)) { clearTimeout(pressed); pressed = 0; } });
+      list.append(it);
+    };
+    const ids = bodyIds(doc);
+    for (const id of ids) {
+      const b = this.bodies.find((x) => x.id === id); const active = this.sel3d.body === id && !this.sel3d.face && !this.sel3d.edges.length;
+      row('body', 'solid', bodyName(doc, id), b ? fmtMm3(b.volume) : '', id, active, () => (isHidden(doc, id) ? this.toggleHidden(id) : this.selectBody(id)), () => [
+        { label: 'Renomear…', action: () => this.renameItem('body', id) }, { label: 'Enquadrar', action: () => this.zoomTo('body', id) },
+        { label: isHidden(doc, id) ? 'Mostrar' : 'Ocultar', action: () => this.toggleHidden(id) }, { label: 'Apagar', action: () => this.deleteBody(id) },
+      ]);
+    }
+    for (const s of doc.sketches) {
+      let plName = ''; try { plName = getPlane(doc, s.plane).name; } catch { /* plano sumiu */ }
+      row('sketch', 'sketch', s.name, plName, s.id, false, () => this.enterSketch(s.id), () => [
+        { label: 'Editar esboço', action: () => this.enterSketch(s.id) }, { label: 'Extrudar…', action: () => this.extrudeSketch(s.id) },
+        { label: 'Renomear…', action: () => this.renameItem('sketch', s.id) }, { label: 'Enquadrar', action: () => this.zoomTo('sketch', s.id) },
+        { label: isHidden(doc, s.id) ? 'Mostrar' : 'Ocultar', action: () => this.toggleHidden(s.id) }, { label: 'Apagar', action: () => this.deleteSketch(s.id) },
+      ]);
+    }
+    for (const pl of doc.planes.filter((x) => x.kind !== 'face')) {
+      row('plane', 'plane', pl.name, pl.kind === 'offset' ? 'deslocado' : '', pl.id, false, () => this.createSketchOn(pl.id), () => [
+        { label: 'Novo esboço aqui', action: () => this.createSketchOn(pl.id) }, { label: 'Renomear…', action: () => this.renameItem('plane', pl.id) },
+        { label: isHidden(doc, pl.id) ? 'Mostrar' : 'Ocultar', action: () => this.toggleHidden(pl.id) }, ...(pl.kind === 'offset' ? [{ label: 'Apagar', action: () => this.deletePlane(pl.id) }] : []),
+      ]);
+    }
+    if (!ids.length && !doc.sketches.length) { const d = el('div', 'hint'); d.textContent = 'Nenhum esboço ainda. Toque num plano ou em "Esboço".'; list.append(d); }
+    p.append(list);
+    const tools = el('div', 'row tools'); const hiddenCount = (doc.hidden ?? []).length;
+    if (hiddenCount) tools.append(this.button(`Mostrar ocultos (${hiddenCount})`, () => { this.pushUndo(); delete doc.hidden; this.refreshAll(false); this.redrawBodies(); }));
+    if (ids.length + doc.sketches.length) tools.append(this.button('Inverter visibilidade', () => this.invertHidden()));
+    if (tools.childElementCount) p.append(tools);
   }
   private faceIsPlanar(ref: { body: Id; index: number }): boolean {
     const f = this.bodyOf(ref.body)?.faces[ref.index]; return !!f && f.type === 'plane';
@@ -683,21 +889,12 @@ export class App {
     this.renderSectionPanel(p);
     this.renderSelectionPanel(p);
     if (!this.sel3d.body && !this.sel3d.face && !this.sel3d.edges.length && this.bodies.length) {
-      const d = el('div', 'hint'); d.textContent = 'Caneta: risque numa face para esboçar nela. Arraste uma região sombreada do esboço para extrudar (para fora adiciona, para dentro corta). Toque numa face e arraste a seta laranja para puxar ou empurrar. Arraste uma aresta para filete ou chanfro.'; p.append(d);
+      const d = el('div', 'hint'); d.textContent = 'Caneta: risque numa face para esboçar nela. Arraste uma região sombreada para extrudar. Toque numa face, aresta ou região e a barra embaixo mostra o que dá para fazer. Toque duas vezes num corpo para movê-lo pelas setas; segure a caneta para escolher entre itens sobrepostos.'; p.append(d);
     }
 
-    p.append(h3('Esboços'));
-    const list = el('div', 'list');
-    if (!doc.sketches.length) { const d = el('div', 'hint'); d.textContent = 'Nenhum esboço ainda. Toque em "Esboço" e escolha um plano, ou toque direto num plano.'; list.append(d); }
-    for (const s of doc.sketches) {
-      const pl = getPlane(doc, s.plane);
-      const it = listItem(s.name, pl.name);
-      it.addEventListener('click', () => this.enterSketch(s.id));
-      list.append(it);
-    }
-    p.append(list);
+    this.renderItems(p);
 
-    p.append(h3(`Features (${doc.features.length})`));
+    p.append(h3(`Histórico (${doc.features.length})`));
     const flist = el('div', 'list');
     if (!doc.features.length) { const d = el('div', 'hint'); d.textContent = 'Extrude um esboço fechado para criar o primeiro corpo.'; flist.append(d); }
     for (const f of doc.features) {
@@ -720,26 +917,13 @@ export class App {
     if (!s3.body && !s3.face && !s3.edges.length) return;
     p.append(h3('Seleção'));
     const body = this.bodies.find((b) => b.id === (s3.face?.body ?? s3.edges[0]?.body ?? s3.body));
-    if (s3.edges.length) {
-      const d = el('div', 'hint'); d.textContent = `${s3.edges.length} aresta${s3.edges.length > 1 ? 's' : ''} de ${body?.name ?? 'corpo'}. Toque em outras para somar.`; p.append(d);
-      const row = el('div', 'row');
-      row.append(this.button('Filete…', () => this.filletSelected('fillet')), this.button('Chanfro…', () => this.filletSelected('chamfer')), this.button('Limpar', () => this.clearSel3d()));
-      p.append(row);
-    } else if (s3.face && body) {
-      const f = body.faces[s3.face.index]; const extra = s3.faces?.length ?? 0;
-      const d = el('div', 'hint'); d.textContent = f ? `${extra ? `${extra + 1} faces de ${body.name}. Arraste a seta para puxar todas juntas, ou use Extrudar ▸ Furo passante com um esboço para repetir o mesmo rasgo nelas.` : `Face ${faceTypeName(f.type)} de ${body.name}, ${f.area.toFixed(0)} mm². Toque em outras faces para somar.`}` : body.name; p.append(d);
-      const row = el('div', 'row');
-      if (f?.type === 'plane') row.append(this.button('Esboçar nesta face', () => this.createSketchOnFace(body.id, s3.face!.index), 'btn primary'));
-      row.append(this.button('Limpar', () => this.clearSel3d()));
-      p.append(row);
-    } else if (s3.body && body) {
-      const d = el('div', 'hint'); d.textContent = `${body.name}: volume ${fmtMm3(body.volume)}, ${body.faces.length} faces, ${body.edges.length} arestas.`; p.append(d);
-      const row = el('div', 'row');
-      if (bodyIds(doc).length > 1) row.append(this.button('Combinar…', (ev) => this.booleanMenu(ev)));
-      row.append(this.button('Apagar corpo', () => this.deleteBody(body.id), 'btn danger'));
-      row.append(this.button('Limpar', () => this.clearSel3d()));
-      p.append(row);
-    }
+    const nm = body ? bodyName(doc, body.id) : 'corpo';
+    const d = el('div', 'hint');
+    if (s3.edges.length) d.textContent = `${s3.edges.length} aresta${s3.edges.length > 1 ? 's' : ''} de ${nm}. Toque em outras para somar; arraste uma para fora (filete) ou para dentro (chanfro).`;
+    else if (s3.face && body) { const f = body.faces[s3.face.index]; const extra = s3.faces?.length ?? 0; d.textContent = extra ? `${extra + 1} faces de ${nm}. A seta puxa todas juntas; Furo passante com um esboço repete o mesmo rasgo nelas.` : f ? `Face ${faceTypeName(f.type)} de ${nm}, ${f.area.toFixed(0)} mm². Toque em outras faces para somar.` : nm; }
+    else if (body) d.textContent = `${nm}: volume ${fmtMm3(body.volume)}, ${body.faces.length} faces, ${body.edges.length} arestas. Setas movem, anéis giram.`;
+    p.append(d);
+    const row = el('div', 'row'); row.append(this.button('Limpar seleção', () => this.clearSel3d())); p.append(row);
   }
 
   private renderFeatureEditor(p: HTMLElement, f: Feature): void {
@@ -855,11 +1039,25 @@ export class App {
   private deleteBody(body: Id): void {
     const f = this.doc.current.features.find((x) => x.id === body); if (f) this.deleteFeature(f);
   }
-  private clearSel3d(): void { this.sel3d = emptySel3D(); this.vp.setSelection(this.sel3d); this.updateFaceHandle(); this.renderSidePanel(); this.renderToolbar(); }
+  private clearSel3d(): void { this.sel3d = emptySel3D(); this.selRegion = null; this.vp.setRegionSelected(null); this.vp.setSelection(this.sel3d); this.updateFaceHandle(); this.renderSidePanel(); this.renderToolbar(); }
   /** Seta de puxar acompanha a face plana selecionada (modo peça). */
   private updateFaceHandle(): void {
     const f = this.sel3d.face; const fd = f && !this.isAssembly ? this.bodyOf(f.body)?.faces[f.index] : undefined;
     if (fd?.type === 'plane' && fd.normal && this.mode === 'view') this.vp.setFaceHandle(new THREE.Vector3(...fd.center), new THREE.Vector3(...fd.normal)); else this.vp.setFaceHandle(null);
+    this.updateGizmo();
+  }
+  /** Gizmo de mover/girar aparece quando um corpo inteiro está selecionado (sem face nem aresta). */
+  private updateGizmo(): void {
+    const b = this.sel3d.body && !this.sel3d.face && !this.sel3d.edges.length && this.mode === 'view' && !this.isAssembly ? this.bodyOf(this.sel3d.body) : undefined;
+    if (!b) { this.vp.setGizmo(null); return; }
+    const c = b.bbox; this.vp.setGizmo(new THREE.Vector3((c[0][0] + c[1][0]) / 2, (c[0][1] + c[1][1]) / 2, (c[0][2] + c[1][2]) / 2));
+  }
+  /** Ângulo do cursor em volta de um eixo (plano perpendicular ao eixo pelo centro). */
+  private gizmoAngle(center: THREE.Vector3, axis: THREE.Vector3, x: number, y: number): number {
+    const p = this.vp.rayOnPlane(center, axis, x, y); if (!p) return 0;
+    const u = Math.abs(axis.x) < 0.9 ? new THREE.Vector3(1, 0, 0) : new THREE.Vector3(0, 1, 0);
+    const a = new THREE.Vector3().crossVectors(axis, u).normalize(); const b = new THREE.Vector3().crossVectors(axis, a).normalize();
+    const v = p.clone().sub(center); return Math.atan2(v.dot(b), v.dot(a));
   }
 
   // ---------- Rótulos (HTML sobre a cena) ----------
@@ -905,6 +1103,8 @@ export class App {
   }
   /** Abre um esboço. Em face de corpo, fica na vista 3D para a peça continuar visível; nos planos base, vista reta. */
   enterSketch(id: Id, perspective?: boolean): void {
+    if (isHidden(this.doc.current, id)) setHidden(this.doc.current, id, false);
+    this.selRegion = null; this.vp.setRegionSelected(null);
     this.activeSketch = id; this.mode = 'sketch'; this.tool = 'draw'; this.sel = emptySelection(); this.pendingDimRefs = []; this.selectedFeature = null; this.sel3d = emptySel3D();
     const p = this.plane!; const persp = perspective ?? (p.kind === 'face' && this.vp.mode === 'view');
     this.vp.enterSketch(p, persp); this.vp.setSelection(this.sel3d); this.updateFaceHandle();
@@ -1070,9 +1270,8 @@ export class App {
     c.addEventListener('pointermove', (ev) => this.onMove(ev));
     c.addEventListener('pointerup', (ev) => this.onUp(ev));
     c.addEventListener('pointercancel', (ev) => this.onUp(ev, true));
-    c.addEventListener('wheel', (ev) => { ev.preventDefault(); const f = Math.exp(-ev.deltaY * 0.0015); this.vp.zoom(f, this.local(ev)); this.refreshSketch(); }, { passive: false });
+    c.addEventListener('wheel', (ev) => { ev.preventDefault(); const f = Math.exp(-ev.deltaY * 0.0015); this.vp.zoom(f, this.local(ev)); this.refreshSketch(); this.vp.refreshHandles(); }, { passive: false });
     c.addEventListener('contextmenu', (ev) => ev.preventDefault());
-    c.addEventListener('dblclick', () => this.vp.fitAll());
   }
   private local(ev: { clientX: number; clientY: number }): { x: number; y: number } {
     const r = this.vp.renderer.domElement.getBoundingClientRect(); return { x: ev.clientX - r.left, y: ev.clientY - r.top };
@@ -1090,7 +1289,7 @@ export class App {
     const { x, y } = this.local(ev);
     const info: PointerInfo = { id: ev.pointerId, type: ev.pointerType, x, y, startX: x, startY: y, moved: false, role: this.roleFor(ev), button: ev.button };
     this.pointers.set(ev.pointerId, info);
-    this.vp.renderer.domElement.setPointerCapture(ev.pointerId);
+    try { this.vp.renderer.domElement.setPointerCapture(ev.pointerId); } catch { /* ponteiro sintético (testes) */ }
     if (this.pointers.size === 2) {
       const [a, b] = [...this.pointers.values()];
       this.pinch = { d0: Math.hypot(a.x - b.x, a.y - b.y), mid: { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 } };
@@ -1125,7 +1324,11 @@ export class App {
   private onUp(ev: PointerEvent, cancelled = false): void {
     const info = this.pointers.get(ev.pointerId); if (!info) return;
     this.pointers.delete(ev.pointerId);
+    this.cancelPress();
     if (this.pointers.size < 2) this.pinch = null;
+    if (info.handled) { this.drag = null; return; }
+    if ((info.role === 'nav' || info.role === 'pan') && info.moved && this.mode === 'view') this.vp.refreshHandles();
+    if (info.role === 'pan' && info.button === 2 && !info.moved && !cancelled && this.mode === 'view' && !this.isAssembly) { this.selectThrough(info.x, info.y); return; }
     if (info.role === 'nav' && !info.moved && !cancelled) { this.tapView(info); return; }
     if (info.role === 'tool' && this.mode === 'sketch') { this.toolUp(info, cancelled); return; }
     if (info.role === 'tool' && this.mode === 'view') this.viewUp(info, cancelled);
@@ -1143,10 +1346,19 @@ export class App {
       this.drag = { kind: 'moveInst', inst, startPos: [...instObj.pos] as V3, lastGood: [...instObj.pos] as V3, hit: fh.point.clone(), normal: this.vp.persp.getWorldDirection(new THREE.Vector3()), checking: false, pending: null };
       return;
     }
+    // Gizmo do corpo selecionado: setas movem no eixo, anéis giram em volta dele.
+    const gz = this.vp.gizmoAt; const gp = gz && this.sel3d.body ? this.vp.pickGizmo(x, y, info.type === 'touch' ? 22 : 14) : null;
+    if (gz && gp && this.sel3d.body) {
+      const axis = new THREE.Vector3(gp.axis === 0 ? 1 : 0, gp.axis === 1 ? 1 : 0, gp.axis === 2 ? 1 : 0);
+      if (gp.kind === 'move') this.drag = { kind: 'gmove', body: this.sel3d.body, axis, axisIndex: gp.axis, origin: gz, t0: this.vp.axisDragDistance(gz, axis, x, y), dist: 0 };
+      else this.drag = { kind: 'grot', body: this.sel3d.body, axis, axisIndex: gp.axis, center: gz, a0: this.gizmoAngle(gz, axis, x, y), angle: 0 };
+      return;
+    }
+    this.startPress(info);
     // Seta da face selecionada: arrastar puxa ou empurra a face.
     if (this.sel3d.face && this.vp.handleDistancePx(x, y) < (info.type === 'touch' ? 26 : 18)) {
       const fd = this.bodyOf(this.sel3d.face.body)?.faces[this.sel3d.face.index];
-      if (fd?.type === 'plane' && fd.normal) { this.drag = { kind: 'pull', body: this.sel3d.face.body, index: this.sel3d.face.index, fd, origin: new THREE.Vector3(...fd.center), normal: new THREE.Vector3(...fd.normal), dist: 0 }; return; }
+      if (fd?.type === 'plane' && fd.normal) { const origin = new THREE.Vector3(...fd.center), normal = new THREE.Vector3(...fd.normal); this.drag = { kind: 'pull', body: this.sel3d.face.body, index: this.sel3d.face.index, fd, origin, normal, dist: 0, t0: this.vp.axisDragDistance(origin, normal, x, y) }; return; }
     }
     const faceHit = this.vp.pickFace(x, y);
     let regionHit = this.vp.pickRegion(x, y); if (regionHit && faceHit && regionHit.distance > faceHit.distance + 0.5) regionHit = null;
@@ -1158,7 +1370,7 @@ export class App {
       this.drag = { kind: 'extrude', sketch: sk.id, profilePoint: [ip.x, ip.y], plane, start: regionHit.point.clone(), normal: new THREE.Vector3(...planeNormal(plane)), depth: 0 };
       return;
     }
-    if (edgeHit) { this.drag = { kind: 'edge', body: edgeHit.body, index: edgeHit.index, created: null, radius: 0 }; return; }
+    if (edgeHit) { this.drag = { kind: 'edge', body: edgeHit.body, index: edgeHit.index, created: null, radius: 0, out: null, shape: 'fillet' }; return; }
     if (faceHit && faceHit.index >= 0) {
       const fd = this.bodyOf(faceHit.body)?.faces[faceHit.index];
       if (fd?.type === 'plane' && fd.normal) { this.drag = { kind: 'draw', body: faceHit.body, index: faceHit.index, started: false }; return; }
@@ -1167,6 +1379,7 @@ export class App {
   }
 
   private viewMove(info: PointerInfo): void {
+    if (info.moved) this.cancelPress();
     const d = this.drag; if (!d) return;
     const doc = this.doc.current;
     if (d.kind === 'extrude') {
@@ -1174,8 +1387,19 @@ export class App {
       if (Math.abs(t) < 0.01) this.vp.setGhost(null);
       else { const tmp: ExtrudeFeature = { id: 'tmp', type: 'extrude', name: '', sketch: d.sketch, depth: Math.abs(t), op: 'new', flip: t < 0, profilePoint: d.profilePoint }; this.vp.setGhost(buildExtrude(doc, tmp)); }
       this.updateChip(info.x, info.y, `${fmtDim('distance', Math.abs(t))} mm${t < 0 ? ' (corte)' : ''}`);
+    } else if (d.kind === 'gmove') {
+      const t = snapMm(this.vp.axisDragDistance(d.origin, d.axis, info.x, info.y) - d.t0); d.dist = t;
+      this.vp.previewBodyMatrix(d.body, new THREE.Matrix4().makeTranslation(d.axis.x * t, d.axis.y * t, d.axis.z * t));
+      this.vp.setGizmo(d.origin.clone().add(d.axis.clone().multiplyScalar(t)));
+      this.updateChip(info.x, info.y, `${t >= 0 ? '+' : '−'}${fmtDim('distance', Math.abs(t))} mm em ${'XYZ'[d.axisIndex]}`);
+    } else if (d.kind === 'grot') {
+      let ang = ((this.gizmoAngle(d.center, d.axis, info.x, info.y) - d.a0) * 180) / Math.PI;
+      ang = ((ang + 540) % 360) - 180; ang = Math.round(ang / 5) * 5; d.angle = ang;
+      const c = d.center; const m = new THREE.Matrix4().makeTranslation(c.x, c.y, c.z).multiply(new THREE.Matrix4().makeRotationAxis(d.axis, (ang * Math.PI) / 180)).multiply(new THREE.Matrix4().makeTranslation(-c.x, -c.y, -c.z));
+      this.vp.previewBodyMatrix(d.body, m);
+      this.updateChip(info.x, info.y, `${ang >= 0 ? '' : '−'}${Math.abs(ang)}° em ${'XYZ'[d.axisIndex]}`);
     } else if (d.kind === 'pull') {
-      const t = snapMm(this.vp.axisDragDistance(d.origin, d.normal, info.x, info.y)); d.dist = t;
+      const t = snapMm(this.vp.axisDragDistance(d.origin, d.normal, info.x, info.y) - d.t0); d.dist = t;
       let g: THREE.BufferGeometry | null = null;
       if (Math.abs(t) >= 0.01) {
         const parts: THREE.BufferGeometry[] = [];
@@ -1185,14 +1409,21 @@ export class App {
       this.vp.setGhost(g);
       this.updateChip(info.x, info.y, `${t >= 0 ? '+' : '−'}${fmtDim('distance', Math.abs(t))} mm`);
     } else if (d.kind === 'edge') {
-      const r = snapMm(Math.hypot(info.x - info.startX, info.y - info.startY) * this.vp.worldPerPixel()); d.radius = r;
+      const body = this.bodyOf(d.body); const ed = body?.edges[d.index]; if (!body || !ed) return;
+      // Sentido do arrasto decide a forma (como no Shapr3D): para fora do corpo arredonda, para dentro chanfra.
+      if (!d.out) {
+        const c = body.bbox; const cs = this.vp.worldToScreen(new THREE.Vector3((c[0][0] + c[1][0]) / 2, (c[0][1] + c[1][1]) / 2, (c[0][2] + c[1][2]) / 2)); const es = this.vp.worldToScreen(new THREE.Vector3(...ed.mid));
+        const len = Math.hypot(es.x - cs.x, es.y - cs.y); d.out = len > 1 ? { x: (es.x - cs.x) / len, y: (es.y - cs.y) / len } : { x: 0, y: -1 };
+      }
+      const proj = (info.x - info.startX) * d.out.x + (info.y - info.startY) * d.out.y;
+      const shape: 'fillet' | 'chamfer' = this.edgeDragKind === 'auto' ? (proj >= 0 ? 'fillet' : 'chamfer') : this.edgeDragKind;
+      const r = snapMm((this.edgeDragKind === 'auto' ? Math.abs(proj) : Math.hypot(info.x - info.startX, info.y - info.startY)) * this.vp.worldPerPixel()); d.radius = r; d.shape = shape;
       if (r >= 0.5) {
-        const body = this.bodyOf(d.body); const ed = body?.edges[d.index]; if (!body || !ed) return;
-        if (!d.created) { this.pushUndo(); const f = addFillet(doc, this.edgeDragKind, body.id, [{ mid: ed.mid, len: ed.len }], r); d.created = f.id; this.selectedFeature = f.id; }
-        else { const f = doc.features.find((x) => x.id === d.created); if (f && (f.type === 'fillet' || f.type === 'chamfer')) f.radius = r; }
+        if (!d.created) { this.pushUndo(); const f = addFillet(doc, shape, body.id, [{ mid: ed.mid, len: ed.len }], r); d.created = f.id; this.selectedFeature = f.id; }
+        else { const f = doc.features.find((x) => x.id === d.created); if (f && (f.type === 'fillet' || f.type === 'chamfer')) { f.radius = r; if (f.type !== shape) { f.type = shape; f.name = f.name.replace(/^(Filete|Chanfro)/, shape === 'fillet' ? 'Filete' : 'Chanfro'); } } }
         this.scheduleLive();
       }
-      this.updateChip(info.x, info.y, `${this.edgeDragKind === 'fillet' ? 'R' : ''}${fmtDim('distance', Math.max(r, 0))} mm`);
+      this.updateChip(info.x, info.y, `${shape === 'fillet' ? 'Filete R' : 'Chanfro '}${fmtDim('distance', Math.max(r, 0))} mm`);
     } else if (d.kind === 'moveInst') {
       const asm = this.asm!; const inst = asm.instances.find((i) => i.id === d.inst); if (!inst) return;
       const p = this.vp.rayOnPlane(d.hit, d.normal, info.x, info.y); if (!p) return;
@@ -1228,9 +1459,26 @@ export class App {
       void this.settleCollision(inst.id);
       return;
     }
+    if (d && (d.kind === 'gmove' || d.kind === 'grot') && (!info.moved || cancelled)) { this.vp.previewBodyMatrix(d.body, null); this.updateGizmo(); return; }
     if (!d || !info.moved || cancelled) {
       if (d?.kind === 'edge' && d.created) { this.undo(); }
       if (!cancelled) this.tapView(info);
+      return;
+    }
+    if (d.kind === 'gmove' || d.kind === 'grot') {
+      this.vp.previewBodyMatrix(d.body, null);
+      const body = d.body; const isMove = d.kind === 'gmove';
+      if (isMove ? Math.abs(d.dist) < 0.3 : Math.abs(d.angle) < 0.5) { this.updateGizmo(); return; }
+      const amount = isMove ? d.dist : d.angle; const sgn = Math.sign(amount) || 1;
+      const axisDir: V3 = [d.axis.x, d.axis.y, d.axis.z]; const center = d.kind === 'grot' ? d.center : d.origin;
+      const apply = (f: Feature, v: number) => { if (f.type !== 'transform') return; if (isMove) f.translate = [axisDir[0] * v, axisDir[1] * v, axisDir[2] * v]; else f.angle = v; };
+      void this.tryFeature(() => {
+        const f = addTransform(doc, body, { translate: [0, 0, 0], axisPoint: [center.x, center.y, center.z], axisDir, angle: 0 });
+        apply(f, amount); if (!isMove) f.name = f.name.replace(/^Mover/, 'Girar'); return f;
+      }, (f) => {
+        this.selectedFeature = f.id; this.selectBody(body);
+        this.showChip(info.x, info.y, `${isMove ? `${fmtDim('distance', Math.abs(amount))} mm` : `${Math.abs(amount)}°`} ✎`, () => this.valuePopover(info.x, info.y, Math.abs(amount), isMove ? 'mm' : '°', (v) => { void this.tryFeature(() => { apply(f, sgn * v); return f; }); }));
+      });
       return;
     }
     if (d.kind === 'extrude') {
@@ -1387,46 +1635,53 @@ export class App {
       if (this.selectedInstance || this.sel3d.body) { this.selectedInstance = null; this.clearSel3d(); }
       return;
     }
+    // Duplo toque: numa face seleciona o corpo inteiro (gizmo); no vazio enquadra tudo.
+    const now = performance.now(); const dbl = now - this.lastTap.t < 380 && Math.hypot(info.x - this.lastTap.x, info.y - this.lastTap.y) < 28;
+    this.lastTap = { t: dbl ? 0 : now, x: info.x, y: info.y };
+    if (dbl) { if (faceHit && faceHit.index >= 0) { this.selectBody(faceHit.body); this.toast('Corpo inteiro: arraste as setas para mover, os anéis para girar.'); } else if (!faceHit) this.vp.fitAll(); return; }
     const edgeHit = this.vp.pickEdge(info.x, info.y, info.type === 'touch' ? 18 : info.type === 'pen' ? 12 : 9, faceHit);
-    if (edgeHit) {
-      if (this.sel3d.edges.length && this.sel3d.edges[0].body !== edgeHit.body) this.sel3d.edges = [];
-      const i = this.sel3d.edges.findIndex((e) => e.body === edgeHit.body && e.index === edgeHit.index);
-      if (i >= 0) this.sel3d.edges.splice(i, 1); else this.sel3d.edges.push({ body: edgeHit.body, index: edgeHit.index });
-      this.sel3d.face = null; this.sel3d.body = this.sel3d.edges.length ? edgeHit.body : null; this.selectedFeature = null;
-      this.vp.setSelection(this.sel3d); this.updateFaceHandle(); this.renderSidePanel(); this.renderToolbar();
-      if (this.sel3d.edges.length) this.menu(info.x + 10, info.y + 10, [
-        { label: `Filete nas ${this.sel3d.edges.length} aresta${this.sel3d.edges.length > 1 ? 's' : ''}…`, action: () => this.filletSelected('fillet') },
-        { label: 'Chanfro…', action: () => this.filletSelected('chamfer') },
-      ]);
-      return;
-    }
+    if (edgeHit) { this.selectEdge(edgeHit.body, edgeHit.index); return; }
+    let regionHit = this.vp.pickRegion(info.x, info.y); if (regionHit && faceHit && regionHit.distance > faceHit.distance + 0.5) regionHit = null;
+    if (regionHit) { this.selectRegion(regionHit.sketch, regionHit.index); return; }
     if (faceHit) {
-      this.selectedFeature = null;
       if (faceHit.index < 0) {
+        this.selectedFeature = null; this.selRegion = null; this.vp.setRegionSelected(null);
         this.sel3d = { body: faceHit.body, face: null, faces: [], edges: [] };
         this.toast(this.kernel.state === 'loading' ? 'O kernel 3D ainda está carregando (50 MB na primeira vez). Faces e arestas ficam disponíveis quando terminar.' : 'Kernel 3D indisponível neste navegador: só a prévia.', 'err');
-      }
-      else {
-        // Toque numa face soma à seleção (mesmo corpo); tocar de novo tira; toque em vazio limpa.
-        const all = [...(this.sel3d.face ? [this.sel3d.face] : []), ...(this.sel3d.faces ?? [])];
-        const idx = all.findIndex((f) => f.body === faceHit.body && f.index === faceHit.index);
-        let next = idx >= 0 ? all.filter((_, i) => i !== idx) : (all.length && all[0].body !== faceHit.body ? [] : all).concat([{ body: faceHit.body, index: faceHit.index }]);
-        if (idx >= 0) next = all.filter((_, i) => i !== idx);
-        const primary = next[next.length - 1] ?? null;
-        this.sel3d = { body: faceHit.body, face: primary, faces: primary ? next.slice(0, -1) : [], edges: [] };
-        if (this.sel3d.face && this.faceIsPlanar(this.sel3d.face) && idx < 0) {
-          const items = [{ label: 'Esboçar nesta face', action: () => this.createSketchOnFace(faceHit.body, faceHit.index) }];
-          const sketchesHere = this.doc.current.sketches.filter((s) => getPlane(this.doc.current, s.plane).body === faceHit.body);
-          for (const s of sketchesHere) items.push({ label: `Extrudar ${s.name}`, action: () => this.extrudeSketch(s.id) });
-          this.menu(info.x + 10, info.y + 10, items);
-        }
-      }
-      this.vp.setSelection(this.sel3d); this.updateFaceHandle(); this.renderSidePanel(); this.renderToolbar();
+        this.vp.setSelection(this.sel3d); this.updateFaceHandle(); this.renderSidePanel(); this.renderToolbar();
+      } else this.selectFace(faceHit.body, faceHit.index);
       return;
     }
     const plane = this.vp.pickPlane(info.x, info.y);
     if (plane) { const p = getPlane(this.doc.current, plane); this.menu(info.x + 8, info.y + 8, [{ label: `Novo esboço em ${p.name}`, action: () => this.createSketchOn(plane) }]); return; }
-    if (this.selectedFeature || this.sel3d.body || this.sel3d.face || this.sel3d.edges.length) { this.selectedFeature = null; this.clearSel3d(); }
+    if (this.selectedFeature || this.sel3d.body || this.sel3d.face || this.sel3d.edges.length || this.selRegion) { this.selectedFeature = null; this.clearSel3d(); }
+  }
+
+  // ---------- Toque longo: escolher entre itens sobrepostos ----------
+  private startPress(info: PointerInfo): void {
+    this.cancelPress(); if (this.isAssembly || this.measure.on) return;
+    this.pressTimer = window.setTimeout(() => {
+      this.pressTimer = 0; if (info.moved || !this.pointers.has(info.id)) return;
+      if (this.selectThrough(info.x, info.y)) { info.handled = true; this.drag = null; this.vp.setGhost(null); this.hideChip(); }
+    }, 520);
+  }
+  private cancelPress(): void { if (this.pressTimer) { clearTimeout(this.pressTimer); this.pressTimer = 0; } }
+  /** Lista do que está sob a caneta (aresta, face, corpo, região, plano) para escolher com precisão. Devolve false se não há nada. */
+  private selectThrough(x: number, y: number): boolean {
+    const doc = this.doc.current; const faceHit = this.vp.pickFace(x, y);
+    const items: { label: string; action: () => void }[] = [];
+    const edgeHit = this.vp.pickEdge(x, y, 14, faceHit);
+    if (edgeHit) items.push({ label: `Aresta de ${bodyName(doc, edgeHit.body)}`, action: () => this.selectEdge(edgeHit.body, edgeHit.index, false) });
+    if (faceHit && faceHit.index >= 0) {
+      const f = this.bodyOf(faceHit.body)?.faces[faceHit.index];
+      items.push({ label: `Face ${faceTypeName(f?.type ?? 'other')} de ${bodyName(doc, faceHit.body)}`, action: () => this.selectFace(faceHit.body, faceHit.index, false) }, { label: `${bodyName(doc, faceHit.body)} inteiro (mover/girar)`, action: () => this.selectBody(faceHit.body) });
+    }
+    const regionHit = this.vp.pickRegion(x, y);
+    if (regionHit) { const sk = getSketch(doc, regionHit.sketch); items.push({ label: `Região de ${sk.name}`, action: () => this.selectRegion(regionHit.sketch, regionHit.index) }, { label: `Editar ${sk.name}`, action: () => this.enterSketch(sk.id) }); }
+    const plane = this.vp.pickPlane(x, y);
+    if (plane) { const p = getPlane(doc, plane); items.push({ label: `Novo esboço em ${p.name}`, action: () => this.createSketchOn(plane) }); }
+    if (!items.length) return false;
+    this.menu(x + 10, y + 10, items); return true;
   }
 
   // ---------- Ferramentas de esboço ----------
@@ -2552,6 +2807,7 @@ export class App {
         if (ev.key === 'Escape') { this.closeMenus(); this.selectedFeature = null; this.clearSel3d(); }
         else if ((ev.key === 'Backspace' || ev.key === 'Delete') && this.selectedFeature) { const f = this.doc.current.features.find((x) => x.id === this.selectedFeature); if (f) this.deleteFeature(f); }
         else if (ev.key.toLowerCase() === 'f' && this.sel3d.edges.length) this.filletSelected('fillet');
+        else if (ev.key.toLowerCase() === 'h' && this.sel3d.body && !this.isAssembly) this.toggleHidden(this.sel3d.body);
         return;
       }
       const map: Record<string, Tool> = { v: 'select', p: 'draw', l: 'line', r: 'rect', c: 'circle', g: 'polygon', o: 'slot', d: 'dimension', x: 'erase' };

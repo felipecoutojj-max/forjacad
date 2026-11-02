@@ -19,12 +19,24 @@ npm run dev
 
 Abre em `http://localhost:5173`. Para abrir no iPad na mesma rede, use o endereço de rede que o Vite imprime.
 
-## Como usar (v0.7, modelagem direta)
+## Como usar (v0.10, modelagem direta)
 
 - **Caneta na peça.** Risque numa face plana: abre um esboço nela, na própria vista 3D (botão "Vista reta"
   se preferir de frente). Arraste uma região sombreada do esboço: extruda ao vivo; para fora adiciona, para
-  dentro corta. Toque numa face e arraste-a: puxa ou empurra a face. Arraste uma aresta: filete (ou chanfro,
-  conforme o botão ativo) com o raio seguindo a caneta. O valor aparece numa etiqueta; toque nela para digitar.
+  dentro corta. Toque numa face e arraste a seta: puxa ou empurra a face. Arraste uma aresta **para fora da
+  peça**: filete; **para dentro**: chanfro (os botões Filete/Chanfro travam uma das formas, se preferir).
+  O valor aparece numa etiqueta; toque nela para digitar.
+- **Barra de ações.** Como o menu adaptativo do Shapr3D: ao tocar numa região, face, aresta ou corpo, aparece
+  embaixo só o que faz sentido para aquela seleção (Extrudar, Esboçar, Puxar, Casca, Espelhar, Filete,
+  Chanfro, Mover/Girar, Dividir, Padrão, Combinar, Ocultar, Apagar). Toque no vazio para limpar.
+- **Mover e girar.** Toque duas vezes numa face (ou escolha o corpo em Itens): aparece o gizmo com setas X, Y, Z
+  e anéis de giro. Arraste uma seta para mover no eixo, um anel para girar (de 5 em 5 graus); o valor sai na
+  etiqueta e pode ser digitado. Toque duas vezes no vazio para enquadrar tudo.
+- **Itens.** O painel lista corpos, esboços e planos com um olho para ocultar e mostrar. Segure a caneta (ou
+  clique com o direito) num item para renomear, enquadrar ou apagar. Esboços que viraram corpo se escondem
+  sozinhos; "Mostrar ocultos" e "Inverter visibilidade" ficam logo abaixo. Tecla H oculta o corpo selecionado.
+- **Sobrepostos.** Segure a caneta parada sobre a peça (ou clique com o direito): abre a lista do que está
+  ali embaixo (aresta, face, corpo inteiro, região de esboço, plano) para escolher exatamente o que quer.
 - **Cotas.** Retângulo, círculo, rasgo e polígono já nascem cotados (largura e altura, diâmetro, distância
   entre centros). Toque numa cota, ou direto numa linha ou círculo, e digite o valor em mm: a geometria obedece.
   O botão "Construção" na paleta deixa tudo o que você riscar como linha de referência tracejada.
@@ -52,7 +64,8 @@ restrições automáticas (horizontal, vertical, ângulo reto, tangente, concên
 filete 2D, construção. Faltam ainda: spline, elipse, texto, aparar, projetar arestas e padrão no esboço.
 
 Sólidos: extrudar (novo, adicionar, cortar, por região, com padrão linear ou circular), puxar/empurrar face,
-revolução, varredura, loft, filete, chanfro, casca, espelho, mover/girar/escalar, dividir por plano, união,
+revolução, varredura, loft, filete, chanfro (pelo sentido do arrasto), casca, espelho, mover/girar pelo gizmo
+(e escalar por diálogo), dividir por plano, menu adaptativo à seleção, itens com visibilidade e nomes, união,
 subtração, interseção, plano de construção deslocado, medir, vista em corte, importar STEP. Faltam: substituir
 face, ângulo de saída (draft), rosca, análise de superfície e materiais visuais.
 
