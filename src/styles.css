@@ -187,5 +187,9 @@ input[type=checkbox] { width: 20px; height: 20px; accent-color: var(--ember); }
 .sidepanel .row.tools { gap: 4px; flex-wrap: wrap; }
 .sidepanel .row.tools .btn { min-height: 32px; font-size: 12px; padding: 4px 10px; }
 
+/* Caixa de seleção: tracejada quando contém (esquerda→direita), cheia quando toca (direita→esquerda) */
+.marquee { position: absolute; border: 1.5px dashed var(--ember); background: var(--ember-soft); border-radius: 4px; pointer-events: none; }
+.marquee.touch { border-style: solid; border-color: var(--teal); background: rgba(30, 158, 138, 0.12); }
+
 /* Concluir esboço sempre à mão */
 .done-fab { position: absolute; left: 12px; bottom: calc(env(safe-area-inset-bottom) + 14px); pointer-events: auto; min-height: 46px; padding: 8px 18px; border-radius: 999px; font-size: 14px; box-shadow: var(--shadow); }

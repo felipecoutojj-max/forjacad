@@ -4,7 +4,7 @@
 import * as THREE from 'three';
 import type { Plane } from '../core/document';
 import { planeNormal } from '../core/document';
-import type { BodyData } from '../core/kernel/occ/types';
+import type { BodyData, EdgeData } from '../core/kernel/occ/types';
 import type { Vec2 } from '../core/geom';
 import type { Id } from '../core/sketch/model';
 
@@ -21,7 +21,8 @@ export type ThemeName = keyof typeof THEMES;
 export interface RenderBody { id: Id; name: string; geometry: THREE.BufferGeometry; data?: BodyData; /** 4×4 em linha-maior (instância de montagem). */ matrix?: number[]; }
 
 /** Seleção em modo vista. Arestas selecionadas pertencem sempre a um único corpo. */
-export interface Sel3D { body: Id | null; face: { body: Id; index: number } | null; /** Faces selecionadas além da principal (toque soma). */ faces?: { body: Id; index: number }[]; edges: { body: Id; index: number }[]; }
+export interface Sel3D { body: Id | null; /** Outros corpos selecionados junto (caixa de seleção): movem, combinam, somem e apagam juntos. */ bodies?: Id[]; face: { body: Id; index: number } | null; /** Faces selecionadas além da principal (toque soma). */ faces?: { body: Id; index: number }[]; edges: { body: Id; index: number }[]; }
+export type BoxKind = 'bodies' | 'faces' | 'edges';
 export const emptySel3D = (): Sel3D => ({ body: null, face: null, faces: [], edges: [] });
 
 export interface FaceHit { body: Id; index: number; distance: number; point: THREE.Vector3; }
@@ -378,7 +379,8 @@ export class Viewport {
   /** Redesenha só os destaques de face e aresta. */
   setSelection(sel: Sel3D): void {
     this.highlights.clear();
-    for (const [id, mesh] of this.bodyMeshes) if (!this.translucent.has(id)) mesh.material = id === sel.body ? this.bodySelMaterial : this.bodyMaterial;
+    const selBodies = new Set<Id>([...(sel.body ? [sel.body] : []), ...(sel.bodies ?? [])]);
+    for (const [id, mesh] of this.bodyMeshes) if (!this.translucent.has(id)) mesh.material = selBodies.has(id) ? this.bodySelMaterial : this.bodyMaterial;
     for (const fs of [...(sel.face ? [sel.face] : []), ...(sel.faces ?? [])]) {
       const data = this.bodyData.get(fs.body); const mesh = this.bodyMeshes.get(fs.body);
       const f = data?.faces[fs.index];
@@ -603,6 +605,59 @@ export class Viewport {
   }
 
   bodyDataOf(id: Id): BodyData | undefined { return this.bodyData.get(id); }
+
+  /** Seleção por caixa na tela. 'contain' pega só o que está inteiro dentro; 'touch' pega tudo o que a caixa encosta. */
+  boxSelect(x0: number, y0: number, x1: number, y1: number, mode: 'contain' | 'touch', kind: BoxKind): { body: Id; index: number }[] {
+    const L = Math.min(x0, x1), R = Math.max(x0, x1), T = Math.min(y0, y1), B = Math.max(y0, y1);
+    const inside = (p: { x: number; y: number }) => p.x >= L && p.x <= R && p.y >= T && p.y <= B;
+    const segHits = (a: { x: number; y: number }, b: { x: number; y: number }) => {
+      if (inside(a) || inside(b)) return true;
+      // Liang–Barsky: o segmento atravessa o retângulo?
+      const dx = b.x - a.x, dy = b.y - a.y; let t0 = 0, t1 = 1;
+      for (const [pq, qq] of [[-dx, a.x - L], [dx, R - a.x], [-dy, a.y - T], [dy, B - a.y]] as [number, number][]) {
+        if (pq === 0) { if (qq < 0) return false; continue; }
+        const t = qq / pq; if (pq < 0) { if (t > t1) return false; if (t > t0) t0 = t; } else { if (t < t0) return false; if (t < t1) t1 = t; }
+      }
+      return t0 <= t1;
+    };
+    const out: { body: Id; index: number }[] = []; const v = new THREE.Vector3(), w = new THREE.Vector3();
+    for (const [body, data] of this.bodyData) {
+      const mat = this.bodyMatrixOf(body);
+      const edgeTest = (e: EdgeData): boolean => {
+        const pts = e.points; let all = true;
+        for (let i = 0; i + 2 < pts.length; i += 3) {
+          const sa = this.worldToScreen(v.set(pts[i], pts[i + 1], pts[i + 2]).applyMatrix4(mat));
+          if (mode === 'contain') { if (!inside(sa)) return false; continue; }
+          if (i + 5 < pts.length) { const sb = this.worldToScreen(w.set(pts[i + 3], pts[i + 4], pts[i + 5]).applyMatrix4(mat)); if (segHits(sa, sb)) return true; }
+          else if (inside(sa)) return true;
+          all = false;
+        }
+        return mode === 'contain' ? all : false;
+      };
+      if (kind === 'edges') { for (const e of data.edges) if (edgeTest(e)) out.push({ body, index: e.index }); continue; }
+      if (kind === 'bodies') {
+        // Corpo inteiro dentro: todas as arestas dentro. Tocado: qualquer aresta tocada.
+        const edges = data.edges; if (!edges.length) continue;
+        const hit = mode === 'contain' ? edges.every(edgeTest) : edges.some(edgeTest);
+        if (hit) out.push({ body, index: -1 }); continue;
+      }
+      // Faces: pelos vértices dos triângulos (contém) ou arestas dos triângulos (toca).
+      const pos = this.bodyMeshes.get(body)?.geometry.getAttribute('position'); if (!pos) continue;
+      for (const f of data.faces) {
+        let all = true, any = false;
+        const scr = new Map<number, { x: number; y: number }>();
+        const sp = (vi: number) => { let s = scr.get(vi); if (!s) { s = this.worldToScreen(v.set(pos.getX(vi), pos.getY(vi), pos.getZ(vi)).applyMatrix4(mat)); scr.set(vi, s); } return s; };
+        for (let t = f.triStart; t < f.triStart + f.triCount && (mode === 'contain' ? all : !any); t++) {
+          const i0 = data.indices[t * 3], i1 = data.indices[t * 3 + 1], i2 = data.indices[t * 3 + 2];
+          const a = sp(i0), b = sp(i1), c = sp(i2);
+          if (mode === 'contain') { if (!inside(a) || !inside(b) || !inside(c)) all = false; }
+          else if (segHits(a, b) || segHits(b, c) || segHits(c, a)) any = true;
+        }
+        if (mode === 'contain' ? all && f.triCount > 0 : any) out.push({ body, index: f.index });
+      }
+    }
+    return out;
+  }
 
   /** Distância em pixels de um ponto 3D ao cursor. */
   screenDistance(p: THREE.Vector3, x: number, y: number): number { const s = this.worldToScreen(p); return Math.hypot(s.x - x, s.y - y); }
