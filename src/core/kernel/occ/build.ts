@@ -190,7 +190,7 @@ export function bbox(oc: OC, shape: TopoDS_Shape): [V3, V3] {
   return out;
 }
 
-interface EdgeInfo { edge: TopoDS_Edge; mid: V3; len: number; curve: BRepAdaptor_Curve; }
+interface EdgeInfo { edge: TopoDS_Edge; mid: V3; len: number; curve: BRepAdaptor_Curve; /** Posição no mapa de arestas do shape (1-based), para casar com as faces. */ mapIndex: number; }
 
 function enumerateEdges(oc: OC, shape: TopoDS_Shape): EdgeInfo[] {
   const map = new oc.TopTools_IndexedMapOfShape_1();
@@ -203,7 +203,7 @@ function enumerateEdges(oc: OC, shape: TopoDS_Shape): EdgeInfo[] {
     const f = curve.FirstParameter(), l = curve.LastParameter();
     const m = curve.Value((f + l) / 2); const mid: V3 = [m.X(), m.Y(), m.Z()]; m.delete();
     const len = oc.GCPnts_AbscissaPoint.Length_1(curve);
-    out.push({ edge, mid, len, curve });
+    out.push({ edge, mid, len, curve, mapIndex: i });
   }
   map.delete();
   return out;
@@ -388,7 +388,7 @@ export function tessellate(oc: OC, body: BuiltBody, name: string, quality = 1): 
   const mesher = new oc.BRepMesh_IncrementalMesh_2(shape, lin, false, 0.3 / quality, false); mesher.delete();
 
   const positions: number[] = [], normals: number[] = [], indices: number[] = [], triFace: number[] = [];
-  const faces: FaceData[] = [];
+  const faces: FaceData[] = []; const faceShapes: [number, TopoDS_Face][] = [];
   const fmap = new oc.TopTools_IndexedMapOfShape_1();
   oc.TopExp.MapShapes_1(shape, oc.TopAbs_ShapeEnum.TopAbs_FACE as never, fmap);
   const REVERSED = enumVal(oc.TopAbs_Orientation.TopAbs_REVERSED);
@@ -433,18 +433,26 @@ export function tessellate(oc: OC, body: BuiltBody, name: string, quality = 1): 
     const props = new oc.GProp_GProps_1(); oc.BRepGProp.SurfaceProperties_1(face, props, false, false); fd.area = props.Mass();
     const cm = props.CentreOfMass(); if (Number.isFinite(cm.X())) fd.center = [cm.X(), cm.Y(), cm.Z()]; cm.delete(); props.delete();
     surf.delete(); trsf.delete(); loc.delete();
-    faces.push(fd);
+    faceShapes.push([faces.length, face]); faces.push(fd);
   }
-  fmap.delete();
 
-  const edges: EdgeData[] = [];
+  const edges: EdgeData[] = []; const edgeByMap = new Map<number, number>();
   for (const e of enumerateEdges(oc, shape)) {
     const disc = new oc.GCPnts_TangentialDeflection_2(e.curve, 0.25 / quality, Math.max(0.01, lin * 2), 2, 1e-9, 1e-7);
     const n = disc.NbPoints(); const pts = new Float32Array(n * 3);
     for (let k = 1; k <= n; k++) { const p = disc.Value(k); pts[(k - 1) * 3] = p.X(); pts[(k - 1) * 3 + 1] = p.Y(); pts[(k - 1) * 3 + 2] = p.Z(); p.delete(); }
     disc.delete(); e.curve.delete();
+    edgeByMap.set(e.mapIndex, edges.length);
     edges.push({ index: edges.length, points: pts, mid: e.mid, len: e.len });
   }
+  // Quais arestas contornam cada face (para projetar uma face inteira no esboço).
+  const emap = new oc.TopTools_IndexedMapOfShape_1(); oc.TopExp.MapShapes_1(shape, oc.TopAbs_ShapeEnum.TopAbs_EDGE as never, emap);
+  for (const [fi, face] of faceShapes) {
+    const ex = new oc.TopExp_Explorer_2(face, oc.TopAbs_ShapeEnum.TopAbs_EDGE as never, oc.TopAbs_ShapeEnum.TopAbs_SHAPE as never); const set = new Set<number>();
+    for (; ex.More(); ex.Next()) { const k = edgeByMap.get(emap.FindIndex(ex.Current())); if (k != null) set.add(k); }
+    ex.delete(); faces[fi].edges = [...set];
+  }
+  emap.delete(); fmap.delete();
 
   const vp = new oc.GProp_GProps_1(); oc.BRepGProp.VolumeProperties_1(shape, vp, false, false, false); const volume = vp.Mass(); vp.delete();
   const sp = new oc.GProp_GProps_1(); oc.BRepGProp.SurfaceProperties_1(shape, sp, false, false); const area = sp.Mass(); sp.delete();

@@ -38,6 +38,10 @@ describe('kernel OpenCASCADE', () => {
     const m = tessellate(oc, r.bodies[0], 'Corpo 1');
     expect(m.volume).toBeCloseTo(120000, 0);
     expect(m.faces).toHaveLength(6); expect(m.edges).toHaveLength(12);
+    // Cada face do bloco é contornada por 4 arestas, e cada aresta aparece em exatamente 2 faces.
+    for (const f of m.faces) expect(f.edges).toHaveLength(4);
+    const uses = new Map<number, number>(); for (const f of m.faces) for (const e of f.edges!) uses.set(e, (uses.get(e) ?? 0) + 1);
+    expect([...uses.values()].every((n) => n === 2)).toBe(true); expect(uses.size).toBe(12);
     expect(m.indices.length / 3).toBeGreaterThanOrEqual(12);
     // Normais para fora: a face com normal +z fica em z = 20.
     const top = m.faces.find((f) => f.type === 'plane' && f.normal && f.normal[2] > 0.99)!;

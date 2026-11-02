@@ -15,6 +15,7 @@ import type { Sketch, Entity, Id, ConstraintKind, DimensionKind } from '../core/
 import { solveSketch, type SolveResult, type SolveOptions } from '../core/sketch/solver';
 import { recognizeStroke, type Primitive } from '../core/sketch/recognizer';
 import { isTrimmable, trimSegmentAt, applyTrim, type TrimSegment, type Trimmable } from '../core/sketch/trim';
+import { projectPolylines } from '../core/sketch/project';
 import { buildAllBodies, buildExtrude, extractProfiles, profileInnerPoint, profileContainsPoint, profileToShape, planeMatrix } from '../core/kernel/preview';
 import { KernelClient, SupersededError } from '../core/kernel/occ/client';
 import type { BodyData, FeatureError, RebuildResult } from '../core/kernel/occ/types';
@@ -30,7 +31,7 @@ import type { ProjectedView, AssemblyPayload, InterferenceHit } from '../core/ke
 import { saveLocal, loadLocal, downloadFile, pickFile, safeFileName } from './storage';
 import { type Vec2, v2, dist, distPointSegment, distPointArc, closestOnSegment, sub, add, scale, norm, perp, angleOf, normAngle, TAU, round, intersectSegments, intersectLineCircle, intersectCircles } from '../core/geom';
 
-type Tool = 'select' | 'draw' | 'line' | 'rect' | 'circle' | 'ellipse' | 'spline' | 'polygon' | 'slot' | 'dimension' | 'trim' | 'erase';
+type Tool = 'select' | 'draw' | 'line' | 'rect' | 'circle' | 'ellipse' | 'spline' | 'polygon' | 'slot' | 'dimension' | 'project' | 'trim' | 'erase';
 interface FormField { key: string; label: string; type: 'number' | 'text' | 'select' | 'check'; value: unknown; options?: [string, string][]; step?: number; }
 
 interface PointerInfo { id: number; type: string; x: number; y: number; startX: number; startY: number; moved: boolean; role: 'tool' | 'nav' | 'pan'; button: number; shift?: boolean; /** Toque longo já consumiu este ponteiro. */ handled?: boolean; }
@@ -632,7 +633,7 @@ export class App {
     this.toolbar.innerHTML = ''; this.toolbar.append(this.toolbarGrip());
     const g1 = el('div', 'group'); const g2 = el('div', 'group'); const g3 = el('div', 'group');
     if (this.mode === 'sketch') {
-      const tools: [Tool, IconName, string][] = [['select', 'select', 'Selecionar'], ['draw', 'draw', 'Caneta'], ['line', 'line', 'Linha'], ['rect', 'rect', 'Retângulo'], ['circle', 'circle', 'Círculo'], ['ellipse', 'ellipse', 'Elipse'], ['spline', 'spline', 'Spline'], ['polygon', 'polygon', 'Polígono'], ['slot', 'slot', 'Rasgo'], ['dimension', 'dimension', 'Cota'], ['trim', 'trim', 'Aparar'], ['erase', 'erase', 'Apagar']];
+      const tools: [Tool, IconName, string][] = [['select', 'select', 'Selecionar'], ['draw', 'draw', 'Caneta'], ['line', 'line', 'Linha'], ['rect', 'rect', 'Retângulo'], ['circle', 'circle', 'Círculo'], ['ellipse', 'ellipse', 'Elipse'], ['spline', 'spline', 'Spline'], ['polygon', 'polygon', 'Polígono'], ['slot', 'slot', 'Rasgo'], ['dimension', 'dimension', 'Cota'], ['project', 'project', 'Projetar'], ['trim', 'trim', 'Aparar'], ['erase', 'erase', 'Apagar']];
       for (const [t, ic, label] of tools) { const b = this.iconButton(ic, label, () => { if (t === 'polygon' && this.tool !== 'polygon') this.valuePopover(this.vp.width / 2, 80, this.polygonSides, 'lados', (v) => { this.polygonSides = Math.max(3, Math.min(24, Math.round(v))); this.setTool('polygon'); }); else this.setTool(t); }); if (this.tool === t) b.classList.add('active'); g1.append(b); }
       const cons = this.iconButton('construction', 'Construção', () => { this.constructionMode = !this.constructionMode; this.renderToolbar(); this.toast(this.constructionMode ? 'Construção ligada: o que você riscar vira linha de referência tracejada (serve para centralizar e encaixar).' : 'Construção desligada.'); }); if (this.constructionMode) cons.classList.add('active'); g1.append(cons);
       const touch = this.iconButton('touch', 'Dedo desenha', () => { this.touchDraws = !this.touchDraws; this.renderToolbar(); }); if (this.touchDraws) touch.classList.add('active'); g2.append(touch);
@@ -898,6 +899,7 @@ export class App {
         : this.tool === 'ellipse' ? 'Arraste do centro: o arrasto dá o eixo maior e a inclinação. Toque na elipse para digitar os dois eixos.'
         : this.tool === 'dimension' ? (this.pendingDimRefs.length ? 'Toque no segundo elemento, ou em área vazia para cotar só este.' : 'Toque numa linha, círculo, arco ou ponto. Para ângulo, toque em duas linhas.')
         : this.tool === 'select' ? 'Toque para selecionar. Arraste pontos para ajustar. Selecione elementos para ver restrições possíveis.'
+        : this.tool === 'project' ? 'Toque numa aresta ou numa face de um corpo: o contorno cai neste plano como linhas, círculos e arcos do esboço (com Construção ligada, como referência tracejada).'
         : this.tool === 'trim' ? 'Toque no trecho que quer tirar: ele some até os cruzamentos vizinhos. Arraste a caneta para aparar vários de uma vez.'
         : this.tool === 'erase' ? 'Toque no que quer apagar.' : 'Arraste para desenhar. Pontas próximas se juntam sozinhas.';
       p.append(hint);
@@ -1170,7 +1172,7 @@ export class App {
     this.activeSketch = null; this.mode = 'view'; this.sel = emptySelection(); this.pendingDimRefs = []; this.lastSolve = null;
     this.vp.exitSketch(); this.refreshAll(); this.vp.fitAll();
   }
-  setTool(t: Tool): void { if (this.splineDraft && t !== 'spline') this.finishSplineDraft(); if (this.tool === 'trim') this.sk.setHint(null, null, [], 1); this.tool = t; this.pendingDimRefs = []; if (t !== 'select') this.sel = emptySelection(); this.refreshAll(false); }
+  setTool(t: Tool): void { if (this.splineDraft && t !== 'spline') this.finishSplineDraft(); if (this.tool === 'trim') this.sk.setHint(null, null, [], 1); if (this.tool === 'project') this.vp.setHover(null); this.tool = t; this.pendingDimRefs = []; if (t !== 'select') this.sel = emptySelection(); this.refreshAll(false); }
 
   private solve(opts?: SolveOptions): SolveResult | null {
     const s = this.sketch; if (!s) return null;
@@ -1746,6 +1748,7 @@ export class App {
 
   private hover(ev: PointerEvent): void {
     if (this.mode === 'sketch') {
+      if (this.tool === 'project') { const { x, y } = this.local(ev); this.vp.setHover(this.projectHit(x, y, ev.pointerType)); return; }
       if (this.tool !== 'trim' || !this.sketch || this.trimRun) return;
       const uv = this.uvOf(this.local(ev)); if (uv) this.trimHint(this.sketch, uv, this.tolMm(ev.pointerType));
       return;
@@ -1848,6 +1851,32 @@ export class App {
     if (!items.length) return false;
     items.push({ label: this.xray ? 'Desligar Ver através' : 'Ver através (translúcido)', action: () => this.toggleXray() });
     this.menu(x + 10, y + 10, items); return true;
+  }
+
+  // ---------- Projetar arestas ----------
+  /** Aresta (de preferência) ou face de corpo sob o cursor, para projetar. */
+  private projectHit(x: number, y: number, pointerType: string): Hover {
+    const faceHit = this.vp.pickFace(x, y);
+    const edgeHit = this.vp.pickEdge(x, y, pointerType === 'touch' ? 18 : 12, faceHit);
+    if (edgeHit) return { kind: 'edge', body: edgeHit.body, index: edgeHit.index };
+    if (faceHit && faceHit.index >= 0) return { kind: 'face', body: faceHit.body, index: faceHit.index };
+    return null;
+  }
+  /** Projeta a aresta ou todas as arestas da face tocada no esboço ativo. */
+  private projectAt(x: number, y: number, pointerType: string): void {
+    const s = this.sketch, plane = this.plane; if (!s || !plane) return;
+    const h = this.projectHit(x, y, pointerType);
+    if (!h || h.kind === 'region') { this.toast('Toque numa aresta ou numa face de um corpo para projetar.'); return; }
+    const data = this.vp.bodyDataOf(h.body); if (!data) return;
+    const idx = h.kind === 'edge' ? [h.index] : data.faces[h.index]?.edges;
+    if (!idx || !idx.length) { this.toast('Esta face não tem contorno para projetar.'); return; }
+    const mat = this.vp.bodyMatrixOf(h.body); const v = new THREE.Vector3();
+    const polys = idx.map((i) => { const pts = data.edges[i].points; const out: V3[] = []; for (let k = 0; k + 2 < pts.length; k += 3) { v.set(pts[k], pts[k + 1], pts[k + 2]).applyMatrix4(mat); out.push([v.x, v.y, v.z]); } return out; });
+    this.pushUndo();
+    const made = projectPolylines(s, plane, polys, { construction: this.constructionMode });
+    if (!made.length) { this.undoStack.pop(); this.toast(h.kind === 'edge' ? 'Esta aresta está de ponta para o plano (ou já foi projetada): nada a desenhar.' : 'Nada novo para projetar desta face.'); return; }
+    this.solve(); this.refreshAll(false);
+    this.toast(made.length === 1 ? 'Aresta projetada no esboço.' : `${made.length} arestas projetadas no esboço.`);
   }
 
   // ---------- Aparar ----------
@@ -1989,6 +2018,7 @@ export class App {
         if (!info.moved) this.tapSelect(uv, tol, s);
         break;
       }
+      case 'project': { if (!cancelled && !info.moved) this.projectAt(info.x, info.y, info.type); break; }
       case 'trim': {
         if (!cancelled && !info.moved) this.trimUnder(s, uv, tol);
         const n = this.trimRun?.count ?? 0; this.trimRun = null; this.sk.setHint(null, null, [], 1);
@@ -3031,7 +3061,7 @@ export class App {
         else if (!meta && !this.isAssembly && ['b', 'f', 'e', 'a'].includes(ev.key.toLowerCase())) { const k = ev.key.toLowerCase(); this.setFilter(k === 'b' ? 'bodies' : k === 'f' ? 'faces' : k === 'e' ? 'edges' : 'all'); }
         return;
       }
-      const map: Record<string, Tool> = { v: 'select', p: 'draw', l: 'line', r: 'rect', c: 'circle', g: 'polygon', o: 'slot', d: 'dimension', t: 'trim', x: 'erase' };
+      const map: Record<string, Tool> = { v: 'select', p: 'draw', l: 'line', r: 'rect', c: 'circle', g: 'polygon', o: 'slot', d: 'dimension', j: 'project', t: 'trim', x: 'erase' };
       const k = ev.key.toLowerCase();
       if (map[k]) this.setTool(map[k]);
       else if (ev.key === 'Escape') { if (this.tool !== 'select') this.setTool('select'); else { this.sel = emptySelection(); this.refreshAll(false); } }

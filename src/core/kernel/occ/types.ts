@@ -15,6 +15,8 @@ export interface FaceData {
   axisOrigin?: V3; axisDir?: V3; radius?: number;
   /** Centro geométrico aproximado (média dos vértices da malha). */
   center: V3;
+  /** Índices (em `BodyData.edges`) das arestas que contornam a face. */
+  edges?: number[];
 }
 
 export interface EdgeData {

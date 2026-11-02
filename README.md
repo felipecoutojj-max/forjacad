@@ -19,7 +19,7 @@ npm run dev
 
 Abre em `http://localhost:5173`. Para abrir no iPad na mesma rede, use o endereço de rede que o Vite imprime.
 
-## Como usar (v0.14, modelagem direta)
+## Como usar (v0.15, modelagem direta)
 
 - **Caneta na peça.** Risque numa face plana: abre um esboço nela, na própria vista 3D (botão "Vista reta"
   se preferir de frente). Arraste uma região sombreada do esboço: extruda ao vivo; para fora adiciona, para
@@ -57,6 +57,10 @@ Abre em `http://localhost:5173`. Para abrir no iPad na mesma rede, use o endere�
   ele some até os cruzamentos vizinhos (linha, círculo ou arco; spline e elipse cortam, mas ainda não se aparam).
   Arraste a caneta por cima de vários trechos para tirar todos de uma vez. Círculo cortado vira arco, linha
   cortada no meio vira duas, e a ponta nova fica presa na linha que a cortou. Sem cruzamento, some inteiro.
+- **Projetar arestas.** Botão "Projetar" (tecla J): passe a caneta por um corpo e a aresta ou a face sob ela
+  acende; toque e o contorno cai no plano do esboço como linha, círculo, arco ou spline (face inteira traz
+  todas as arestas de uma vez, inclusive furos). Cantos repetidos se fundem e nada entra duas vezes. Com
+  "Construção" ligada vira referência tracejada. Aresta de ponta para o plano não desenha nada.
 - **Esboço vivo.** Linhas colam em horizontal, vertical e ângulo reto automaticamente. A caneta encaixa em
   cantos, cruzamentos de linhas (o centro de um X de construção), meios de linha e na origem do plano, com um
   anel mostrando onde vai grudar; linhas de construção são tracejadas e a origem tem uma cruz. Toque numa
@@ -77,8 +81,8 @@ Abre em `http://localhost:5173`. Para abrir no iPad na mesma rede, use o endere�
 
 Esboço: linha, arco, oval e curva livre à mão livre (reconhecimento do traço), linha, retângulo, círculo, elipse,
 spline, polígono, rasgo, cotas, restrições automáticas (horizontal, vertical, ângulo reto, tangente, concêntrico),
-deslocar contorno, espelhar, filete 2D, aparar (toque ou varredura), construção. Faltam ainda: texto, projetar arestas,
-padrão no esboço e aparar spline ou elipse.
+deslocar contorno, espelhar, filete 2D, aparar (toque ou varredura), projetar arestas e faces de corpos, construção.
+Faltam ainda: texto, padrão no esboço, aparar spline ou elipse e projeção associativa (a projetada não acompanha o corpo).
 
 Sólidos: extrudar (novo, adicionar, cortar, por região, com padrão linear ou circular), puxar/empurrar face,
 revolução, varredura, loft, filete, chanfro (pelo sentido do arrasto), casca, espelho, mover/girar pelo gizmo
