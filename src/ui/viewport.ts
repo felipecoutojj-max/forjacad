@@ -369,6 +369,8 @@ export class Viewport {
     return typeof c.captureStream === 'function' ? c.captureStream(fps) : null;
   }
 
+  /** Ver através: todos os corpos translúcidos (null desliga). */
+  setXray(on: boolean): void { this.setTranslucent(on ? new Set(this.bodyMeshes.keys()) : new Set()); }
   /** Corpos (ids de cena) desenhados translúcidos: peças que se atravessam com a colisão desligada. */
   setTranslucent(ids: Set<Id>, colliding = false): void {
     this.translucent = ids;
@@ -579,8 +581,27 @@ export class Viewport {
     return { body, index, distance: h.distance, point: h.point };
   }
 
-  /** Aresta a menos de `tolPx` pixels do cursor, ignorando as escondidas atrás de faces. */
-  pickEdge(x: number, y: number, tolPx: number, faceHit: FaceHit | null): EdgeHit | null {
+  /** Todas as faces atravessadas pelo raio do cursor, da mais perto à mais longe (uma entrada por face). */
+  pickFacesThrough(x: number, y: number): FaceHit[] {
+    this.setRay(x, y);
+    const hits = this.raycaster.intersectObjects([...this.bodyMeshes.values()], false);
+    const out: FaceHit[] = []; const seen = new Set<string>();
+    for (const h of hits) {
+      const body = h.object.userData.bodyId as Id; const data = this.bodyData.get(body);
+      const index = data && h.faceIndex != null ? data.triFace[h.faceIndex] : -1; const k = `${body}:${index}`;
+      if (seen.has(k)) continue; seen.add(k); out.push({ body, index, distance: h.distance, point: h.point });
+    }
+    return out;
+  }
+  /** Todas as regiões de esboço atravessadas pelo raio, da mais perto à mais longe. */
+  pickRegionsThrough(x: number, y: number): RegionHit[] {
+    if (!this.regionMeshes.length) return [];
+    this.setRay(x, y);
+    return this.raycaster.intersectObjects(this.regionMeshes, false).map((h) => ({ sketch: h.object.userData.sketch as Id, index: h.object.userData.index as number, distance: h.distance, point: h.point }));
+  }
+
+  /** Aresta a menos de `tolPx` pixels do cursor, ignorando as escondidas atrás de faces (a não ser que `through`). */
+  pickEdge(x: number, y: number, tolPx: number, faceHit: FaceHit | null, through = false): EdgeHit | null {
     let best: EdgeHit | null = null; let bestPx = tolPx;
     const cam = this.camera; const camPos = new THREE.Vector3().setFromMatrixPosition(cam.matrixWorld);
     const a = new THREE.Vector3(), b = new THREE.Vector3(), q = new THREE.Vector3();
@@ -596,7 +617,7 @@ export class Viewport {
           const px = Math.hypot(sa.x + t * dx - x, sa.y + t * dy - y);
           if (px >= bestPx) continue;
           // Oclusão: ponto da aresta mais longe da câmera que a face tocada (com folga) fica escondido.
-          if (faceHit) { q.copy(a).lerp(b, t); const d = this.mode === 'sketch' ? 0 : q.distanceTo(camPos); if (d > faceHit.distance + Math.max(0.5, faceHit.distance * 0.004)) continue; }
+          if (faceHit && !through) { q.copy(a).lerp(b, t); const d = this.mode === 'sketch' ? 0 : q.distanceTo(camPos); if (d > faceHit.distance + Math.max(0.5, faceHit.distance * 0.004)) continue; }
           bestPx = px; best = { body, index: e.index, px };
         }
       }

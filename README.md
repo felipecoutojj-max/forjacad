@@ -19,7 +19,7 @@ npm run dev
 
 Abre em `http://localhost:5173`. Para abrir no iPad na mesma rede, use o endereço de rede que o Vite imprime.
 
-## Como usar (v0.11, modelagem direta)
+## Como usar (v0.12, modelagem direta)
 
 - **Caneta na peça.** Risque numa face plana: abre um esboço nela, na própria vista 3D (botão "Vista reta"
   se preferir de frente). Arraste uma região sombreada do esboço: extruda ao vivo; para fora adiciona, para
@@ -42,6 +42,9 @@ Abre em `http://localhost:5173`. Para abrir no iPad na mesma rede, use o endere�
   cheia). Vários corpos selecionados movem, giram, unem, somem e apagam juntos.
 - **Filtro de seleção.** Botão "Tudo" na paleta (ou Tab para alternar; A, B, F, E): tudo, só corpos, só faces ou
   só arestas. Com "Corpos", tocar numa face pega o corpo inteiro e cada toque soma mais um.
+- **Selecionar através.** O toque longo lista tudo o que a caneta atravessa, da frente para trás, com a
+  distância ("Face plana de Corpo 1 · 13 mm atrás"), inclusive arestas escondidas. O botão "Através" (tecla T)
+  deixa a peça translúcida: cada toque no mesmo ponto passa para a face de trás.
 - **Cotas.** Retângulo, círculo, rasgo e polígono já nascem cotados (largura e altura, diâmetro, distância
   entre centros). Toque numa cota, ou direto numa linha ou círculo, e digite o valor em mm: a geometria obedece.
   O botão "Construção" na paleta deixa tudo o que você riscar como linha de referência tracejada.
@@ -70,7 +73,7 @@ filete 2D, construção. Faltam ainda: spline, elipse, texto, aparar, projetar a
 
 Sólidos: extrudar (novo, adicionar, cortar, por região, com padrão linear ou circular), puxar/empurrar face,
 revolução, varredura, loft, filete, chanfro (pelo sentido do arrasto), casca, espelho, mover/girar pelo gizmo
-(e escalar por diálogo), dividir por plano, menu adaptativo à seleção, caixa de seleção com filtros, vários
+(e escalar por diálogo), dividir por plano, menu adaptativo à seleção, caixa de seleção com filtros, selecionar através, vários
 corpos de uma vez, itens com visibilidade e nomes, união,
 subtração, interseção, plano de construção deslocado, medir, vista em corte, importar STEP. Faltam: substituir
 face, ângulo de saída (draft), rosca, análise de superfície e materiais visuais.

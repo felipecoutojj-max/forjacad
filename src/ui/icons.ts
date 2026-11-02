@@ -51,6 +51,7 @@ export const icons = {
   split: w('<path d="M4 16l8 4 8-4V8l-8-4-8 4z"/><path d="M12 2v20" stroke-dasharray="3 2"/>'),
   pattern: w('<rect x="3" y="3" width="6" height="6" rx="1"/><rect x="15" y="3" width="6" height="6" rx="1"/><rect x="3" y="15" width="6" height="6" rx="1"/><rect x="15" y="15" width="6" height="6" rx="1"/>'),
   plane: w('<path d="M3 17l6-10h12l-6 10z"/><path d="M9 7v10M15 7v10" stroke-dasharray="1.5 2"/>'),
+  xray: w('<path d="M4 16l8 4 8-4V8l-8-4-8 4z"/><path d="M4 8l8 4 8-4M12 12v8" stroke-dasharray="2 2"/><path d="M4 16l8-4 8 4M12 4v8" stroke-dasharray="2 2" opacity="0.6"/>'),
   axis: w('<path d="M12 21V3"/><path d="M9 6l3-3 3 3"/><path d="M6 15c0 1.7 2.7 3 6 3s6-1.3 6-3-2.7-3-6-3-6 1.3-6 3z"/>'),
 };
 export type IconName = keyof typeof icons;

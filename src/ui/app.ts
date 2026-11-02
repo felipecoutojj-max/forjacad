@@ -55,7 +55,7 @@ const ICON_FAMILY: Partial<Record<IconName, 'sketch' | 'solid' | 'out' | 'view'>
   drawing: 'out', play: 'out', pause: 'out', record: 'out', collide: 'out', measure: 'out', section: 'out',
   polygon: 'sketch', slot: 'sketch', mirror: 'sketch', offset: 'sketch', body: 'solid',
   view: 'view', fit: 'view', touch: 'view', undo: 'view', redo: 'view', done: 'view', menu: 'view', trash: 'view', theme: 'view',
-  eye: 'view', eyeOff: 'view', items: 'view', more: 'view', rename: 'view', move: 'solid', rotate: 'solid', shell: 'solid', split: 'solid', pattern: 'solid', plane: 'sketch', axis: 'sketch',
+  eye: 'view', eyeOff: 'view', items: 'view', more: 'view', rename: 'view', move: 'solid', rotate: 'solid', shell: 'solid', split: 'solid', pattern: 'solid', plane: 'sketch', axis: 'sketch', xray: 'view',
 };
 
 const H_V_SNAP_DEG = 10;
@@ -117,6 +117,11 @@ export class App {
   private lastTap = { t: 0, x: 0, y: 0 };
   /** Filtro de seleção (toque e caixa): tudo, só corpos, só faces ou só arestas. Tab alterna; B, F, E escolhem. */
   selFilter: SelFilter = 'all';
+  /** Ver através: corpos translúcidos e toques repetidos no mesmo ponto vão passando para a face de trás. */
+  xray = false;
+  private cycle = { x: -1, y: -1, i: 0 };
+  /** Gizmo só aparece quando a pessoa pediu o corpo (duplo toque, Itens, caixa, botão Mover/Girar), não depois de cada feature. */
+  private gizmoWanted = false;
   private liveTimer = 0;
   private chipEl: HTMLElement | null = null; private chipTimer = 0;
   private polygonSides = 6;
@@ -321,7 +326,11 @@ export class App {
   /** Redesenha os corpos (sem recalcular): aplica ocultos e seleção. */
   private redrawBodies(): void {
     const doc = this.doc.current;
-    this.vp.setBodies(this.bodies.filter((b) => !isHidden(doc, b.id)).map(toRenderBody), this.sel3d); this.updateFaceHandle();
+    this.vp.setBodies(this.bodies.filter((b) => !isHidden(doc, b.id)).map(toRenderBody), this.sel3d); if (this.xray) this.vp.setXray(true); this.updateFaceHandle();
+  }
+  toggleXray(): void {
+    this.xray = !this.xray; this.vp.setXray(this.xray); this.vp.setSelection(this.sel3d); this.renderToolbar();
+    this.toast(this.xray ? 'Ver através: a peça fica translúcida e cada toque no mesmo ponto passa para a face de trás.' : 'Ver através desligado.');
   }
   private refreshSketch(): void {
     const s = this.sketch, p = this.plane;
@@ -584,6 +593,7 @@ export class App {
       return;
     }
     if ((f.type === 'extrude' || f.type === 'revolve') && this.mode === 'view') this.autoHideSketch(f.sketch);
+    if (f.type !== 'transform') { this.gizmoWanted = false; this.updateGizmo(); }
     onOk?.(f);
   }
 
@@ -654,6 +664,7 @@ export class App {
       const mb = this.iconButton('measure', 'Medir', () => this.toggleMeasure()); if (this.measure.on) mb.classList.add('active'); g2.append(mb);
       const sb = this.iconButton('section', 'Corte', () => this.toggleSection()); if (this.section.on) sb.classList.add('active'); g2.append(sb);
       g2.append(this.iconButton('drawing', 'Desenho', () => void this.drawingDialog()));
+      const xb = this.iconButton('xray', 'Através', () => this.toggleXray()); xb.title = 'Ver através (T): translúcido, toque cicla as faces de trás'; if (this.xray) xb.classList.add('active'); g2.append(xb);
       const fb = this.iconButton('select', FILTER_LABEL[this.selFilter], (ev) => this.menu(ev.clientX, ev.clientY, (['all', 'bodies', 'faces', 'edges'] as SelFilter[]).map((f) => ({ label: `Selecionar: ${FILTER_LABEL[f]}`, action: () => this.setFilter(f) })))); fb.title = 'Filtro de seleção (Tab alterna; B, F, E)'; if (this.selFilter !== 'all') fb.classList.add('active'); g2.append(fb);
       g2.append(this.iconButton('view', 'Vistas', (ev) => this.viewMenu(ev)));
       g2.append(this.iconButton('fit', 'Enquadrar', () => this.vp.fitAll()));
@@ -697,13 +708,13 @@ export class App {
       btn('body', 'Corpo', () => this.selectBody(bd.id));
     } else if (s3.body && bd && (s3.bodies?.length ?? 0) > 0) {
       const ids = this.selBodies(); who = `${ids.length} corpos`;
-      btn('move', 'Mover/Girar', () => this.transformSelected(), true);
+      btn('move', 'Mover/Girar', () => this.moveRotateAction(), true);
       btn('boolean', 'Unir todos', () => this.uniteBodies(ids));
       btn('eyeOff', 'Ocultar', () => this.hideBodies(ids));
       btn('trash', 'Apagar', () => this.deleteBodies(ids));
     } else if (s3.body && bd) {
       who = bodyName(doc, bd.id);
-      btn('move', 'Mover/Girar', () => this.transformSelected(), true);
+      btn('move', 'Mover/Girar', () => this.moveRotateAction(), true);
       btn('mirror', 'Espelhar', () => this.mirrorSelected());
       btn('shell', 'Casca', () => this.shellSelected());
       btn('split', 'Dividir', () => this.splitSelected());
@@ -727,9 +738,14 @@ export class App {
     });
   }
 
+  /** Botão Mover/Girar: primeiro mostra o gizmo; com o gizmo já na tela, abre os campos para digitar. */
+  private moveRotateAction(): void {
+    if (!this.gizmoWanted) { this.gizmoWanted = true; this.updateGizmo(); this.toast('Arraste uma seta para mover, um anel para girar. Toque de novo em Mover/Girar para digitar valores.'); }
+    else this.transformSelected();
+  }
   /** Seleciona um corpo inteiro: aparece o gizmo de mover e girar. */
   selectBody(id: Id): void {
-    this.selectedFeature = null; this.selRegion = null; this.vp.setRegionSelected(null);
+    this.selectedFeature = null; this.selRegion = null; this.vp.setRegionSelected(null); this.gizmoWanted = true;
     this.sel3d = { body: id, face: null, faces: [], edges: [] };
     this.vp.setSelection(this.sel3d); this.updateFaceHandle(); this.renderSidePanel(); this.renderToolbar();
   }
@@ -1067,7 +1083,7 @@ export class App {
   private deleteBody(body: Id): void {
     const f = this.doc.current.features.find((x) => x.id === body); if (f) this.deleteFeature(f);
   }
-  private clearSel3d(): void { this.sel3d = emptySel3D(); this.selRegion = null; this.vp.setRegionSelected(null); this.vp.setSelection(this.sel3d); this.updateFaceHandle(); this.renderSidePanel(); this.renderToolbar(); }
+  private clearSel3d(): void { this.gizmoWanted = false; this.sel3d = emptySel3D(); this.selRegion = null; this.vp.setRegionSelected(null); this.vp.setSelection(this.sel3d); this.updateFaceHandle(); this.renderSidePanel(); this.renderToolbar(); }
   /** Seta de puxar acompanha a face plana selecionada (modo peça). */
   private updateFaceHandle(): void {
     const f = this.sel3d.face; const fd = f && !this.isAssembly ? this.bodyOf(f.body)?.faces[f.index] : undefined;
@@ -1076,7 +1092,7 @@ export class App {
   }
   /** Gizmo de mover/girar aparece quando um corpo inteiro está selecionado (sem face nem aresta). */
   private updateGizmo(): void {
-    const bs = !this.sel3d.face && !this.sel3d.edges.length && this.mode === 'view' && !this.isAssembly ? this.selBodies().map((id) => this.bodyOf(id)).filter((b): b is BodyData => !!b) : [];
+    const bs = this.gizmoWanted && !this.sel3d.face && !this.sel3d.edges.length && this.mode === 'view' && !this.isAssembly ? this.selBodies().map((id) => this.bodyOf(id)).filter((b): b is BodyData => !!b) : [];
     if (!bs.length) { this.vp.setGizmo(null); return; }
     const mn: V3 = [Infinity, Infinity, Infinity], mx: V3 = [-Infinity, -Infinity, -Infinity];
     for (const b of bs) for (let i = 0; i < 3; i++) { mn[i] = Math.min(mn[i], b.bbox[0][i]); mx[i] = Math.max(mx[i], b.bbox[1][i]); }
@@ -1430,7 +1446,7 @@ export class App {
   private selBodies(): Id[] { const s = this.sel3d; return s.body ? [s.body, ...(s.bodies ?? []).filter((b) => b !== s.body)] : []; }
   selectBodies(ids: Id[]): void {
     if (!ids.length) return this.clearSel3d();
-    this.selectedFeature = null; this.selRegion = null; this.vp.setRegionSelected(null);
+    this.selectedFeature = null; this.selRegion = null; this.vp.setRegionSelected(null); this.gizmoWanted = true;
     this.sel3d = { body: ids[0], bodies: ids.slice(1), face: null, faces: [], edges: [] };
     this.vp.setSelection(this.sel3d); this.updateFaceHandle(); this.renderSidePanel(); this.renderToolbar();
     if (ids.length > 1) this.toast(`${ids.length} corpos selecionados: as setas movem todos juntos.`);
@@ -1707,11 +1723,23 @@ export class App {
       return;
     }
     // Duplo toque: numa face seleciona o corpo inteiro (gizmo); no vazio enquadra tudo.
-    const now = performance.now(); const dbl = now - this.lastTap.t < 380 && Math.hypot(info.x - this.lastTap.x, info.y - this.lastTap.y) < 28;
+    const now = performance.now(); const dbl = !this.xray && now - this.lastTap.t < 380 && Math.hypot(info.x - this.lastTap.x, info.y - this.lastTap.y) < 28;
     this.lastTap = { t: dbl ? 0 : now, x: info.x, y: info.y };
     if (dbl) { if (faceHit && faceHit.index >= 0) { this.selectBody(faceHit.body); this.toast('Corpo inteiro: arraste as setas para mover, os anéis para girar.'); } else if (!faceHit) this.vp.fitAll(); return; }
     const filter = this.selFilter;
-    const edgeHit = filter === 'faces' || filter === 'bodies' ? null : this.vp.pickEdge(info.x, info.y, info.type === 'touch' ? 18 : info.type === 'pen' ? 12 : 9, faceHit);
+    if (this.xray && filter !== 'edges') {
+      // Ver através: lista tudo o que o raio atravessa; toques repetidos no mesmo lugar avançam para o item de trás.
+      const through = this.vp.pickFacesThrough(info.x, info.y).filter((h) => h.index >= 0);
+      if (through.length) {
+        const same = Math.hypot(info.x - this.cycle.x, info.y - this.cycle.y) < 28;
+        const i = same ? (this.cycle.i + 1) % through.length : 0; this.cycle = { x: info.x, y: info.y, i };
+        const h = through[i];
+        if (filter === 'bodies') this.selectBody(h.body); else this.selectFace(h.body, h.index, false);
+        if (through.length > 1) this.toast(`${i + 1} de ${through.length} nesta linha: ${faceTypeName(this.bodyOf(h.body)?.faces[h.index]?.type ?? 'other')} de ${bodyName(this.doc.current, h.body)}. Toque de novo para a próxima.`);
+        return;
+      }
+    }
+    const edgeHit = filter === 'faces' || filter === 'bodies' ? null : this.vp.pickEdge(info.x, info.y, info.type === 'touch' ? 18 : info.type === 'pen' ? 12 : 9, faceHit, this.xray);
     if (edgeHit) { this.selectEdge(edgeHit.body, edgeHit.index); return; }
     let regionHit = this.vp.pickRegion(info.x, info.y); if (regionHit && faceHit && regionHit.distance > faceHit.distance + 0.5) regionHit = null;
     if (regionHit) { this.selectRegion(regionHit.sketch, regionHit.index); return; }
@@ -1744,17 +1772,21 @@ export class App {
   private selectThrough(x: number, y: number): boolean {
     const doc = this.doc.current; const faceHit = this.vp.pickFace(x, y);
     const items: { label: string; action: () => void }[] = [];
-    const edgeHit = this.vp.pickEdge(x, y, 14, faceHit);
-    if (edgeHit) items.push({ label: `Aresta de ${bodyName(doc, edgeHit.body)}`, action: () => this.selectEdge(edgeHit.body, edgeHit.index, false) });
-    if (faceHit && faceHit.index >= 0) {
-      const f = this.bodyOf(faceHit.body)?.faces[faceHit.index];
-      items.push({ label: `Face ${faceTypeName(f?.type ?? 'other')} de ${bodyName(doc, faceHit.body)}`, action: () => this.selectFace(faceHit.body, faceHit.index, false) }, { label: `${bodyName(doc, faceHit.body)} inteiro (mover/girar)`, action: () => this.selectBody(faceHit.body) });
-    }
-    const regionHit = this.vp.pickRegion(x, y);
-    if (regionHit) { const sk = getSketch(doc, regionHit.sketch); items.push({ label: `Região de ${sk.name}`, action: () => this.selectRegion(regionHit.sketch, regionHit.index) }, { label: `Editar ${sk.name}`, action: () => this.enterSketch(sk.id) }); }
+    const edgeVisible = this.vp.pickEdge(x, y, 14, faceHit); const edgeAny = this.vp.pickEdge(x, y, 14, faceHit, true);
+    if (edgeVisible) items.push({ label: `Aresta de ${bodyName(doc, edgeVisible.body)}`, action: () => this.selectEdge(edgeVisible.body, edgeVisible.index, false) });
+    if (edgeAny && (!edgeVisible || edgeAny.body !== edgeVisible.body || edgeAny.index !== edgeVisible.index)) items.push({ label: `Aresta escondida de ${bodyName(doc, edgeAny.body)}`, action: () => this.selectEdge(edgeAny.body, edgeAny.index, false) });
+    // Tudo o que o raio atravessa, da frente para trás: faces e, uma vez cada, o corpo inteiro.
+    const through = this.vp.pickFacesThrough(x, y).filter((h) => h.index >= 0).slice(0, 8); const bodiesSeen = new Set<Id>();
+    through.forEach((h, i) => {
+      const f = this.bodyOf(h.body)?.faces[h.index]; const depth = i === 0 ? '' : ` · ${fmtDim('distance', h.distance - through[0].distance)} mm atrás`;
+      items.push({ label: `Face ${faceTypeName(f?.type ?? 'other')} de ${bodyName(doc, h.body)}${depth}`, action: () => this.selectFace(h.body, h.index, false) });
+      if (!bodiesSeen.has(h.body)) { bodiesSeen.add(h.body); items.push({ label: `${bodyName(doc, h.body)} inteiro (mover/girar)`, action: () => this.selectBody(h.body) }); }
+    });
+    for (const rh of this.vp.pickRegionsThrough(x, y).slice(0, 4)) { const sk = getSketch(doc, rh.sketch); items.push({ label: `Região de ${sk.name}`, action: () => this.selectRegion(rh.sketch, rh.index) }, { label: `Editar ${sk.name}`, action: () => this.enterSketch(sk.id) }); }
     const plane = this.vp.pickPlane(x, y);
     if (plane) { const p = getPlane(doc, plane); items.push({ label: `Novo esboço em ${p.name}`, action: () => this.createSketchOn(plane) }); }
     if (!items.length) return false;
+    items.push({ label: this.xray ? 'Desligar Ver através' : 'Ver através (translúcido)', action: () => this.toggleXray() });
     this.menu(x + 10, y + 10, items); return true;
   }
 
@@ -2838,7 +2870,7 @@ export class App {
   private menu(x: number, y: number, items: { label: string; action: () => void }[]): void {
     this.closeMenus();
     const m = el('div', 'menu'); const r = this.overlay.getBoundingClientRect();
-    const lx = Math.min(Math.max(8, x - (x > r.width ? r.left : 0)), r.width - 230), ly = Math.min(Math.max(8, y - (y > r.height ? r.top : 0)), r.height - 60 - items.length * 40);
+    const lx = Math.min(Math.max(8, x - (x > r.width ? r.left : 0)), r.width - 230), ly = Math.max(8, Math.min(Math.max(8, y - (y > r.height ? r.top : 0)), r.height - 60 - items.length * 40));
     m.style.left = `${lx}px`; m.style.top = `${ly}px`;
     for (const it of items) { const b = document.createElement('button'); b.textContent = it.label; b.addEventListener('click', () => { this.closeMenus(); it.action(); }); m.append(b); }
     this.overlay.append(m); this.menus.push(m);
@@ -2883,6 +2915,7 @@ export class App {
         else if (ev.key.toLowerCase() === 'f' && this.sel3d.edges.length) this.filletSelected('fillet');
         else if (ev.key.toLowerCase() === 'h' && this.sel3d.body && !this.isAssembly) this.toggleHidden(this.sel3d.body);
         else if (ev.key === 'Tab' && !this.isAssembly) { ev.preventDefault(); this.cycleFilter(); }
+        else if (!meta && ev.key.toLowerCase() === 't' && !this.isAssembly) this.toggleXray();
         else if (!meta && !this.isAssembly && ['b', 'f', 'e', 'a'].includes(ev.key.toLowerCase())) { const k = ev.key.toLowerCase(); this.setFilter(k === 'b' ? 'bodies' : k === 'f' ? 'faces' : k === 'e' ? 'edges' : 'all'); }
         return;
       }
