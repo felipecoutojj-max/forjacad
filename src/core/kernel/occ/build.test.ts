@@ -329,4 +329,35 @@ describe('kernel OpenCASCADE', () => {
     const r = rebuildDocument(oc, doc);
     expect(r.bodies).toHaveLength(0); expect(r.errors[0].message).toMatch(/contorno/);
   });
+
+  it('extruda uma elipse inclinada: volume π·a·b·h e uma face lateral curva', () => {
+    const doc = createDocument(); const s = M.createSketch('plane-xy', 'el'); doc.sketches.push(s);
+    const c = M.addPoint(s, 10, 5); M.addEllipse(s, c.id, 30, 12, Math.PI / 6);
+    addExtrude(doc, s.id, 10);
+    const r = rebuildDocument(oc, doc);
+    expect(r.errors).toEqual([]); expect(r.bodies).toHaveLength(1);
+    const m = tessellate(oc, r.bodies[0], 'Corpo 1');
+    expect(m.volume).toBeCloseTo(Math.PI * 30 * 12 * 10, -2);
+    expect(m.faces.filter((f) => f.type === 'plane')).toHaveLength(2);
+  });
+
+  it('extruda uma spline fechada e um contorno linha + spline', () => {
+    const doc = createDocument(); const s = M.createSketch('plane-xy', 'sp'); doc.sketches.push(s);
+    // Laço fechado em forma de feijão pelos 6 pontos.
+    const ids = [[0, 0], [30, -8], [60, 0], [55, 25], [30, 18], [5, 25]].map(([x, y]) => M.addPoint(s, x, y).id);
+    M.addSpline(s, ids, true);
+    addExtrude(doc, s.id, 8);
+    // Segundo esboço: linha de base e spline aberta por cima, fechando com a linha.
+    const s2 = M.createSketch('plane-xy', 'sp2'); doc.sketches.push(s2);
+    const a = M.addPoint(s2, 100, 0), b = M.addPoint(s2, 160, 0); M.addLine(s2, a.id, b.id);
+    const mid = [[150, 20], [130, 32], [110, 20]].map(([x, y]) => M.addPoint(s2, x, y).id);
+    M.addSpline(s2, [b.id, ...mid, a.id], false);
+    addExtrude(doc, s2.id, 8);
+    const r = rebuildDocument(oc, doc);
+    expect(r.errors).toEqual([]); expect(r.bodies).toHaveLength(2);
+    const m1 = tessellate(oc, r.bodies[0], 'a'), m2 = tessellate(oc, r.bodies[1], 'b');
+    expect(m1.volume).toBeGreaterThan(8 * 800); expect(m1.volume).toBeLessThan(8 * 1500);
+    expect(m2.volume).toBeGreaterThan(8 * 900); expect(m2.volume).toBeLessThan(8 * 1800);
+    expect(m2.faces.filter((f) => f.type === 'plane').length).toBeGreaterThanOrEqual(3);
+  });
 });

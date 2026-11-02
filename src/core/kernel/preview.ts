@@ -4,7 +4,7 @@
 
 import * as THREE from 'three';
 import type { Sketch } from '../sketch/model';
-import { getPoint } from '../sketch/model';
+import { getPoint, sampleEntity } from '../sketch/model';
 import type { Plane, ExtrudeFeature, ForjaDocument } from '../document';
 import { planeNormal, getPlane, getSketch } from '../document';
 import { TAU } from '../geom';
@@ -15,13 +15,16 @@ export { extractProfiles, signedArea, profileContainsPoint, profileInnerPoint, t
 /** Converte um laço em THREE.Shape ou THREE.Path (coordenadas do plano). */
 function loopToPath<T extends THREE.Path>(s: Sketch, loop: Loop, target: T): T {
   if (loop.kind === 'circle') {
-    const e = loop.entity; if (e.type !== 'circle') return target; const c = getPoint(s, e.center);
-    target.absarc(c.x, c.y, e.r, 0, TAU, false); return target;
+    const e = loop.entity;
+    if (e.type === 'circle') { const c = getPoint(s, e.center); target.absarc(c.x, c.y, e.r, 0, TAU, false); return target; }
+    if (e.type === 'ellipse') { const c = getPoint(s, e.center); target.absellipse(c.x, c.y, e.rx, e.ry, 0, TAU, false, e.angle); return target; }
+    const pts = sampleEntity(s, e); target.moveTo(pts[0].x, pts[0].y); for (let i = 1; i < pts.length - 1; i++) target.lineTo(pts[i].x, pts[i].y); target.closePath(); return target;
   }
   const first = getPoint(s, loop.edges[0].from); target.moveTo(first.x, first.y);
   for (const ed of loop.edges) {
     const to = getPoint(s, ed.to);
     if (ed.entity.type === 'line') target.lineTo(to.x, to.y);
+    else if (ed.entity.type === 'spline') { const pts = sampleEntity(s, ed.entity); if (ed.reversed) pts.reverse(); for (let i = 1; i < pts.length; i++) target.lineTo(pts[i].x, pts[i].y); }
     else if (ed.entity.type === 'arc') {
       const a = ed.entity; const c = getPoint(s, a.center); const { a0, a1, sweep } = loopArcAngles(s, ed);
       target.absarc(c.x, c.y, a.r, a0, a1, sweep < 0);

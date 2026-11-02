@@ -29,7 +29,7 @@ import type { ProjectedView, AssemblyPayload, InterferenceHit } from '../core/ke
 import { saveLocal, loadLocal, downloadFile, pickFile, safeFileName } from './storage';
 import { type Vec2, v2, dist, distPointSegment, distPointArc, closestOnSegment, sub, add, scale, norm, perp, angleOf, normAngle, TAU, round, intersectSegments, intersectLineCircle, intersectCircles } from '../core/geom';
 
-type Tool = 'select' | 'draw' | 'line' | 'rect' | 'circle' | 'polygon' | 'slot' | 'dimension' | 'erase';
+type Tool = 'select' | 'draw' | 'line' | 'rect' | 'circle' | 'ellipse' | 'spline' | 'polygon' | 'slot' | 'dimension' | 'erase';
 interface FormField { key: string; label: string; type: 'number' | 'text' | 'select' | 'check'; value: unknown; options?: [string, string][]; step?: number; }
 
 interface PointerInfo { id: number; type: string; x: number; y: number; startX: number; startY: number; moved: boolean; role: 'tool' | 'nav' | 'pan'; button: number; shift?: boolean; /** Toque longo já consumiu este ponteiro. */ handled?: boolean; }
@@ -53,7 +53,7 @@ const ICON_FAMILY: Partial<Record<IconName, 'sketch' | 'solid' | 'out' | 'view'>
   sketch: 'sketch', draw: 'sketch', line: 'sketch', rect: 'sketch', circle: 'sketch', dimension: 'sketch', erase: 'sketch', select: 'sketch', construction: 'sketch',
   extrude: 'solid', revolve: 'solid', fillet: 'solid', chamfer: 'solid', face: 'solid', boolean: 'solid', cut: 'solid', joint: 'solid', plus: 'solid',
   drawing: 'out', play: 'out', pause: 'out', record: 'out', collide: 'out', measure: 'out', section: 'out',
-  polygon: 'sketch', slot: 'sketch', mirror: 'sketch', offset: 'sketch', body: 'solid',
+  polygon: 'sketch', slot: 'sketch', mirror: 'sketch', offset: 'sketch', body: 'solid', spline: 'sketch', ellipse: 'sketch',
   view: 'view', fit: 'view', touch: 'view', undo: 'view', redo: 'view', done: 'view', menu: 'view', trash: 'view', theme: 'view',
   eye: 'view', eyeOff: 'view', items: 'view', more: 'view', rename: 'view', move: 'solid', rotate: 'solid', shell: 'solid', split: 'solid', pattern: 'solid', plane: 'sketch', axis: 'sketch', xray: 'view',
 };
@@ -629,7 +629,7 @@ export class App {
     this.toolbar.innerHTML = ''; this.toolbar.append(this.toolbarGrip());
     const g1 = el('div', 'group'); const g2 = el('div', 'group'); const g3 = el('div', 'group');
     if (this.mode === 'sketch') {
-      const tools: [Tool, IconName, string][] = [['select', 'select', 'Selecionar'], ['draw', 'draw', 'Caneta'], ['line', 'line', 'Linha'], ['rect', 'rect', 'Retângulo'], ['circle', 'circle', 'Círculo'], ['polygon', 'polygon', 'Polígono'], ['slot', 'slot', 'Rasgo'], ['dimension', 'dimension', 'Cota'], ['erase', 'erase', 'Apagar']];
+      const tools: [Tool, IconName, string][] = [['select', 'select', 'Selecionar'], ['draw', 'draw', 'Caneta'], ['line', 'line', 'Linha'], ['rect', 'rect', 'Retângulo'], ['circle', 'circle', 'Círculo'], ['ellipse', 'ellipse', 'Elipse'], ['spline', 'spline', 'Spline'], ['polygon', 'polygon', 'Polígono'], ['slot', 'slot', 'Rasgo'], ['dimension', 'dimension', 'Cota'], ['erase', 'erase', 'Apagar']];
       for (const [t, ic, label] of tools) { const b = this.iconButton(ic, label, () => { if (t === 'polygon' && this.tool !== 'polygon') this.valuePopover(this.vp.width / 2, 80, this.polygonSides, 'lados', (v) => { this.polygonSides = Math.max(3, Math.min(24, Math.round(v))); this.setTool('polygon'); }); else this.setTool(t); }); if (this.tool === t) b.classList.add('active'); g1.append(b); }
       const cons = this.iconButton('construction', 'Construção', () => { this.constructionMode = !this.constructionMode; this.renderToolbar(); this.toast(this.constructionMode ? 'Construção ligada: o que você riscar vira linha de referência tracejada (serve para centralizar e encaixar).' : 'Construção desligada.'); }); if (this.constructionMode) cons.classList.add('active'); g1.append(cons);
       const touch = this.iconButton('touch', 'Dedo desenha', () => { this.touchDraws = !this.touchDraws; this.renderToolbar(); }); if (this.touchDraws) touch.classList.add('active'); g2.append(touch);
@@ -890,7 +890,9 @@ export class App {
       const s = this.sketch;
       p.append(h3(s.name));
       const hint = el('div', 'hint');
-      hint.textContent = this.tool === 'draw' ? 'Risque com a caneta: o traço vira linha, arco ou círculo. Um dedo arrasta, dois dedos aproximam.'
+      hint.textContent = this.tool === 'draw' ? 'Risque com a caneta: o traço vira linha, arco, círculo, elipse ou spline (curva livre). Um dedo arrasta, dois dedos aproximam.'
+        : this.tool === 'spline' ? 'Toque ponto a ponto; a curva passa por todos. Toque no primeiro ponto para fechar; trocar de ferramenta termina. Arraste os pontos depois para ajustar.'
+        : this.tool === 'ellipse' ? 'Arraste do centro: o arrasto dá o eixo maior e a inclinação. Toque na elipse para digitar os dois eixos.'
         : this.tool === 'dimension' ? (this.pendingDimRefs.length ? 'Toque no segundo elemento, ou em área vazia para cotar só este.' : 'Toque numa linha, círculo, arco ou ponto. Para ângulo, toque em duas linhas.')
         : this.tool === 'select' ? 'Toque para selecionar. Arraste pontos para ajustar. Selecione elementos para ver restrições possíveis.'
         : this.tool === 'erase' ? 'Toque no que quer apagar.' : 'Arraste para desenhar. Pontas próximas se juntam sozinhas.';
@@ -1157,13 +1159,14 @@ export class App {
     this.solve(); this.refreshAll(false); if (!persp) this.vp.fitAll();
   }
   exitSketch(removeEmpty: boolean): void {
+    this.finishSplineDraft();
     const s = this.sketch;
     if (s && removeEmpty && !s.entities.length) this.doc.current.sketches = this.doc.current.sketches.filter((x) => x.id !== s.id);
     pruneFacePlanes(this.doc.current);
     this.activeSketch = null; this.mode = 'view'; this.sel = emptySelection(); this.pendingDimRefs = []; this.lastSolve = null;
     this.vp.exitSketch(); this.refreshAll(); this.vp.fitAll();
   }
-  setTool(t: Tool): void { this.tool = t; this.pendingDimRefs = []; if (t !== 'select') this.sel = emptySelection(); this.refreshAll(false); }
+  setTool(t: Tool): void { if (this.splineDraft && t !== 'spline') this.finishSplineDraft(); this.tool = t; this.pendingDimRefs = []; if (t !== 'select') this.sel = emptySelection(); this.refreshAll(false); }
 
   private solve(opts?: SolveOptions): SolveResult | null {
     const s = this.sketch; if (!s) return null;
@@ -1185,11 +1188,49 @@ export class App {
   }
   private entityDistance(uv: Vec2, e: Entity, s: Sketch): number {
     if (e.type === 'line') return distPointSegment(uv, M.getPoint(s, e.a), M.getPoint(s, e.b));
+    if (e.type === 'spline' || e.type === 'ellipse') return this.polylineDistance(uv, M.sampleEntity(s, e)).d;
     const c = M.getPoint(s, e.center);
     if (e.type === 'circle') return Math.abs(dist(uv, c) - e.r);
     const { start, end } = M.arcAngles(s, e); return distPointArc(uv, c, e.r, start, end);
   }
 
+  /** Distância e ponto mais próximo numa polilinha. */
+  private polylineDistance(uv: Vec2, pts: Vec2[]): { d: number; q: Vec2 } {
+    let best = { d: Infinity, q: uv };
+    for (let i = 1; i < pts.length; i++) { const q = closestOnSegment(uv, pts[i - 1], pts[i]); const d = dist(uv, q); if (d < best.d) best = { d, q }; }
+    if (pts.length === 1) best = { d: dist(uv, pts[0]), q: pts[0] };
+    return best;
+  }
+  /** Spline toque a toque: cada toque põe um ponto; tocar no primeiro ponto fecha; trocar de ferramenta termina. */
+  private splineDraft: Id | null = null;
+  private addSplinePoint(s: Sketch, uv: Vec2, tol: number): void {
+    const draft = this.splineDraft ? s.entities.find((e): e is M.SplineEntity => e.type === 'spline' && e.id === this.splineDraft) : undefined;
+    if (draft && draft.points.length >= 3) {
+      const first = M.getPoint(s, draft.points[0]);
+      if (dist(uv, first) < tol * 1.6) { this.pushUndo(); draft.closed = true; this.splineDraft = null; this.solve(); this.refreshAll(false); this.toast('Spline fechada.'); return; }
+    }
+    this.pushUndo();
+    const pid = this.snapPoint(s, uv, tol, new Set(draft?.points ?? [])).id;
+    if (draft) { if (draft.points[draft.points.length - 1] !== pid) draft.points.push(pid); }
+    else { const e = M.addSpline(s, [pid]); if (this.constructionMode) e.construction = true; this.splineDraft = e.id; this.toast('Toque para pôr os próximos pontos; toque no primeiro ponto para fechar. Trocar de ferramenta termina.'); }
+    this.solve(); this.refreshAll(false);
+  }
+  /** Termina a spline em andamento (remove se ficou com um ponto só). */
+  private finishSplineDraft(): void {
+    const s = this.sketch; const id = this.splineDraft; this.splineDraft = null; if (!s || !id) return;
+    const e = s.entities.find((x) => x.id === id);
+    if (e && e.type === 'spline' && e.points.length < 2) M.removeEntities(s, [id]);
+  }
+  /** Campos da elipse: eixos maior e menor e inclinação. */
+  private ellipseDialog(e: M.EllipseEntity): void {
+    this.formDialog('Elipse', [
+      { key: 'a', label: 'Eixo maior (mm)', type: 'number', value: App.niceMm(e.rx * 2) }, { key: 'b', label: 'Eixo menor (mm)', type: 'number', value: App.niceMm(e.ry * 2) },
+      { key: 'ang', label: 'Inclinação (°)', type: 'number', value: Math.round((e.angle * 180) / Math.PI * 10) / 10 },
+    ], 'Aplicar', (v) => {
+      const a = v.a as number, b = v.b as number; if (!(a > 0) || !(b > 0)) return this.toast('Eixos têm que ser maiores que zero.', 'err');
+      this.pushUndo(); e.rx = a / 2; e.ry = b / 2; e.angle = ((v.ang as number) * Math.PI) / 180; this.solve(); this.refreshAll(false);
+    });
+  }
   /** Onde a caneta encaixa perto de `uv`: canto existente, origem do plano, cruzamento de linhas, meio de linha ou sobre uma entidade. */
   private findSnap(s: Sketch, uv: Vec2, tol: number, exclude: Set<Id> = new Set()): SnapHit | null {
     // 1) Cantos e pontos existentes têm preferência (tolerância maior).
@@ -1203,6 +1244,8 @@ export class App {
     let bestX: { uv: Vec2; a: Entity; b: Entity } | null = null; let bx = tol;
     for (let i = 0; i < ents.length; i++) for (let j = i + 1; j < ents.length; j++) {
       const a = ents[i], b = ents[j]; let cands: Vec2[] = [];
+      // Só linhas, círculos e arcos têm cruzamento calculado; elipses e splines ficam de fora.
+      if (!(a.type === 'line' || M.isRound(a)) || !(b.type === 'line' || M.isRound(b))) continue;
       if (a.type === 'line' && b.type === 'line') { const q = intersectSegments(P(a.a), P(a.b), P(b.a), P(b.b)); if (q) cands = [q]; }
       else if (a.type === 'line' || b.type === 'line') { const l = (a.type === 'line' ? a : b) as M.LineEntity, c = (a.type === 'line' ? b : a) as M.CircleEntity | M.ArcEntity; cands = intersectLineCircle(P(l.a), P(l.b), P(c.center), c.r).filter((q) => distPointSegment(q, P(l.a), P(l.b)) < 1e-6 && this.entityDistance(q, c, s) < 1e-6); }
       else { const c1 = a as M.CircleEntity | M.ArcEntity, c2 = b as M.CircleEntity | M.ArcEntity; cands = intersectCircles(P(c1.center), c1.r, P(c2.center), c2.r).filter((q) => this.entityDistance(q, c1, s) < 1e-6 && this.entityDistance(q, c2, s) < 1e-6); }
@@ -1218,8 +1261,10 @@ export class App {
     for (const e of ents) { const d = this.entityDistance(uv, e, s); if (d < be) { be = d; bestE = e; } }
     if (bestE) {
       const e = bestE; let q = uv;
-      if (e.type === 'line') q = closestOnSegment(uv, P(e.a), P(e.b)); else { const c = P(e.center); q = add(v2(c.x, c.y), scale(norm(sub(uv, c)), e.r)); }
-      return { uv: q, kind: 'entity', apply: () => { const p = M.addPoint(s, q.x, q.y); M.addConstraint(s, e.type === 'line' ? 'pointOnLine' : 'pointOnCircle', [p.id, e.id]); return p.id; } };
+      if (e.type === 'line') q = closestOnSegment(uv, P(e.a), P(e.b));
+      else if (M.isRound(e)) { const c = P(e.center); q = add(v2(c.x, c.y), scale(norm(sub(uv, c)), e.r)); }
+      else q = this.polylineDistance(uv, M.sampleEntity(s, e)).q;
+      return { uv: q, kind: 'entity', apply: () => { const p = M.addPoint(s, q.x, q.y); if (e.type === 'line' || M.isRound(e)) M.addConstraint(s, e.type === 'line' ? 'pointOnLine' : 'pointOnCircle', [p.id, e.id]); return p.id; } };
     }
     return null;
   }
@@ -1249,9 +1294,15 @@ export class App {
     };
     const created: Entity[] = [];
     for (const pr of prims) {
+      if (pr.type === 'ellipse') { const c = M.addPoint(s, pr.c.x, pr.c.y); created.push(M.addEllipse(s, c.id, pr.rx, pr.ry, pr.angle)); continue; }
+      if (pr.type === 'spline') {
+        const ids = pr.pts.map((p, i) => (!pr.closed && (i === 0 || i === pr.pts.length - 1)) ? pointFor(p) : M.addPoint(s, p.x, p.y).id);
+        const e = M.addSpline(s, ids.filter((id, i) => i === 0 || id !== ids[i - 1]), pr.closed); if (e.points.length >= 2) created.push(e); else M.removeEntities(s, [e.id]);
+        continue;
+      }
       if (pr.type === 'circle') {
         const c = M.addPoint(s, pr.c.x, pr.c.y);
-        const other = s.entities.find((e) => e.type !== 'line' && dist(M.getPoint(s, e.center), pr.c) < tol * 1.5);
+        const other = s.entities.find((e) => (M.isRound(e) || e.type === 'ellipse') && dist(M.getPoint(s, e.center), pr.c) < tol * 1.5);
         const e = M.addCircle(s, c.id, pr.r); created.push(e);
         if (other) autoCons.push(M.addConstraint(s, 'concentric', [e.id, other.id]).id);
         continue;
@@ -1805,12 +1856,13 @@ export class App {
           if (hit.kind === 'point') { this.dragPoint = hit.id; break; }
           const e = M.getEntity(s, hit.id);
           if (e.type === 'line') { const a = M.getPoint(s, e.a), b = M.getPoint(s, e.b); this.sketchDrag = { kind: 'line', id: e.id, a: e.a, b: e.b, a0: v2(a.x, a.y), b0: v2(b.x, b.y), start: uv }; }
-          else { const c = M.getPoint(s, e.center); if (Math.abs(dist(uv, c) - e.r) < tol && dist(uv, c) > tol) this.sketchDrag = { kind: 'radius', id: e.id, center: e.center }; else this.sketchDrag = { kind: 'move', points: M.entityPoints(e).map((pid) => { const q = M.getPoint(s, pid); return { id: pid, x0: q.x, y0: q.y }; }), start: uv }; }
+          else if (M.isRound(e) && Math.abs(dist(uv, M.getPoint(s, e.center)) - e.r) < tol && dist(uv, M.getPoint(s, e.center)) > tol) this.sketchDrag = { kind: 'radius', id: e.id, center: e.center };
+          else this.sketchDrag = { kind: 'move', points: M.entityPoints(e).map((pid) => { const q = M.getPoint(s, pid); return { id: pid, x0: q.x, y0: q.y }; }), start: uv };
           break;
         }
         this.stroke = [this.showSnap(s, uv, tol)]; this.sk.setStroke(this.plane, this.stroke); this.vp.requestRender(); break;
       }
-      case 'line': case 'rect': case 'circle': case 'polygon': case 'slot': {
+      case 'line': case 'rect': case 'circle': case 'ellipse': case 'polygon': case 'slot': {
         this.pushUndo(); this.previewSketchBackup = M.cloneSketch(s);
         this.toolStart = { uv: this.showSnap(s, uv, tol) }; break;
       }
@@ -1839,7 +1891,7 @@ export class App {
         if (this.stroke.length) { this.stroke.push(uv); this.sk.setStroke(this.plane, this.stroke); this.showSnap(s, uv, this.tolMm(info.type)); this.vp.requestRender(); }
         break;
       }
-      case 'line': case 'rect': case 'circle': case 'polygon': case 'slot': {
+      case 'line': case 'rect': case 'circle': case 'ellipse': case 'polygon': case 'slot': {
         if (!this.toolStart || !this.previewSketchBackup) return;
         Object.assign(s, M.cloneSketch(this.previewSketchBackup));
         const snapped = this.showSnap(s, uv, this.tolMm(info.type));
@@ -1883,12 +1935,21 @@ export class App {
         this.insertPrimitives(prims, tol);
         break;
       }
-      case 'line': case 'rect': case 'circle': case 'polygon': case 'slot': {
+      case 'line': case 'rect': case 'circle': case 'ellipse': case 'polygon': case 'slot': {
         if (!this.toolStart || !this.previewSketchBackup) return;
         Object.assign(s, M.cloneSketch(this.previewSketchBackup)); this.sk.setSnap(null, null, 1);
+        const before = s.entities.length;
         if (!cancelled && info.moved) { const end = this.findSnap(s, uv, tol); this.buildShape(s, this.toolStart.uv, end ? end.uv : uv, tol, false); this.solve(); }
         else this.undoStack.pop();
         this.toolStart = null; this.previewSketchBackup = null; this.refreshAll(false);
+        // Elipse recém-criada: o eixo menor pode ser digitado na hora.
+        const ell = s.entities.slice(before).find((e): e is M.EllipseEntity => e.type === 'ellipse');
+        if (ell) this.showChip(info.x, info.y, `menor ${fmtDim('distance', ell.ry * 2)} mm ✎`, () => this.ellipseDialog(ell));
+        break;
+      }
+      case 'spline': {
+        if (cancelled || info.moved) break;
+        this.addSplinePoint(s, uv, tol);
         break;
       }
       case 'select': {
@@ -1965,6 +2026,13 @@ export class App {
       const r = dist(a, b); if (r < tol * 0.5) return;
       const c = preview ? M.addPoint(s, a.x, a.y).id : this.snapPoint(s, a, tol).id;
       M.addCircle(s, c, r);
+    } else if (this.tool === 'ellipse') {
+      // Elipse do centro: o arrasto dá o semieixo maior e a inclinação; o menor nasce com 60% e se digita depois.
+      const rx = dist(a, b); if (rx < tol * 0.5) return;
+      const c = preview ? M.addPoint(s, a.x, a.y).id : this.snapPoint(s, a, tol).id;
+      let ang = angleOf(sub(b, a)); const deg = Math.abs(((ang * 180) / Math.PI) % 180); const dev = Math.min(deg, 180 - deg);
+      if (!preview && dev < H_V_SNAP_DEG) ang = ang > Math.PI / 2 || ang < -Math.PI / 2 ? Math.PI : 0; else if (!preview && Math.abs(dev - 90) < H_V_SNAP_DEG) ang = ang > 0 ? Math.PI / 2 : -Math.PI / 2;
+      M.addEllipse(s, c, rx, Math.max(tol, rx * 0.6), ang);
     } else if (this.tool === 'polygon') {
       // Polígono regular: vértices numa circunferência de construção, lados iguais.
       const r = dist(a, b); if (r < tol * 0.5) return; const n = this.polygonSides; const a0 = angleOf(sub(b, a));
@@ -2022,14 +2090,15 @@ export class App {
       const e = ents[0]; if (!e) return;
       if (e.type === 'line') { const a = M.getPoint(s, e.a), b = M.getPoint(s, e.b); const dx = Math.abs(b.x - a.x), dy = Math.abs(b.y - a.y); const isH = s.constraints.some((k) => k.kind === 'horizontal' && k.refs[0] === e.id), isV = s.constraints.some((k) => k.kind === 'vertical' && k.refs[0] === e.id); kind = isH ? 'hdistance' : isV ? 'vdistance' : 'distance'; value = kind === 'hdistance' ? dx : kind === 'vdistance' ? dy : dist(a, b); }
       else if (e.type === 'circle') { kind = 'diameter'; value = e.r * 2; }
-      else { kind = 'radius'; value = e.r; }
+      else if (e.type === 'arc') { kind = 'radius'; value = e.r; }
+      else { this.toast('Elipses e splines se editam pelos pontos e pelo toque na curva.'); this.sel = emptySelection(); this.refreshAll(false); return; }
     } else {
       const [e1, e2] = ents; const [p1, p2] = pts;
       if (p1 && p2) { kind = 'distance'; value = dist(p1, p2); }
       else if (e1?.type === 'line' && e2?.type === 'line') { const d1 = sub(M.getPoint(s, e1.b), M.getPoint(s, e1.a)), d2 = sub(M.getPoint(s, e2.b), M.getPoint(s, e2.a)); kind = 'angle'; value = Math.atan2(Math.abs(d1.x * d2.y - d1.y * d2.x), d1.x * d2.x + d1.y * d2.y) * 180 / Math.PI; }
       else if ((p1 && e2?.type === 'line') || (p2 && e1?.type === 'line')) { const p = p1 ?? p2!; const l = (e2?.type === 'line' ? e2 : e1) as M.LineEntity; finalRefs = [p.id, l.id]; kind = 'distance'; const a = M.getPoint(s, l.a), b = M.getPoint(s, l.b); const ab = sub(b, a); const L = Math.hypot(ab.x, ab.y) || 1; value = Math.abs(ab.x * (p.y - a.y) - ab.y * (p.x - a.x)) / L; }
-      else if ((p1 && e2 && e2.type !== 'line') || (p2 && e1 && e1.type !== 'line')) { const p = p1 ?? p2!; const c = (e2 && e2.type !== 'line' ? e2 : e1) as M.CircleEntity; finalRefs = [p.id, c.center]; kind = 'distance'; value = dist(p, M.getPoint(s, c.center)); }
-      else if (e1 && e2 && e1.type !== 'line' && e2.type !== 'line') { finalRefs = [e1.center, e2.center]; kind = 'distance'; value = dist(M.getPoint(s, e1.center), M.getPoint(s, e2.center)); }
+      else if ((p1 && M.isRound(e2)) || (p2 && M.isRound(e1))) { const p = p1 ?? p2!; const c = (M.isRound(e2) ? e2 : e1) as M.CircleEntity; finalRefs = [p.id, c.center]; kind = 'distance'; value = dist(p, M.getPoint(s, c.center)); }
+      else if (M.isRound(e1) && M.isRound(e2)) { finalRefs = [e1.center, e2.center]; kind = 'distance'; value = dist(M.getPoint(s, e1.center), M.getPoint(s, e2.center)); }
     }
     if (!kind) { this.toast('Combinação sem cota possível.'); this.sel = emptySelection(); this.refreshAll(false); return; }
     const k = kind; const v0 = round(value, 2);
@@ -2040,7 +2109,7 @@ export class App {
       if (k === 'distance' || k === 'hdistance' || k === 'vdistance') {
         const [a, b] = dimEndpoints(s, { kind: k, refs: finalRefs });
         if (a && b) { const dir = k === 'hdistance' ? v2(1, 0) : k === 'vdistance' ? v2(0, 1) : norm(sub(b, a)); const nrm = v2(-dir.y, dir.x); const mid = v2((a.x + b.x) / 2, (a.y + b.y) / 2); const off = (at.x - mid.x) * nrm.x + (at.y - mid.y) * nrm.y; offset = scale(nrm, Math.abs(off) < 2 ? 8 : off); }
-      } else if (k === 'radius' || k === 'diameter') { const e = M.findEntity(s, finalRefs[0]); if (e && e.type !== 'line') { const c = M.getPoint(s, e.center); offset = norm(sub(at, c)); } }
+      } else if (k === 'radius' || k === 'diameter') { const e = M.findEntity(s, finalRefs[0]); if (M.isRound(e)) { const c = M.getPoint(s, e.center); offset = norm(sub(at, c)); } }
       const d = M.addDimension(s, k, finalRefs, v, offset);
       const r = this.solve();
       if (!r?.converged) { M.removeDimension(s, d.id); this.solve(); this.toast('Essa cota conflita com as restrições existentes.', 'err'); }
@@ -2051,6 +2120,8 @@ export class App {
   /** Cota dinâmica: toque numa entidade abre direto o valor para digitar (edita a cota existente ou cria uma). */
   private quickDimension(e: Entity, at: Vec2): void {
     const s = this.sketch; if (!s) return;
+    if (e.type === 'ellipse') { this.ellipseDialog(e); return; }
+    if (e.type === 'spline') return;
     const existing = s.dimensions.find((d) => d.refs.length === 1 && d.refs[0] === e.id) ?? s.dimensions.find((d) => e.type === 'line' && d.refs.length === 2 && d.refs.includes(e.a) && d.refs.includes(e.b));
     if (existing) { this.editDimension(existing.id); return; }
     this.createDimension([e.id], at);
@@ -2534,6 +2605,8 @@ export class App {
       const e = M.findEntity(s, id); if (!e || e.id === lineId) continue;
       if (e.type === 'line') M.addLine(s, mp(e.a), mp(e.b));
       else if (e.type === 'circle') M.addCircle(s, mp(e.center), e.r);
+      else if (e.type === 'spline') M.addSpline(s, e.points.map(mp), e.closed);
+      else if (e.type === 'ellipse') M.addEllipse(s, mp(e.center), e.rx, e.ry, 2 * angleOf(d) - e.angle);
       else M.addArc(s, mp(e.center), mp(e.end), mp(e.start), e.r); // espelho inverte o sentido
     }
     this.sel = emptySelection(); this.solve(); this.refreshAll(false); this.toast('Espelhado.');

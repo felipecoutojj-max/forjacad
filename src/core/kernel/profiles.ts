@@ -2,7 +2,7 @@
 // Sem dependência de three.js: serve à prévia (malha) e ao kernel OpenCASCADE (worker).
 
 import type { Sketch, Entity, Id } from '../sketch/model';
-import { getPoint, arcAngles } from '../sketch/model';
+import { getPoint, arcAngles, sampleEntity, splineEndDir, isClosedEntity } from '../sketch/model';
 import { type Vec2, normAngle, TAU } from '../geom';
 
 /** Um lado de um laço: entidade percorrida de `from` para `to`. */
@@ -15,15 +15,16 @@ export function extractProfiles(s: Sketch): Profile[] {
   const ents = s.entities.filter((e) => !e.construction);
   const loops: { loop: Loop; poly: Vec2[]; area: number; neg?: boolean }[] = [];
 
-  for (const e of ents) if (e.type === 'circle') {
-    const c = getPoint(s, e.center); const poly = sampleCircle({ x: c.x, y: c.y }, e.r);
-    loops.push({ loop: { kind: 'circle', entity: e }, poly, area: Math.PI * e.r * e.r });
+  // Entidades fechadas sozinhas (círculo, elipse, spline fechada) são laços inteiros.
+  for (const e of ents) if (isClosedEntity(e)) {
+    const poly = sampleEntity(s, e); if (poly.length > 1 && dist2(poly[0], poly[poly.length - 1]) < 1e-12) poly.pop();
+    const area = Math.abs(signedArea(poly)); if (area > 1e-6) loops.push({ loop: { kind: 'circle', entity: e }, poly: signedArea(poly) < 0 ? poly.reverse() : poly, area });
   }
 
-  // Grafo planar das linhas e arcos.
-  const edges = ents.filter((e) => e.type !== 'circle');
+  // Grafo planar das linhas, arcos e splines abertas.
+  const edges = ents.filter((e) => !isClosedEntity(e));
   const adj = new Map<Id, { e: Entity; other: Id }[]>();
-  const endpoints = (e: Entity): [Id, Id] => e.type === 'line' ? [e.a, e.b] : e.type === 'arc' ? [e.start, e.end] : [e.center, e.center];
+  const endpoints = (e: Entity): [Id, Id] => e.type === 'line' ? [e.a, e.b] : e.type === 'arc' ? [e.start, e.end] : e.type === 'spline' ? [e.points[0], e.points[e.points.length - 1]] : [e.center, e.center];
   for (const e of edges) {
     const [a, b] = endpoints(e);
     if (!adj.has(a)) adj.set(a, []); if (!adj.has(b)) adj.set(b, []);
@@ -38,6 +39,7 @@ export function extractProfiles(s: Sketch): Profile[] {
       // Arco anti-horário de start até end: saindo de start, tangente = ang + 90°; saindo de end, ang - 90°.
       return e.start === from ? ang + Math.PI / 2 : ang - Math.PI / 2;
     }
+    if (e.type === 'spline') return splineEndDir(s, e, e.points[0] === from);
     return 0;
   };
   // Rastreio de faces: a partir de cada meia-aresta, no vértice de chegada escolhe a próxima aresta
@@ -67,7 +69,7 @@ export function extractProfiles(s: Sketch): Profile[] {
         const k = key(curE, curFrom);
         if (local.has(k)) break;
         local.add(k);
-        path.push({ entity: curE, from: curFrom, to: curTo, reversed: curE.type === 'line' ? curE.a !== curFrom : curE.type === 'arc' ? curE.start !== curFrom : false });
+        path.push({ entity: curE, from: curFrom, to: curTo, reversed: curE.type === 'line' ? curE.a !== curFrom : curE.type === 'arc' ? curE.start !== curFrom : curE.type === 'spline' ? curE.points[0] !== curFrom : false });
         const nx = nextHalfEdge(curE, curFrom, curTo);
         if (!nx) break;
         if (nx.e === e && curTo === from) { ok = true; break; }
@@ -118,9 +120,10 @@ export function loopArcAngles(s: Sketch, ed: LoopEdge): { a0: number; a1: number
 
 /** Polilinha amostrada de um laço (coordenadas do plano). */
 export function sampleLoop(s: Sketch, loop: Loop): Vec2[] {
-  if (loop.kind === 'circle') { const e = loop.entity; if (e.type !== 'circle') return []; const c = getPoint(s, e.center); return sampleCircle({ x: c.x, y: c.y }, e.r); }
+  if (loop.kind === 'circle') { const poly = sampleEntity(s, loop.entity); if (poly.length > 1 && dist2(poly[0], poly[poly.length - 1]) < 1e-12) poly.pop(); return poly; }
   return samplePath(s, loop.edges);
 }
+const dist2 = (a: Vec2, b: Vec2) => (a.x - b.x) ** 2 + (a.y - b.y) ** 2;
 /** O ponto (u, v) está dentro do perfil (no contorno e fora dos furos)? */
 export function profileContainsPoint(s: Sketch, prof: Profile, pt: Vec2): boolean {
   if (!pointInPoly(pt, sampleLoop(s, prof.outer))) return false;
@@ -137,10 +140,6 @@ export function profileInnerPoint(s: Sketch, prof: Profile): Vec2 {
   return { x: cx, y: cy };
 }
 
-function sampleCircle(c: Vec2, r: number, n = 64): Vec2[] {
-  const out: Vec2[] = []; for (let i = 0; i < n; i++) { const t = (i / n) * TAU; out.push({ x: c.x + r * Math.cos(t), y: c.y + r * Math.sin(t) }); } return out;
-}
-
 function samplePath(s: Sketch, path: LoopEdge[]): Vec2[] {
   const out: Vec2[] = [];
   for (const ed of path) {
@@ -150,6 +149,9 @@ function samplePath(s: Sketch, path: LoopEdge[]): Vec2[] {
       const a = ed.entity; const c = getPoint(s, a.center); const { a0, sweep } = loopArcAngles(s, ed);
       const n = Math.max(4, Math.ceil(Math.abs(sweep) / (TAU / 48)));
       for (let i = 0; i < n; i++) { const t = a0 + (sweep * i) / n; out.push({ x: c.x + a.r * Math.cos(t), y: c.y + a.r * Math.sin(t) }); }
+    } else if (ed.entity.type === 'spline') {
+      const pts = sampleEntity(s, ed.entity); if (ed.reversed) pts.reverse();
+      for (let i = 0; i < pts.length - 1; i++) out.push(pts[i]);
     }
   }
   return out;

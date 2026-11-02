@@ -40,4 +40,15 @@ describe('reconhecedor', () => {
     const pr = recognizeStroke(jitter(pts, 0.3), { tol: 1 });
     expect(pr.map((p) => p.type)).toEqual(['line', 'arc', 'line']);
   });
+
+  it('oval sem cantos vira elipse; onda sem cantos vira spline', () => {
+    const oval: Vec2[] = []; for (let i = 0; i <= 80; i++) { const t = (i / 80) * Math.PI * 2; oval.push({ x: 40 * Math.cos(t), y: 18 * Math.sin(t) }); }
+    const pe = recognizeStroke(oval, { tol: 1 });
+    expect(pe).toHaveLength(1); expect(pe[0].type).toBe('ellipse');
+    if (pe[0].type === 'ellipse') { expect(pe[0].rx).toBeCloseTo(40, 0); expect(pe[0].ry).toBeCloseTo(18, 0); }
+    const wave: Vec2[] = []; for (let i = 0; i <= 120; i++) { const x = i; wave.push({ x, y: 15 * Math.sin((x / 120) * Math.PI * 3) }); }
+    const ps = recognizeStroke(wave, { tol: 1 });
+    expect(ps).toHaveLength(1); expect(ps[0].type).toBe('spline');
+    if (ps[0].type === 'spline') { expect(ps[0].closed).toBe(false); expect(ps[0].pts.length).toBeGreaterThanOrEqual(4); }
+  });
 });

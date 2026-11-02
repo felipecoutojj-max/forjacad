@@ -2,11 +2,11 @@
 // esboço → faces, prisma, booleanas, filete/chanfro, malha com ids de face e polilinhas de aresta, STEP.
 // Não importa three.js nem DOM: roda no worker e nos testes em Node.
 
-import type { OpenCascadeInstance, TopoDS_Shape, TopoDS_Face, TopoDS_Edge, TopoDS_Wire, BRepAdaptor_Curve, gp_Trsf } from 'opencascade.js';
+import type { OpenCascadeInstance, TopoDS_Shape, TopoDS_Face, TopoDS_Edge, TopoDS_Wire, BRepAdaptor_Curve, gp_Trsf, GeomAbs_Shape } from 'opencascade.js';
 import type { ForjaDocument, FilletFeature, EdgeRef, FaceRef, V3, Plane, SketchAxis, PatternSpec, ExtrudeOp } from '../../document';
 import { getSketch, getPlane, planeNormal, planeToWorld } from '../../document';
-import type { Sketch, Id } from '../../sketch/model';
-import { getPoint, findEntity } from '../../sketch/model';
+import type { Sketch, Id, SplineEntity, EllipseEntity } from '../../sketch/model';
+import { getPoint, findEntity, sampleEntity } from '../../sketch/model';
 import { extractProfiles, loopArcAngles, profileContainsPoint, type Loop, type Profile } from '../profiles';
 import type { BodyData, FaceData, EdgeData, FeatureError, FaceType, ViewSpec, ProjectedView, ProjCircle, InterferenceHit, SketchEntity2D } from './types';
 
@@ -31,20 +31,45 @@ export function errorMessage(oc: OC, e: unknown): string {
 
 function pnt(oc: OC, p: V3) { return new oc.gp_Pnt_3(p[0], p[1], p[2]); }
 
+/** Aresta B-spline passando pelos pontos (aproximação com tolerância mínima; fechada repete o primeiro ponto). */
+function splineEdge(oc: OC, pts: V3[], closed: boolean): TopoDS_Edge {
+  const list = closed ? [...pts, pts[0]] : pts;
+  const arr = new oc.TColgp_Array1OfPnt_2(1, list.length);
+  list.forEach((p, i) => arr.SetValue(i + 1, pnt(oc, p)));
+  const fit = new oc.GeomAPI_PointsToBSpline_2(arr, 3, 8, oc.GeomAbs_Shape.GeomAbs_C2 as GeomAbs_Shape, 1e-4);
+  if (!fit.IsDone()) throw new Error('spline degenerada');
+  return new oc.BRepBuilderAPI_MakeEdge_24(new oc.Handle_Geom_Curve_2(fit.Curve().get())).Edge();
+}
+/** Aresta de elipse no plano (semieixo maior ao longo de `angle`; troca eixos se `ry` > `rx`). */
+function ellipseEdge(oc: OC, s: Sketch, plane: Plane, e: EllipseEntity): TopoDS_Edge {
+  const c = getPoint(s, e.center); const n = planeNormal(plane);
+  const swap = e.ry > e.rx; const ang = e.angle + (swap ? Math.PI / 2 : 0); const major = swap ? e.ry : e.rx, minor = swap ? e.rx : e.ry;
+  const xd = planeToWorld(plane, Math.cos(ang), Math.sin(ang)); const o = planeToWorld(plane, 0, 0); const vx: V3 = [xd[0] - o[0], xd[1] - o[1], xd[2] - o[2]];
+  const ax = new oc.gp_Ax2_2(pnt(oc, planeToWorld(plane, c.x, c.y)), new oc.gp_Dir_4(n[0], n[1], n[2]), new oc.gp_Dir_4(vx[0], vx[1], vx[2]));
+  return new oc.BRepBuilderAPI_MakeEdge_12(new oc.gp_Elips_2(ax, major, Math.max(1e-6, minor))).Edge();
+}
+function splinePoints(s: Sketch, plane: Plane, e: SplineEntity): V3[] { return e.points.map((id) => { const p = getPoint(s, id); return planeToWorld(plane, p.x, p.y); }); }
+
 function loopToWire(oc: OC, s: Sketch, plane: Plane, loop: Loop): TopoDS_Wire {
   const mk = new oc.BRepBuilderAPI_MakeWire_1();
   if (loop.kind === 'circle') {
-    const e = loop.entity; if (e.type !== 'circle') throw new Error('laço inválido');
-    const c = getPoint(s, e.center); const n = planeNormal(plane);
-    const ax = new oc.gp_Ax2_3(pnt(oc, planeToWorld(plane, c.x, c.y)), new oc.gp_Dir_4(n[0], n[1], n[2]));
-    const circ = new oc.gp_Circ_2(ax, e.r);
-    mk.Add_1(new oc.BRepBuilderAPI_MakeEdge_8(circ).Edge());
+    const e = loop.entity;
+    if (e.type === 'circle') {
+      const c = getPoint(s, e.center); const n = planeNormal(plane);
+      const ax = new oc.gp_Ax2_3(pnt(oc, planeToWorld(plane, c.x, c.y)), new oc.gp_Dir_4(n[0], n[1], n[2]));
+      mk.Add_1(new oc.BRepBuilderAPI_MakeEdge_8(new oc.gp_Circ_2(ax, e.r)).Edge());
+    } else if (e.type === 'ellipse') mk.Add_1(ellipseEdge(oc, s, plane, e));
+    else if (e.type === 'spline') mk.Add_1(splineEdge(oc, splinePoints(s, plane, e), true));
+    else throw new Error('laço inválido');
   } else {
     for (const ed of loop.edges) {
       const a = getPoint(s, ed.from), b = getPoint(s, ed.to);
       const A = pnt(oc, planeToWorld(plane, a.x, a.y)), B = pnt(oc, planeToWorld(plane, b.x, b.y));
       if (ed.entity.type === 'line') {
         mk.Add_1(new oc.BRepBuilderAPI_MakeEdge_3(A, B).Edge());
+      } else if (ed.entity.type === 'spline') {
+        const pts = splinePoints(s, plane, ed.entity); if (ed.reversed) pts.reverse();
+        mk.Add_1(splineEdge(oc, pts, false));
       } else if (ed.entity.type === 'arc') {
         const arc = ed.entity; const c = getPoint(s, arc.center); const { a0, sweep } = loopArcAngles(s, ed);
         const tm = a0 + sweep / 2;
@@ -138,7 +163,8 @@ function profileCrossesAxis(sk: Sketch, p: [number, number], d: [number, number]
   for (const e of sk.entities) {
     if (e.construction) continue;
     if (e.type === 'line') { const a = getPoint(sk, e.a), b = getPoint(sk, e.b); test(a.x, a.y); test(b.x, b.y); }
-    else { const c = getPoint(sk, e.center); const px = -d[1], py = d[0]; test(c.x + px * e.r, c.y + py * e.r); test(c.x - px * e.r, c.y - py * e.r); if (e.type === 'arc') { const s = getPoint(sk, e.start), en = getPoint(sk, e.end); test(s.x, s.y); test(en.x, en.y); } }
+    else if (e.type === 'circle' || e.type === 'arc') { const c = getPoint(sk, e.center); const px = -d[1], py = d[0]; test(c.x + px * e.r, c.y + py * e.r); test(c.x - px * e.r, c.y - py * e.r); if (e.type === 'arc') { const s = getPoint(sk, e.start), en = getPoint(sk, e.end); test(s.x, s.y); test(en.x, en.y); } }
+    else for (const q of sampleEntity(sk, e)) test(q.x, q.y);
   }
   return pos && neg;
 }
@@ -645,6 +671,7 @@ export function sketchWire(oc: OC, doc: ForjaDocument, sketchIds: Id | Id[]): To
       const arc = new oc.GC_MakeArcOfCircle_4(pnt(oc, planeToWorld(plane, a.x, a.y)), M, pnt(oc, planeToWorld(plane, b.x, b.y)));
       mk.Add_1(new oc.BRepBuilderAPI_MakeEdge_24(new oc.Handle_Geom_Curve_2(arc.Value().get())).Edge()); n++;
     }
+    else if (e.type === 'spline') { mk.Add_1(splineEdge(oc, splinePoints(s, plane, e), !!e.closed)); n++; }
   }
   }
   if (!n) throw new Error('o caminho não tem linhas nem arcos');

@@ -2,10 +2,10 @@
 
 import * as THREE from 'three';
 import type { Sketch, Entity, Id } from '../core/sketch/model';
-import { getPoint, arcAngles, findEntity, findPoint } from '../core/sketch/model';
+import { getPoint, findEntity, findPoint, sampleEntity, isRound } from '../core/sketch/model';
 import type { Plane } from '../core/document';
 import { planeToWorld } from '../core/document';
-import { normAngle, TAU, type Vec2, dist, v2, sub, norm, perp, add, scale } from '../core/geom';
+import { TAU, type Vec2, dist, v2, sub, norm, perp, add, scale } from '../core/geom';
 
 export interface Selection { points: Set<Id>; entities: Set<Id>; dimensions: Set<Id>; }
 export const emptySelection = (): Selection => ({ points: new Set(), entities: new Set(), dimensions: new Set() });
@@ -42,15 +42,7 @@ export class SketchRenderer {
   constructor() { this.group.add(this.lines, this.constr, this.dims, this.points, this.stroke, this.snap); this.group.renderOrder = 10; this.snap.visible = false; this.snap.renderOrder = 12; }
 
   /** Pontos 3D de uma entidade (polilinha), em coordenadas do plano. */
-  static sample(s: Sketch, e: Entity, segs = 48): Vec2[] {
-    if (e.type === 'line') { const a = getPoint(s, e.a), b = getPoint(s, e.b); return [v2(a.x, a.y), v2(b.x, b.y)]; }
-    const c = getPoint(s, e.center); const out: Vec2[] = [];
-    if (e.type === 'circle') { for (let i = 0; i <= segs; i++) { const t = (i / segs) * TAU; out.push(v2(c.x + e.r * Math.cos(t), c.y + e.r * Math.sin(t))); } return out; }
-    const { start, end } = arcAngles(s, e); let sweep = normAngle(end - start); if (sweep === 0) sweep = TAU;
-    const n = Math.max(6, Math.ceil((sweep / TAU) * segs));
-    for (let i = 0; i <= n; i++) { const t = start + (sweep * i) / n; out.push(v2(c.x + e.r * Math.cos(t), c.y + e.r * Math.sin(t))); }
-    return out;
-  }
+  static sample(s: Sketch, e: Entity, segs = 48): Vec2[] { return sampleEntity(s, e, segs).map((p) => v2(p.x, p.y)); }
 
   update(s: Sketch, plane: Plane, sel: Selection, active: boolean, mmPerPx: number): void {
     // O esboço ativo fica sempre visível, mesmo sobre a face de um corpo (sem teste de profundidade).
@@ -88,7 +80,7 @@ export class SketchRenderer {
         const txt = fmtDim(d.kind, d.value);
         const selected = sel.dimensions.has(d.id);
         if (d.kind === 'radius' || d.kind === 'diameter') {
-          const e = findEntity(s, d.refs[0]); if (!e || e.type === 'line') continue;
+          const e = findEntity(s, d.refs[0]); if (!isRound(e)) continue;
           const c = getPoint(s, e.center); const dirv = norm(d.offset.x || d.offset.y ? d.offset : v2(1, 1));
           const on = add(v2(c.x, c.y), scale(dirv, e.r)); const out = add(on, scale(dirv, Math.max(arrow * 2, 6)));
           if (d.kind === 'diameter') dline(add(v2(c.x, c.y), scale(dirv, -e.r)), out); else dline(v2(c.x, c.y), out);

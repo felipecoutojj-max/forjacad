@@ -19,7 +19,7 @@ npm run dev
 
 Abre em `http://localhost:5173`. Para abrir no iPad na mesma rede, use o endereço de rede que o Vite imprime.
 
-## Como usar (v0.12, modelagem direta)
+## Como usar (v0.13, modelagem direta)
 
 - **Caneta na peça.** Risque numa face plana: abre um esboço nela, na própria vista 3D (botão "Vista reta"
   se preferir de frente). Arraste uma região sombreada do esboço: extruda ao vivo; para fora adiciona, para
@@ -49,6 +49,10 @@ Abre em `http://localhost:5173`. Para abrir no iPad na mesma rede, use o endere�
   entre centros). Toque numa cota, ou direto numa linha ou círculo, e digite o valor em mm: a geometria obedece.
   O botão "Construção" na paleta deixa tudo o que você riscar como linha de referência tracejada.
 - **Paleta.** A barra de ferramentas fica no topo, na horizontal; arraste pela alça para a lateral se preferir vertical.
+- **Elipse e spline.** "Elipse": arraste do centro (o arrasto dá o eixo maior e a inclinação; toque na elipse para
+  digitar os dois eixos). "Spline": toque ponto a ponto, a curva passa por todos; toque no primeiro ponto para
+  fechar; arraste os pontos depois para ajustar. Na Caneta, um oval à mão livre vira elipse e uma curva ondulada
+  sem cantos vira spline. Os dois extrudam, revolucionam e servem de caminho (spline) como qualquer contorno.
 - **Esboço vivo.** Linhas colam em horizontal, vertical e ângulo reto automaticamente. A caneta encaixa em
   cantos, cruzamentos de linhas (o centro de um X de construção), meios de linha e na origem do plano, com um
   anel mostrando onde vai grudar; linhas de construção são tracejadas e a origem tem uma cruz. Toque numa
@@ -67,9 +71,9 @@ Abre em `http://localhost:5173`. Para abrir no iPad na mesma rede, use o endere�
 
 ## Ferramentas, comparadas ao Shapr3D
 
-Esboço: linha e arco à mão livre (reconhecimento do traço), linha, retângulo, círculo, polígono, rasgo, cotas,
-restrições automáticas (horizontal, vertical, ângulo reto, tangente, concêntrico), deslocar contorno, espelhar,
-filete 2D, construção. Faltam ainda: spline, elipse, texto, aparar, projetar arestas e padrão no esboço.
+Esboço: linha, arco, oval e curva livre à mão livre (reconhecimento do traço), linha, retângulo, círculo, elipse,
+spline, polígono, rasgo, cotas, restrições automáticas (horizontal, vertical, ângulo reto, tangente, concêntrico),
+deslocar contorno, espelhar, filete 2D, construção. Faltam ainda: texto, aparar, projetar arestas e padrão no esboço.
 
 Sólidos: extrudar (novo, adicionar, cortar, por região, com padrão linear ou circular), puxar/empurrar face,
 revolução, varredura, loft, filete, chanfro (pelo sentido do arrasto), casca, espelho, mover/girar pelo gizmo

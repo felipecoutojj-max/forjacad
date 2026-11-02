@@ -315,7 +315,7 @@ export function addExtrude(doc: ForjaDocument, sketch: Id, depth: number, opts: 
   const op = opts.op ?? 'new';
   const n = doc.features.filter((f) => f.type === 'extrude' && f.op === op).length + 1;
   const base = op === 'cut' ? 'Corte' : op === 'add' ? 'Adição' : 'Extrusão';
-  const f: ExtrudeFeature = { id: newId('f'), type: 'extrude', name: `${base} ${n}${opts.onFaces?.length ? ` em ${opts.onFaces.length + 1} faces` : ''}`, sketch, depth: Math.abs(depth), op, target: op === 'new' ? undefined : opts.target, symmetric: !!opts.symmetric, flip: !!opts.flip, throughAll: !!opts.throughAll, onFaces: opts.onFaces?.length ? opts.onFaces : undefined, visible: true };
+  const f: ExtrudeFeature = { id: newId('f'), type: 'extrude', name: `${base} ${n}${opts.onFaces?.length ? ` em ${opts.onFaces.length + 1} faces` : ''}`, sketch, depth: Math.abs(depth), op, target: op === 'new' ? undefined : opts.target, symmetric: !!opts.symmetric, flip: !!opts.flip, throughAll: !!opts.throughAll, profilePoint: opts.profilePoint, pattern: opts.pattern, onFaces: opts.onFaces?.length ? opts.onFaces : undefined, visible: true };
   doc.features.push(f); return f;
 }
 

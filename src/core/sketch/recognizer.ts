@@ -6,7 +6,44 @@ import { type Vec2, dist, fitCircle, fitLine, resample, polylineLength, sub, ang
 export type Primitive =
   | { type: 'line'; a: Vec2; b: Vec2 }
   | { type: 'arc'; c: Vec2; r: number; a: Vec2; b: Vec2; ccw: boolean } // a→b na ordem do traço; ccw diz o sentido
-  | { type: 'circle'; c: Vec2; r: number };
+  | { type: 'circle'; c: Vec2; r: number }
+  | { type: 'ellipse'; c: Vec2; rx: number; ry: number; angle: number }
+  | { type: 'spline'; pts: Vec2[]; closed: boolean }; // curva livre, sem cantos vivos
+const SHARP = (55 * Math.PI) / 180;
+/** Quantos cantos vivos o traço simplificado tem. */
+function sharpCorners(pts: Vec2[], tol: number): number {
+  const idx = simplify(pts, tol * 0.9); let n = 0;
+  for (let k = 1; k < idx.length - 1; k++) { const a = pts[idx[k - 1]], b = pts[idx[k]], c = pts[idx[k + 1]]; const u = sub(b, a), w = sub(c, b); if (Math.abs(Math.atan2(cross(u, w), dot(u, w))) > SHARP) n++; }
+  return n;
+}
+/** Ajuste de elipse por eixos principais (PCA): centro, direção e semieixos pelos extremos; erro radial normalizado. */
+export function fitEllipse(pts: Vec2[]): { c: Vec2; rx: number; ry: number; angle: number; rms: number; maxErr: number } | null {
+  const n = pts.length; if (n < 8) return null;
+  let mx = 0, my = 0; for (const p of pts) { mx += p.x; my += p.y; } mx /= n; my /= n;
+  let sxx = 0, syy = 0, sxy = 0; for (const p of pts) { const u = p.x - mx, v = p.y - my; sxx += u * u; syy += v * v; sxy += u * v; }
+  const angle = 0.5 * Math.atan2(2 * sxy, sxx - syy); const ca = Math.cos(angle), sa = Math.sin(angle);
+  let rx = 0, ry = 0; const uv: Vec2[] = [];
+  for (const p of pts) { const u = (p.x - mx) * ca + (p.y - my) * sa, v = -(p.x - mx) * sa + (p.y - my) * ca; uv.push(v2(u, v)); rx = Math.max(rx, Math.abs(u)); ry = Math.max(ry, Math.abs(v)); }
+  if (rx < 1e-9 || ry < 1e-9) return null;
+  let se = 0, maxErr = 0; for (const q of uv) { const d = (Math.hypot(q.x / rx, q.y / ry) - 1) * Math.min(rx, ry); se += d * d; maxErr = Math.max(maxErr, Math.abs(d)); }
+  return { c: v2(mx, my), rx, ry, angle, rms: Math.sqrt(se / n), maxErr };
+}
+/** O traço vira para os dois lados (S, onda, rim): sinais de giro opostos entre os vértices marcantes, sem cantos vivos. */
+function turnFlips(pts: Vec2[], tol: number): boolean {
+  const idx = simplify(pts, tol * 0.9); let pos = 0, neg = 0;
+  for (let k = 1; k < idx.length - 1; k++) {
+    const a = pts[idx[k - 1]], b = pts[idx[k]], c = pts[idx[k + 1]]; const u = sub(b, a), w = sub(c, b);
+    const t = Math.atan2(cross(u, w), dot(u, w)); if (t > 0.2) pos++; else if (t < -0.2) neg++;
+  }
+  return pos > 0 && neg > 0;
+}
+/** Spline pelos pontos marcantes do traço (Douglas–Peucker com tolerância folgada). */
+function splineOf(pts: Vec2[], tol: number, closed: boolean): Primitive {
+  const idx = simplify(pts, tol * 1.6); let keep = idx.map((i) => pts[i]);
+  if (closed) keep = keep.slice(0, -1);
+  if (keep.length < 3) { const n = Math.max(3, Math.min(12, Math.round(pts.length / 6))); keep = []; for (let i = 0; i < n; i++) keep.push(pts[Math.round((i / (n - (closed ? 0 : 1))) * (pts.length - 1))]); }
+  return { type: 'spline', pts: keep, closed };
+}
 
 export interface RecognizeOptions {
   /** Tolerância de ajuste em mm (algo como 3 a 6 pixels convertidos). */
@@ -29,9 +66,15 @@ export function recognizeStroke(raw: Vec2[], opts: RecognizeOptions): Primitive[
   if (closed) {
     const fc = fitCircle(rs);
     if (fc && fc.rms < tol && fc.r > minR && isRoundish(rs, fc.c, fc.r)) return [{ type: 'circle', c: fc.c, r: fc.r }];
-    // Polígono fechado: fecha a polilinha e segmenta.
     const loop = rs.slice(); loop[loop.length - 1] = loop[0];
+    // Polígono fechado: fecha a polilinha e segmenta.
     const segs = segmentize(loop, tol, minR, true);
+    if (sharpCorners(loop, tol) === 0) {
+      // Oval sem cantos: elipse se o traço cabe justo nela (um rasgo arredondado não cabe); rim ou feijão vira spline fechada.
+      const fe = fitEllipse(rs);
+      if (fe && fe.maxErr < tol * 0.5 && fe.rms < tol * 0.3 && Math.min(fe.rx, fe.ry) > minR) return [{ type: 'ellipse', c: fe.c, rx: fe.rx, ry: fe.ry, angle: fe.angle }];
+      if (turnFlips(loop, tol)) return [splineOf(loop, tol, true)];
+    }
     return chain(segs, true);
   }
 
@@ -39,6 +82,8 @@ export function recognizeStroke(raw: Vec2[], opts: RecognizeOptions): Primitive[
   const single = fitSingle(rs, tol, minR);
   if (single) return [single];
   const segs = segmentize(rs, tol, minR, false);
+  // Curva ondulada sem cantos vivos: spline em vez de uma fila de arcos e linhas.
+  if (sharpCorners(rs, tol) === 0 && turnFlips(rs, tol)) return [splineOf(rs, tol, false)];
   return chain(segs, false);
 }
 
@@ -173,10 +218,10 @@ function dropStubs(out: Primitive[], tol: number, closed: boolean): void {
     const prev = out[(i - 1 + out.length) % out.length], next = out[(i + 1) % out.length];
     const hasPrev = closed || i > 0, hasNext = closed || i < out.length - 1;
     if (hasPrev && hasNext && prev !== next) {
-      const j = v2((p.a.x + p.b.x) / 2, (p.a.y + p.b.y) / 2);
-      if (prev.type !== 'circle') prev.b = j; if (next.type !== 'circle') next.a = j;
-    } else if (hasPrev && prev.type !== 'circle') prev.b = p.b;
-    else if (hasNext && next.type !== 'circle') next.a = p.a;
+      const j = v2((startOf(p).x + endOf(p).x) / 2, (startOf(p).y + endOf(p).y) / 2);
+      setEnd(prev, j); setStart(next, j);
+    } else if (hasPrev) setEnd(prev, endOf(p));
+    else if (hasNext) setStart(next, startOf(p));
     out.splice(i, 1);
   }
 }
@@ -199,7 +244,7 @@ function mergeEnds(out: Primitive[], _pts: Vec2[], tol: number, _minR: number): 
 
 /** Garante que o fim de cada primitiva coincide com o início da seguinte (e fecha o laço, se for o caso). */
 function chain(prims: Primitive[], closed: boolean): Primitive[] {
-  const out = prims.filter((p) => p.type === 'circle' || dist(startOf(p), endOf(p)) > 1e-9);
+  const out = prims.filter((p) => isWhole(p) || dist(startOf(p), endOf(p)) > 1e-9);
   for (let i = 1; i < out.length; i++) {
     const prev = out[i - 1], cur = out[i];
     const joint = midpoint(endOf(prev), startOf(cur));
@@ -215,8 +260,10 @@ function chain(prims: Primitive[], closed: boolean): Primitive[] {
 
 const midpoint = (a: Vec2, b: Vec2) => v2((a.x + b.x) / 2, (a.y + b.y) / 2);
 
+/** Primitiva fechada em si (círculo, elipse, spline fechada): não encadeia com vizinhas. */
+function isWhole(p: Primitive): boolean { return p.type === 'circle' || p.type === 'ellipse' || (p.type === 'spline' && p.closed); }
 /** Ponto onde a primitiva começa, na ordem do traço. */
-export function startOf(p: Primitive): Vec2 { return p.type === 'circle' ? p.c : p.a; }
-export function endOf(p: Primitive): Vec2 { return p.type === 'circle' ? p.c : p.b; }
-function setStart(p: Primitive, q: Vec2) { if (p.type !== 'circle') p.a = q; }
-function setEnd(p: Primitive, q: Vec2) { if (p.type !== 'circle') p.b = q; }
+export function startOf(p: Primitive): Vec2 { return p.type === 'circle' || p.type === 'ellipse' ? p.c : p.type === 'spline' ? p.pts[0] : p.a; }
+export function endOf(p: Primitive): Vec2 { return p.type === 'circle' || p.type === 'ellipse' ? p.c : p.type === 'spline' ? p.pts[p.pts.length - 1] : p.b; }
+function setStart(p: Primitive, q: Vec2) { if (p.type === 'spline') p.pts[0] = q; else if (p.type === 'line' || p.type === 'arc') p.a = q; }
+function setEnd(p: Primitive, q: Vec2) { if (p.type === 'spline') p.pts[p.pts.length - 1] = q; else if (p.type === 'line' || p.type === 'arc') p.b = q; }
