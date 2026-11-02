@@ -19,7 +19,7 @@ npm run dev
 
 Abre em `http://localhost:5173`. Para abrir no iPad na mesma rede, use o endereço de rede que o Vite imprime.
 
-## Como usar (v0.15, modelagem direta)
+## Como usar (v0.16, modelagem direta)
 
 - **Caneta na peça.** Risque numa face plana: abre um esboço nela, na própria vista 3D (botão "Vista reta"
   se preferir de frente). Arraste uma região sombreada do esboço: extruda ao vivo; para fora adiciona, para
@@ -61,6 +61,10 @@ Abre em `http://localhost:5173`. Para abrir no iPad na mesma rede, use o endere�
   acende; toque e o contorno cai no plano do esboço como linha, círculo, arco ou spline (face inteira traz
   todas as arestas de uma vez, inclusive furos). Cantos repetidos se fundem e nada entra duas vezes. Com
   "Construção" ligada vira referência tracejada. Aresta de ponta para o plano não desenha nada.
+- **Substituir face.** Toque numa face plana, depois em "Substituir" na barra de ações, depois na face de destino
+  (plana ou cilíndrica, deste corpo ou de outro). A face passa a ficar rente ao destino: as faces vizinhas
+  esticam ou encurtam, só dentro da coluna da face (um degrau some, um topo fica inclinado ou abaulado).
+  Esc ou toque no vazio cancela.
 - **Esboço vivo.** Linhas colam em horizontal, vertical e ângulo reto automaticamente. A caneta encaixa em
   cantos, cruzamentos de linhas (o centro de um X de construção), meios de linha e na origem do plano, com um
   anel mostrando onde vai grudar; linhas de construção são tracejadas e a origem tem uma cruz. Toque numa
@@ -88,8 +92,8 @@ Sólidos: extrudar (novo, adicionar, cortar, por região, com padrão linear ou 
 revolução, varredura, loft, filete, chanfro (pelo sentido do arrasto), casca, espelho, mover/girar pelo gizmo
 (e escalar por diálogo), dividir por plano, menu adaptativo à seleção, caixa de seleção com filtros, selecionar através, vários
 corpos de uma vez, itens com visibilidade e nomes, união,
-subtração, interseção, plano de construção deslocado, medir, vista em corte, importar STEP. Faltam: substituir
-face, ângulo de saída (draft), rosca, análise de superfície e materiais visuais.
+subtração, interseção, substituir face (rente a plano ou cilindro), plano de construção deslocado, medir, vista em corte,
+importar STEP. Faltam: ângulo de saída (draft), rosca, análise de superfície e materiais visuais.
 
 Montagem: peças embutidas, juntas por faces (rígida, pino, deslizante, cilíndrica), lista de materiais,
 animação pelas juntas, vídeo, interferências. Desenho: vistas com ocultas, cotas, balões, lista, PDF e DXF.

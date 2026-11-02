@@ -75,6 +75,10 @@ export interface MirrorFeature { id: Id; type: 'mirror'; name: string; body: Id;
 export interface TransformFeature { id: Id; type: 'transform'; name: string; body: Id; translate: V3; axisPoint: V3; axisDir: V3; angle: number; scale: number; }
 /** Divide um corpo por um plano. 'both' mantém os dois (o segundo vira corpo com o id da feature). */
 export interface SplitFeature { id: Id; type: 'split'; name: string; body: Id; origin: V3; normal: V3; keep: 'both' | 'front' | 'back'; }
+/** Superfície de destino do Substituir face: plano (normal para fora) ou cilindro (`inside`: o material fica dentro dele, como num ressalto). */
+export type ReplaceTarget = { kind: 'plane'; origin: V3; normal: V3 } | { kind: 'cylinder'; origin: V3; dir: V3; radius: number; inside: boolean };
+/** Substituir face: a face plana passa a ficar rente à superfície de destino; as faces vizinhas esticam ou encurtam (só dentro da coluna da face). */
+export interface ReplaceFaceFeature { id: Id; type: 'replaceFace'; name: string; body: Id; face: FaceRef; with: ReplaceTarget; }
 /** Varredura: perfil fechado de um esboço ao longo de um caminho (linhas e arcos de um ou mais esboços emendados).
  *  Com `tube`, o perfil é gerado: círculo de diâmetro `outer` (e furo `inner`, se > 0) no começo do caminho. */
 export interface SweepFeature { id: Id; type: 'sweep'; name: string; profile: Id; path: Id; paths?: Id[]; tube?: { outer: number; inner: number }; op: ExtrudeOp; target?: Id; }
@@ -99,7 +103,7 @@ export interface BooleanFeature {
   body: Id; tool: Id;
 }
 
-export type Feature = ExtrudeFeature | RevolveFeature | PushPullFeature | FilletFeature | BooleanFeature | ShellFeature | MirrorFeature | TransformFeature | SplitFeature | SweepFeature | LoftFeature | ImportFeature;
+export type Feature = ExtrudeFeature | RevolveFeature | PushPullFeature | FilletFeature | BooleanFeature | ShellFeature | MirrorFeature | TransformFeature | SplitFeature | ReplaceFaceFeature | SweepFeature | LoftFeature | ImportFeature;
 
 export interface ForjaDocument {
   format: 'forja'; version: number; name: string; units: 'mm';
@@ -192,6 +196,10 @@ function fromObject(d: Record<string, unknown> & { [k: string]: any }, depth: nu
       features.push({ id: f.id, type: 'transform', name: str(f.name, 'Mover'), body: f.body, translate: isV3(f.translate) ? f.translate : [0, 0, 0], axisPoint: isV3(f.axisPoint) ? f.axisPoint : [0, 0, 0], axisDir: isV3(f.axisDir) ? f.axisDir : [0, 0, 1], angle: num(f.angle, 0), scale: num(f.scale, 1) || 1 });
     } else if (f.type === 'split' && typeof f.body === 'string' && isV3(f.origin) && isV3(f.normal)) {
       features.push({ id: f.id, type: 'split', name: str(f.name, 'Dividir'), body: f.body, origin: f.origin, normal: f.normal, keep: f.keep === 'front' || f.keep === 'back' ? f.keep : 'both' });
+    } else if (f.type === 'replaceFace' && typeof f.body === 'string') {
+      const face = faceRef(f.face); const w = f.with as Partial<ReplaceTarget & { dir: V3; radius: number; inside: boolean }> | undefined;
+      const target: ReplaceTarget | null = !w || !isV3(w.origin) ? null : w.kind === 'plane' && isV3(w.normal) ? { kind: 'plane', origin: w.origin, normal: w.normal } : w.kind === 'cylinder' && isV3(w.dir) && typeof w.radius === 'number' && w.radius > 0 ? { kind: 'cylinder', origin: w.origin, dir: w.dir, radius: w.radius, inside: w.inside !== false } : null;
+      if (face && target) features.push({ id: f.id, type: 'replaceFace', name: str(f.name, 'Substituir face'), body: f.body, face, with: target });
     } else if (f.type === 'sweep' && typeof f.profile === 'string' && typeof f.path === 'string') {
       const op = opOf(f); const paths = Array.isArray(f.paths) ? (f.paths as unknown[]).filter((x): x is string => typeof x === 'string') : undefined;
       const tb = f.tube as { outer?: unknown; inner?: unknown } | undefined; const tube = tb && typeof tb.outer === 'number' && tb.outer > 0 ? { outer: tb.outer, inner: Math.max(0, num(tb.inner, 0)) } : undefined;
@@ -354,6 +362,10 @@ export function addImport(doc: ForjaDocument, name: string, step: string): Impor
   const f: ImportFeature = { id: newId('f'), type: 'import', name: name.slice(0, 80) || 'Importado', step }; doc.features.push(f); return f;
 }
 
+export function addReplaceFace(doc: ForjaDocument, body: Id, face: FaceRef, target: ReplaceTarget): ReplaceFaceFeature {
+  const n = doc.features.filter((f) => f.type === 'replaceFace').length + 1;
+  const f: ReplaceFaceFeature = { id: newId('f'), type: 'replaceFace', name: `Substituir face ${n}`, body, face, with: target }; doc.features.push(f); return f;
+}
 export function addPushPull(doc: ForjaDocument, body: Id, face: FaceRef, distance: number, more: FaceRef[] = []): PushPullFeature {
   const n = doc.features.filter((f) => f.type === 'pushpull').length + 1;
   const f: PushPullFeature = { id: newId('f'), type: 'pushpull', name: `${distance >= 0 ? 'Puxar' : 'Empurrar'} ${more.length ? `${more.length + 1} faces` : 'face'} ${n}`, body, face, faces: more.length ? more : undefined, distance };

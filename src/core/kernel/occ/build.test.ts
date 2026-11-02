@@ -3,7 +3,7 @@ import { describe, it, expect, beforeAll } from 'vitest';
 import initOpenCascade from 'opencascade.js/dist/node.js';
 import type { OpenCascadeInstance } from 'opencascade.js';
 import { rebuildDocument, tessellate, exportSTEP, exportIGES, projectViews, assemblyShapes, interferences, offsetProfile, tubeAlongPath, sketchWire } from './build';
-import { createDocument, addExtrude, addRevolve, addFillet, addBoolean, addPushPull, addShell, addMirror, addTransform, addSplit, addSweep, addLoft, addImport, addFacePlane, type ForjaDocument } from '../../document';
+import { createDocument, addExtrude, addRevolve, addFillet, addBoolean, addPushPull, addShell, addMirror, addTransform, addSplit, addSweep, addLoft, addImport, addFacePlane, addReplaceFace, type ForjaDocument } from '../../document';
 import * as M from '../../sketch/model';
 
 let oc: OpenCascadeInstance;
@@ -28,6 +28,29 @@ function slotSketch(doc: ForjaDocument, plane: string): M.Sketch {
   M.addLine(s, a.id, b.id); M.addArc(s, c1.id, c.id, b.id, 10); M.addLine(s, c.id, d.id); M.addArc(s, c2.id, a.id, d.id, 10);
   return s;
 }
+
+describe('substituir face', () => {
+  const top = { center: [20, 10, 10] as [number, number, number], normal: [0, 0, 1] as [number, number, number], area: 800 };
+  const block = () => { const doc = createDocument(); const s = rectSketch(doc, 'plane-xy', 0, 0, 40, 20); const f = addExtrude(doc, s.id, 10); return { doc, body: f.id }; };
+  it('plano paralelo acima estica o bloco; abaixo encurta', () => {
+    const a = block(); addReplaceFace(a.doc, a.body, top, { kind: 'plane', origin: [0, 0, 16], normal: [0, 0, 1] });
+    const ra = rebuildDocument(oc, a.doc); expect(ra.errors).toEqual([]); expect(tessellate(oc, ra.bodies[0], 'a').volume).toBeCloseTo(40 * 20 * 16, 0);
+    const b = block(); addReplaceFace(b.doc, b.body, top, { kind: 'plane', origin: [0, 0, 6], normal: [0, 0, 1] });
+    const rb = rebuildDocument(oc, b.doc); expect(rb.errors).toEqual([]); expect(tessellate(oc, rb.bodies[0], 'b').volume).toBeCloseTo(40 * 20 * 6, 0);
+  });
+  it('plano inclinado pelo centro da face mantém o volume e dá um topo inclinado', () => {
+    const a = block(); const t = Math.atan2(2, 40); addReplaceFace(a.doc, a.body, top, { kind: 'plane', origin: [20, 10, 10], normal: [Math.sin(t), 0, Math.cos(t)] });
+    const r = rebuildDocument(oc, a.doc); expect(r.errors).toEqual([]); const m = tessellate(oc, r.bodies[0], 'a');
+    expect(m.volume).toBeCloseTo(8000, 0); expect(m.faces).toHaveLength(6);
+    const topFace = m.faces.find((f) => f.type === 'plane' && f.normal![2] > 0.9 && f.normal![0] > 0.01); expect(topFace).toBeDefined();
+  });
+  it('cilindro como destino deixa o topo abaulado', () => {
+    const a = block(); addReplaceFace(a.doc, a.body, top, { kind: 'cylinder', origin: [20, 0, 0], dir: [0, 1, 0], radius: 14, inside: true });
+    const r = rebuildDocument(oc, a.doc); expect(r.errors).toEqual([]); const m = tessellate(oc, r.bodies[0], 'a');
+    expect(m.faces.some((f) => f.type === 'cylinder')).toBe(true);
+    expect(m.volume).toBeGreaterThan(5000); expect(m.volume).toBeLessThan(40 * 20 * 14);
+  });
+});
 
 describe('kernel OpenCASCADE', () => {
   it('extruda um retângulo em um bloco de 100×60×20', () => {

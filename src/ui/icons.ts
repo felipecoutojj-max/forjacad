@@ -8,6 +8,7 @@ export const icons = {
   circle: w('<circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="0.8"/>'),
   dimension: w('<path d="M4 16h16M4 12v8M20 12v8M8 16l-3 0M16 16l3 0"/><path d="M9 7h6" stroke-dasharray="1 2"/>'),
   project: w('<path d="M3 19h18"/><path d="M8 5h8l3 5H5z"/><path d="M7 10v9M17 10v9" stroke-dasharray="2 2"/>'),
+  replace: w('<path d="M4 6h7v12H4z"/><path d="M20 4v16" stroke-dasharray="2 2"/><path d="M11 12h6m-2-2.5 2.5 2.5-2.5 2.5"/>'),
   trim: w('<circle cx="6" cy="6" r="2.5"/><circle cx="6" cy="18" r="2.5"/><path d="M8.2 7.5L20 16M8.2 16.5L20 8"/>'),
   erase: w('<path d="M4 15l8-8 8 8-4 4H8z"/><path d="M8 19h12"/>'),
   undo: w('<path d="M8 7H4v4"/><path d="M4 11a8 8 0 1 1 3 6"/>'),

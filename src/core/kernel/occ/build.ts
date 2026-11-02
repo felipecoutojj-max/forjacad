@@ -3,7 +3,7 @@
 // Não importa three.js nem DOM: roda no worker e nos testes em Node.
 
 import type { OpenCascadeInstance, TopoDS_Shape, TopoDS_Face, TopoDS_Edge, TopoDS_Wire, BRepAdaptor_Curve, gp_Trsf, GeomAbs_Shape } from 'opencascade.js';
-import type { ForjaDocument, FilletFeature, EdgeRef, FaceRef, V3, Plane, SketchAxis, PatternSpec, ExtrudeOp } from '../../document';
+import type { ForjaDocument, FilletFeature, EdgeRef, FaceRef, ReplaceTarget, V3, Plane, SketchAxis, PatternSpec, ExtrudeOp } from '../../document';
 import { getSketch, getPlane, planeNormal, planeToWorld } from '../../document';
 import type { Sketch, Id, SplineEntity, EllipseEntity } from '../../sketch/model';
 import { getPoint, findEntity, sampleEntity } from '../../sketch/model';
@@ -292,6 +292,37 @@ export function pushPull(oc: OC, shape: TopoDS_Shape, ref: FaceRef, distance: nu
   return boolOp(oc, d > 0 ? 'fuse' : 'cut', shape, prism);
 }
 
+/** Substituir face: a face plana `ref` passa a ficar rente ao destino. Só a coluna da face muda:
+ *  tira o que está além do destino (prisma para dentro) e acrescenta até ele (prisma para fora). */
+export function replaceFace(oc: OC, shape: TopoDS_Shape, ref: FaceRef, target: ReplaceTarget): TopoDS_Shape {
+  const f = matchFace(planarFaces(oc, shape), ref); if (!f) throw new Error('face não encontrada (a geometria mudou)');
+  const [lo, hi] = bbox(oc, shape); const L = dist3(lo, hi) * 2 + dist3(f.center, target.origin) + 10;
+  const n = f.normal;
+  const prismOut = new oc.BRepPrimAPI_MakePrism_1(f.face, new oc.gp_Vec_4(n[0] * L, n[1] * L, n[2] * L), false, true).Shape();
+  const prismIn = new oc.BRepPrimAPI_MakePrism_1(f.face, new oc.gp_Vec_4(-n[0] * L, -n[1] * L, -n[2] * L), false, true).Shape();
+  let keep: TopoDS_Shape; let inside = true;
+  if (target.kind === 'plane') {
+    const tn = norm3(target.normal);
+    const pln = new oc.gp_Pln_3(pnt(oc, target.origin), new oc.gp_Dir_4(tn[0], tn[1], tn[2]));
+    const face = new oc.BRepBuilderAPI_MakeFace_9(pln, -L, L, -L, L).Face();
+    keep = new oc.BRepPrimAPI_MakeHalfSpace_1(face, pnt(oc, [target.origin[0] - tn[0] * 10, target.origin[1] - tn[1] * 10, target.origin[2] - tn[2] * 10])).Solid();
+  } else {
+    const d = norm3(target.dir); const o = target.origin;
+    const ax = new oc.gp_Ax2_3(pnt(oc, [o[0] - d[0] * L, o[1] - d[1] * L, o[2] - d[2] * L]), new oc.gp_Dir_4(d[0], d[1], d[2]));
+    keep = new oc.BRepPrimAPI_MakeCylinder_3(ax, target.radius, 2 * L).Shape(); inside = target.inside;
+  }
+  const safe = (kind: 'fuse' | 'cut' | 'common', a: TopoDS_Shape, b: TopoDS_Shape): TopoDS_Shape | null => { try { const r = boolOp(oc, kind, a, b); return hasSolid(oc, r) ? r : null; } catch { return null; } };
+  const removed = safe(inside ? 'cut' : 'common', prismIn, keep);
+  const added = safe(inside ? 'common' : 'cut', prismOut, keep);
+  let out = shape;
+  if (removed) { const r = safe('cut', out, removed); if (!r) throw new Error('o destino tiraria o corpo inteiro'); out = r; }
+  if (added) { const r = safe('fuse', out, added); if (r) out = r; }
+  if (out === shape) return out;
+  // Faces vizinhas que ficaram partidas no antigo nível da face voltam a ser uma só.
+  try { const u = new oc.ShapeUpgrade_UnifySameDomain_2(out, true, true, false); u.Build(); const s = u.Shape(); if (hasSolid(oc, s)) out = s; } catch { /* mantém como está */ }
+  return out;
+}
+
 /** Recalcula todos os corpos do documento, feature por feature. Erros não param o resto. */
 export function rebuildDocument(oc: OC, doc: ForjaDocument): RebuildShapes {
   const bodies = new Map<Id, TopoDS_Shape>(); const order: Id[] = []; const errors: FeatureError[] = [];
@@ -358,6 +389,9 @@ export function rebuildDocument(oc: OC, doc: ForjaDocument): RebuildShapes {
         if (f.keep === 'front') { if (!front) throw new Error('nada sobra desse lado'); bodies.set(f.body, front); }
         else if (f.keep === 'back') { if (!back) throw new Error('nada sobra desse lado'); bodies.set(f.body, back); }
         else { if (!front || !back) throw new Error('o plano não corta o corpo'); bodies.set(f.body, front); bodies.set(f.id, back); order.push(f.id); }
+      } else if (f.type === 'replaceFace') {
+        const shape = bodies.get(f.body); if (!shape) throw new Error('o corpo não existe mais');
+        bodies.set(f.body, replaceFace(oc, shape, f.face, f.with));
       } else if (f.type === 'pushpull') {
         let shape = bodies.get(f.body); if (!shape) throw new Error('o corpo não existe mais');
         for (const ref of [f.face, ...(f.faces ?? [])]) shape = pushPull(oc, shape, ref, f.distance);

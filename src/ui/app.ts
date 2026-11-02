@@ -6,7 +6,7 @@ import { SketchRenderer, emptySelection, setSketchTheme, type Selection, dimEndp
 import { icons, type IconName } from './icons';
 import {
   createDocument, serialize, deserialize, getPlane, getSketch, addExtrude, addRevolve, addFillet, addBoolean, addFacePlane, pruneFacePlanes, addPushPull, planeToWorld,
-  addShell, addMirror, addTransform, addSplit, addSweep, addLoft, addImport, addOffsetPlane, type PatternSpec, type FaceRef,
+  addShell, addMirror, addTransform, addSplit, addSweep, addLoft, addImport, addOffsetPlane, addReplaceFace, type PatternSpec, type FaceRef, type ReplaceTarget,
   bodyIds, bodyName, featuresOfBody, planeNormal, isHidden, setHidden, renameBody,
   type ForjaDocument, type Plane, type Feature, type ExtrudeFeature, type RevolveFeature, type ExtrudeOp, type V3, type SketchAxis,
 } from '../core/document';
@@ -102,6 +102,8 @@ export class App {
   private pointers = new Map<number, PointerInfo>();
   private pinch: { d0: number; mid: { x: number; y: number } } | null = null;
   private stroke: Vec2[] = [];
+  /** Substituir face em andamento: face plana escolhida, esperando o toque na face de destino. */
+  private replaceFlow: { body: Id; face: FaceRef } | null = null;
   /** Varredura da ferramenta Aparar em andamento: quantos trechos já sumiram. */
   private trimRun: { count: number } | null = null;
   private dragPoint: Id | null = null;
@@ -614,7 +616,8 @@ export class App {
     if (!s) {
       const n = this.bodies.length; const errs = this.featureErrors.length;
       let txt: string; let cls = 'status';
-      if (this.busy) { txt = 'Calculando…'; }
+      if (this.replaceFlow) { txt = 'Substituir face: toque na face de destino (plana ou cilíndrica)'; cls = 'status warn'; }
+      else if (this.busy) { txt = 'Calculando…'; }
       else if (this.kernel.state === 'loading') { txt = 'Carregando kernel 3D (50 MB, só na primeira vez)…'; cls = 'status warn'; }
       else if (this.kernel.state === 'failed') { txt = 'Kernel 3D indisponível: só prévia'; cls = 'status err'; }
       else if (!this.doc.current.features.length) txt = 'Toque em um plano para esboçar';
@@ -706,7 +709,7 @@ export class App {
     } else if (s3.face && bd) {
       const f = bd.faces[s3.face.index]; const n = 1 + (s3.faces?.length ?? 0); const planar = f?.type === 'plane';
       who = n > 1 ? `${n} faces · ${bodyName(doc, bd.id)}` : `Face ${faceTypeName(f?.type ?? 'other')} · ${bodyName(doc, bd.id)}`;
-      if (planar) { btn('face', 'Esboçar', () => this.createSketchOnFace(bd.id, s3.face!.index), true); btn('extrude', n > 1 ? 'Puxar juntas' : 'Puxar', () => this.pushPullNumeric()); btn('plane', 'Plano', () => this.offsetPlaneFromFace()); }
+      if (planar) { btn('face', 'Esboçar', () => this.createSketchOnFace(bd.id, s3.face!.index), true); btn('extrude', n > 1 ? 'Puxar juntas' : 'Puxar', () => this.pushPullNumeric()); btn('replace', 'Substituir', () => this.startReplaceFace()); btn('plane', 'Plano', () => this.offsetPlaneFromFace()); }
       btn('shell', 'Casca', () => this.shellSelected());
       if (planar) btn('mirror', 'Espelhar', () => this.mirrorSelected());
       btn('body', 'Corpo', () => this.selectBody(bd.id));
@@ -740,6 +743,36 @@ export class App {
       const more = (this.sel3d.faces ?? []).filter((f) => f.body === fs.body && f.index !== fs.index).map((f) => this.faceRefOf(f)).filter((x): x is FaceRef => !!x);
       void this.tryFeature(() => addPushPull(this.doc.current, fs.body, ref, v, more), (f) => { this.selectedFeature = f.id; this.selectBody(fs.body); });
     });
+  }
+
+  /** Substituir face (como no Shapr3D): a face plana selecionada passa a ficar rente à face que você tocar em seguida. */
+  private startReplaceFace(): void {
+    const fs = this.sel3d.face; const ref = this.faceRefOf(fs); if (!fs || !ref) { this.toast('Selecione uma face plana para substituir.'); return; }
+    this.replaceFlow = { body: fs.body, face: ref }; this.renderStatus();
+    this.toast('Agora toque na face de destino: plana ou cilíndrica, deste corpo ou de outro. A face selecionada passa a ficar rente a ela.');
+  }
+  private cancelReplaceFace(): void { this.replaceFlow = null; this.renderStatus(); this.toast('Substituir face cancelado.'); }
+  /** Normal da malha na face (primeiro triângulo): diz se um cilindro é ressalto (normal para fora do eixo) ou furo. */
+  private faceMeshNormal(data: BodyData, index: number): V3 | null {
+    const k = data.triFace.indexOf(index); if (k < 0) return null; const vi = data.indices[k * 3];
+    return [data.normals[vi * 3], data.normals[vi * 3 + 1], data.normals[vi * 3 + 2]];
+  }
+  private finishReplaceFace(body: Id, index: number): void {
+    const flow = this.replaceFlow; if (!flow) return;
+    const data = this.bodyOf(body); const fd = data?.faces[index]; if (!data || !fd) return;
+    if (body === flow.body && fd.type === 'plane' && fd.normal && Math.hypot(fd.center[0] - flow.face.center[0], fd.center[1] - flow.face.center[1], fd.center[2] - flow.face.center[2]) < 1e-6) { this.toast('Essa é a própria face: toque na face de destino.'); return; }
+    let target: ReplaceTarget | null = null;
+    const m = this.vp.bodyMatrixOf(body); const tp = (p: V3): V3 => { const v = new THREE.Vector3(...p).applyMatrix4(m); return [v.x, v.y, v.z]; }; const td = (d: V3): V3 => { const v = new THREE.Vector3(...d).transformDirection(m); return [v.x, v.y, v.z]; };
+    if (fd.type === 'plane' && fd.normal) target = { kind: 'plane', origin: tp(fd.origin ?? fd.center), normal: td(fd.normal) };
+    else if (fd.type === 'cylinder' && fd.axisOrigin && fd.axisDir && fd.radius) {
+      const n = this.faceMeshNormal(data, index); const o = fd.axisOrigin, d = fd.axisDir, c = fd.center;
+      const t = (c[0] - o[0]) * d[0] + (c[1] - o[1]) * d[1] + (c[2] - o[2]) * d[2]; const radial: V3 = [c[0] - o[0] - d[0] * t, c[1] - o[1] - d[1] * t, c[2] - o[2] - d[2] * t];
+      const inside = !n || n[0] * radial[0] + n[1] * radial[1] + n[2] * radial[2] >= 0;
+      target = { kind: 'cylinder', origin: tp(o), dir: td(d), radius: fd.radius, inside };
+    }
+    if (!target) { this.toast('O destino precisa ser uma face plana ou cilíndrica.', 'err'); return; }
+    this.replaceFlow = null; this.renderStatus();
+    void this.tryFeature(() => addReplaceFace(this.doc.current, flow.body, flow.face, target!), (f) => { this.selectedFeature = f.id; this.selectBody(flow.body); this.toast(target!.kind === 'plane' ? 'Face rente ao plano de destino.' : 'Face rente ao cilindro de destino.'); });
   }
 
   /** Botão Mover/Girar: primeiro mostra o gizmo; com o gizmo já na tela, abre os campos para digitar. */
@@ -1042,6 +1075,9 @@ export class App {
       const rr = el('div', 'row'); const rl = document.createElement('label'); rl.textContent = 'Girar (°)'; const ri = document.createElement('input'); ri.type = 'number'; ri.step = '5'; ri.value = String(f.angle); ri.addEventListener('change', () => { const v = parseFloat(ri.value.replace(',', '.')); if (isFinite(v)) edit(() => { f.angle = v; }); }); rr.append(rl, ri); p.append(rr);
       selectRow('Eixo do giro', [['x', 'X'], ['y', 'Y'], ['z', 'Z']], f.axisDir[0] ? 'x' : f.axisDir[1] ? 'y' : 'z', (v) => edit(() => { f.axisDir = v === 'x' ? [1, 0, 0] : v === 'y' ? [0, 1, 0] : [0, 0, 1]; }));
       numRow('Escala (×)', f.scale, (v) => edit(() => { f.scale = v; }));
+      const row = el('div', 'row'); row.append(this.button('Apagar', () => this.deleteFeature(f), 'btn danger')); p.append(row);
+    } else if (f.type === 'replaceFace') {
+      const d = el('div', 'hint'); d.textContent = `Face de ${bodyName(doc, f.body)} (${f.face.area.toFixed(0)} mm²) rente a ${f.with.kind === 'plane' ? 'um plano' : `um cilindro Ø${fmtDim('distance', f.with.radius * 2)}`}. Para mudar o destino, apague e refaça.`; p.append(d);
       const row = el('div', 'row'); row.append(this.button('Apagar', () => this.deleteFeature(f), 'btn danger')); p.append(row);
     } else if (f.type === 'split') {
       selectRow('Manter', [['both', 'Os dois lados'], ['front', 'Lado da normal'], ['back', 'Lado oposto']], f.keep, (v) => edit(() => { f.keep = v as typeof f.keep; }));
@@ -1785,6 +1821,7 @@ export class App {
       if (this.selectedInstance || this.sel3d.body) { this.selectedInstance = null; this.clearSel3d(); }
       return;
     }
+    if (this.replaceFlow) { if (faceHit && faceHit.index >= 0) this.finishReplaceFace(faceHit.body, faceHit.index); else this.cancelReplaceFace(); return; }
     // Duplo toque: numa face seleciona o corpo inteiro (gizmo); no vazio enquadra tudo.
     const now = performance.now(); const dbl = !this.xray && now - this.lastTap.t < 380 && Math.hypot(info.x - this.lastTap.x, info.y - this.lastTap.y) < 28;
     this.lastTap = { t: dbl ? 0 : now, x: info.x, y: info.y };
@@ -3052,7 +3089,7 @@ export class App {
       if (meta && ev.key.toLowerCase() === 'z') { ev.preventDefault(); if (ev.shiftKey) this.redo(); else this.undo(); return; }
       if (meta && ev.key.toLowerCase() === 's') { ev.preventDefault(); this.saveFile(); return; }
       if (this.mode !== 'sketch') {
-        if (ev.key === 'Escape') { this.closeMenus(); this.selectedFeature = null; this.clearSel3d(); }
+        if (ev.key === 'Escape') { if (this.replaceFlow) return this.cancelReplaceFace(); this.closeMenus(); this.selectedFeature = null; this.clearSel3d(); }
         else if ((ev.key === 'Backspace' || ev.key === 'Delete') && this.selectedFeature) { const f = this.doc.current.features.find((x) => x.id === this.selectedFeature); if (f) this.deleteFeature(f); }
         else if (ev.key.toLowerCase() === 'f' && this.sel3d.edges.length) this.filletSelected('fillet');
         else if (ev.key.toLowerCase() === 'h' && this.sel3d.body && !this.isAssembly) this.toggleHidden(this.sel3d.body);
@@ -3091,6 +3128,7 @@ function featureMini(f: Feature): string {
   if (f.type === 'mirror') return f.join ? 'fundido' : 'cópia';
   if (f.type === 'transform') return `${f.angle ? `${fmtDim('angle', f.angle)} ` : ''}${f.scale !== 1 ? `×${fmtDim('distance', f.scale)}` : ''}`.trim() || 'mover';
   if (f.type === 'split') return f.keep === 'both' ? '2 corpos' : 'um lado';
+  if (f.type === 'replaceFace') return f.with.kind === 'plane' ? 'rente a plano' : 'rente a cilindro';
   if (f.type === 'sweep') return f.tube ? `Ø${fmtDim('distance', f.tube.outer)}${f.tube.inner > 0 ? ` parede ${fmtDim('distance', (f.tube.outer - f.tube.inner) / 2)}` : ''}` : 'varredura'; if (f.type === 'loft') return `${f.sketches.length} perfis`; if (f.type === 'import') return 'STEP';
   if (f.type === 'fillet') return `R${fmtDim('distance', f.radius)} · ${f.edges.length}`;
   if (f.type === 'chamfer') return `${fmtDim('distance', f.radius)} mm · ${f.edges.length}`;
