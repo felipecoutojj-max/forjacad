@@ -3,7 +3,7 @@
 // Não importa three.js nem DOM: roda no worker e nos testes em Node.
 
 import type { OpenCascadeInstance, TopoDS_Shape, TopoDS_Face, TopoDS_Edge, TopoDS_Wire, BRepAdaptor_Curve, gp_Trsf, GeomAbs_Shape } from 'opencascade.js';
-import type { ForjaDocument, FilletFeature, EdgeRef, FaceRef, ReplaceTarget, V3, Plane, SketchAxis, PatternSpec, ExtrudeOp } from '../../document';
+import type { ForjaDocument, FilletFeature, EdgeRef, FaceRef, ReplaceTarget, DraftFeature, V3, Plane, SketchAxis, PatternSpec, ExtrudeOp } from '../../document';
 import { getSketch, getPlane, planeNormal, planeToWorld } from '../../document';
 import type { Sketch, Id, SplineEntity, EllipseEntity } from '../../sketch/model';
 import { getPoint, findEntity, sampleEntity } from '../../sketch/model';
@@ -292,6 +292,28 @@ export function pushPull(oc: OC, shape: TopoDS_Shape, ref: FaceRef, distance: nu
   return boolOp(oc, d > 0 ? 'fuse' : 'cut', shape, prism);
 }
 
+/** Ângulo de saída: inclina faces planas em torno do plano neutro, na direção de saída (normal do plano neutro). */
+export function applyDraft(oc: OC, shape: TopoDS_Shape, f: DraftFeature): TopoDS_Shape {
+  const faces = planarFaces(oc, shape); const n = norm3(f.neutral.normal);
+  const d = new oc.BRepOffsetAPI_DraftAngle_2(shape);
+  const pln = new oc.gp_Pln_3(pnt(oc, f.neutral.origin), new oc.gp_Dir_4(n[0], n[1], n[2]));
+  const dir = new oc.gp_Dir_4(n[0], n[1], n[2]);
+  let added = 0;
+  for (const ref of f.faces) {
+    const fi = matchFace(faces, ref); if (!fi) continue;
+    // Faces paralelas ao plano neutro não têm como inclinar.
+    if (Math.abs(fi.normal[0] * n[0] + fi.normal[1] * n[1] + fi.normal[2] * n[2]) > 0.999) continue;
+    d.Add(fi.face, dir, (f.angle * Math.PI) / 180, pln, true);
+    if (!d.AddDone()) { d.Remove(fi.face); continue; }
+    added++;
+  }
+  if (!added) throw new Error('nenhuma dessas faces aceita o ângulo (a geometria mudou ou são paralelas ao plano neutro)');
+  d.Build(new oc.Message_ProgressRange_1());
+  if (!d.IsDone()) throw new Error('não deu para inclinar essas faces');
+  const out = d.Shape(); if (!hasSolid(oc, out)) throw new Error('o ângulo de saída destruiu o corpo');
+  return out;
+}
+
 /** Substituir face: a face plana `ref` passa a ficar rente ao destino. Só a coluna da face muda:
  *  tira o que está além do destino (prisma para dentro) e acrescenta até ele (prisma para fora). */
 export function replaceFace(oc: OC, shape: TopoDS_Shape, ref: FaceRef, target: ReplaceTarget): TopoDS_Shape {
@@ -389,6 +411,9 @@ export function rebuildDocument(oc: OC, doc: ForjaDocument): RebuildShapes {
         if (f.keep === 'front') { if (!front) throw new Error('nada sobra desse lado'); bodies.set(f.body, front); }
         else if (f.keep === 'back') { if (!back) throw new Error('nada sobra desse lado'); bodies.set(f.body, back); }
         else { if (!front || !back) throw new Error('o plano não corta o corpo'); bodies.set(f.body, front); bodies.set(f.id, back); order.push(f.id); }
+      } else if (f.type === 'draft') {
+        const shape = bodies.get(f.body); if (!shape) throw new Error('o corpo não existe mais');
+        bodies.set(f.body, applyDraft(oc, shape, f));
       } else if (f.type === 'replaceFace') {
         const shape = bodies.get(f.body); if (!shape) throw new Error('o corpo não existe mais');
         bodies.set(f.body, replaceFace(oc, shape, f.face, f.with));

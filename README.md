@@ -19,7 +19,7 @@ npm run dev
 
 Abre em `http://localhost:5173`. Para abrir no iPad na mesma rede, use o endereço de rede que o Vite imprime.
 
-## Como usar (v0.17, modelagem direta)
+## Como usar (v0.18, modelagem direta)
 
 - **Caneta na peça.** Risque numa face plana: abre um esboço nela, na própria vista 3D (botão "Vista reta"
   se preferir de frente). Arraste uma região sombreada do esboço: extruda ao vivo; para fora adiciona, para
@@ -65,6 +65,9 @@ Abre em `http://localhost:5173`. Para abrir no iPad na mesma rede, use o endere�
   (plana ou cilíndrica, deste corpo ou de outro). A face passa a ficar rente ao destino: as faces vizinhas
   esticam ou encurtam, só dentro da coluna da face (um degrau some, um topo fica inclinado ou abaulado).
   Esc ou toque no vazio cancela.
+- **Ângulo de saída (draft).** Toque na face plana a inclinar (ou em várias do mesmo corpo), depois em "Inclinar"
+  na barra de ações, depois na face plana que fica fixa (o fundo da matriz, o plano de partição) e digite o
+  ângulo. Positivo afunila no sentido de saída; negativo alarga. O ângulo pode ser mudado no histórico.
 - **Ajustes (engrenagem no topo).** Material e cor da peça (aço, aço temperado, inox, alumínio, latão, bronze,
   cobre, ferro fundido, plástico, borracha, madeira ou uma cor sua), para o corpo selecionado (fica salvo na
   peça) ou para todos; cor e espessura das linhas das arestas (pretas por padrão), arestas visíveis e tema.
@@ -98,7 +101,7 @@ revolução, varredura, loft, filete, chanfro (pelo sentido do arrasto), casca, 
 (e escalar por diálogo), dividir por plano, menu adaptativo à seleção, caixa de seleção com filtros, selecionar através, vários
 corpos de uma vez, itens com visibilidade e nomes, união,
 subtração, interseção, substituir face (rente a plano ou cilindro), plano de construção deslocado, medir, vista em corte,
-importar STEP. Faltam: ângulo de saída (draft), rosca, análise de superfície e materiais visuais.
+importar STEP, ângulo de saída (draft), materiais visuais. Faltam: rosca e análise de superfície.
 
 Montagem: peças embutidas, juntas por faces (rígida, pino, deslizante, cilíndrica), lista de materiais,
 animação pelas juntas, vídeo, interferências. Desenho: vistas com ocultas, cotas, balões, lista, PDF e DXF.

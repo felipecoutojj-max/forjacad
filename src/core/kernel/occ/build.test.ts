@@ -3,7 +3,7 @@ import { describe, it, expect, beforeAll } from 'vitest';
 import initOpenCascade from 'opencascade.js/dist/node.js';
 import type { OpenCascadeInstance } from 'opencascade.js';
 import { rebuildDocument, tessellate, exportSTEP, exportIGES, projectViews, assemblyShapes, interferences, offsetProfile, tubeAlongPath, sketchWire } from './build';
-import { createDocument, addExtrude, addRevolve, addFillet, addBoolean, addPushPull, addShell, addMirror, addTransform, addSplit, addSweep, addLoft, addImport, addFacePlane, addReplaceFace, type ForjaDocument } from '../../document';
+import { createDocument, addExtrude, addRevolve, addFillet, addBoolean, addPushPull, addShell, addMirror, addTransform, addSplit, addSweep, addLoft, addImport, addFacePlane, addReplaceFace, addDraft, type ForjaDocument } from '../../document';
 import * as M from '../../sketch/model';
 
 let oc: OpenCascadeInstance;
@@ -28,6 +28,22 @@ function slotSketch(doc: ForjaDocument, plane: string): M.Sketch {
   M.addLine(s, a.id, b.id); M.addArc(s, c1.id, c.id, b.id, 10); M.addLine(s, c.id, d.id); M.addArc(s, c2.id, a.id, d.id, 10);
   return s;
 }
+
+describe('ângulo de saída', () => {
+  const side = (c: [number, number, number], n: [number, number, number], area: number) => ({ center: c, normal: n, area });
+  it('10° nas quatro laterais com o fundo fixo afunila para cima; negativo alarga', () => {
+    const mk = (angle: number) => {
+      const doc = createDocument(); const s = rectSketch(doc, 'plane-xy', 0, 0, 40, 20); const f = addExtrude(doc, s.id, 10);
+      addDraft(doc, f.id, [side([20, 0, 5], [0, -1, 0], 400), side([20, 20, 5], [0, 1, 0], 400), side([0, 10, 5], [-1, 0, 0], 200), side([40, 10, 5], [1, 0, 0], 200)], { origin: [0, 0, 0], normal: [0, 0, 1] }, angle);
+      const r = rebuildDocument(oc, doc); expect(r.errors).toEqual([]); return tessellate(oc, r.bodies[0], 'd');
+    };
+    const m = mk(10); expect(m.faces).toHaveLength(6); expect(m.volume).toBeLessThan(8000);
+    // Topo: cada lateral entra 10·tan10° ≈ 1,763 mm → topo (40−3,53)×(20−3,53).
+    const k = Math.tan((10 * Math.PI) / 180); // ∫₀¹⁰ (40 − 2kz)(20 − 2kz) dz
+    expect(m.volume).toBeCloseTo(8000 - 6000 * k + (4000 / 3) * k * k, 0);
+    expect(mk(-10).volume).toBeGreaterThan(8000);
+  });
+});
 
 describe('substituir face', () => {
   const top = { center: [20, 10, 10] as [number, number, number], normal: [0, 0, 1] as [number, number, number], area: 800 };

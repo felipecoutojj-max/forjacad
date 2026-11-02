@@ -77,6 +77,9 @@ export interface TransformFeature { id: Id; type: 'transform'; name: string; bod
 export interface SplitFeature { id: Id; type: 'split'; name: string; body: Id; origin: V3; normal: V3; keep: 'both' | 'front' | 'back'; }
 /** Superfície de destino do Substituir face: plano (normal para fora) ou cilindro (`inside`: o material fica dentro dele, como num ressalto). */
 export type ReplaceTarget = { kind: 'plane'; origin: V3; normal: V3 } | { kind: 'cylinder'; origin: V3; dir: V3; radius: number; inside: boolean };
+/** Ângulo de saída: as faces inclinam `angle` graus em torno do plano neutro (que fica fixo), na direção de saída `dir`.
+ *  Positivo afunila no sentido de `dir` (a peça sai da matriz); negativo alarga. */
+export interface DraftFeature { id: Id; type: 'draft'; name: string; body: Id; faces: FaceRef[]; neutral: { origin: V3; normal: V3 }; angle: number; }
 /** Substituir face: a face plana passa a ficar rente à superfície de destino; as faces vizinhas esticam ou encurtam (só dentro da coluna da face). */
 export interface ReplaceFaceFeature { id: Id; type: 'replaceFace'; name: string; body: Id; face: FaceRef; with: ReplaceTarget; }
 /** Varredura: perfil fechado de um esboço ao longo de um caminho (linhas e arcos de um ou mais esboços emendados).
@@ -103,7 +106,7 @@ export interface BooleanFeature {
   body: Id; tool: Id;
 }
 
-export type Feature = ExtrudeFeature | RevolveFeature | PushPullFeature | FilletFeature | BooleanFeature | ShellFeature | MirrorFeature | TransformFeature | SplitFeature | ReplaceFaceFeature | SweepFeature | LoftFeature | ImportFeature;
+export type Feature = ExtrudeFeature | RevolveFeature | PushPullFeature | FilletFeature | BooleanFeature | ShellFeature | MirrorFeature | TransformFeature | SplitFeature | ReplaceFaceFeature | DraftFeature | SweepFeature | LoftFeature | ImportFeature;
 
 export interface ForjaDocument {
   format: 'forja'; version: number; name: string; units: 'mm';
@@ -198,6 +201,9 @@ function fromObject(d: Record<string, unknown> & { [k: string]: any }, depth: nu
       features.push({ id: f.id, type: 'transform', name: str(f.name, 'Mover'), body: f.body, translate: isV3(f.translate) ? f.translate : [0, 0, 0], axisPoint: isV3(f.axisPoint) ? f.axisPoint : [0, 0, 0], axisDir: isV3(f.axisDir) ? f.axisDir : [0, 0, 1], angle: num(f.angle, 0), scale: num(f.scale, 1) || 1 });
     } else if (f.type === 'split' && typeof f.body === 'string' && isV3(f.origin) && isV3(f.normal)) {
       features.push({ id: f.id, type: 'split', name: str(f.name, 'Dividir'), body: f.body, origin: f.origin, normal: f.normal, keep: f.keep === 'front' || f.keep === 'back' ? f.keep : 'both' });
+    } else if (f.type === 'draft' && typeof f.body === 'string') {
+      const faces = (Array.isArray(f.faces) ? f.faces : []).map(faceRef).filter((x): x is FaceRef => !!x); const nt = f.neutral as { origin?: unknown; normal?: unknown } | undefined;
+      if (faces.length && nt && isV3(nt.origin) && isV3(nt.normal)) features.push({ id: f.id, type: 'draft', name: str(f.name, 'Ângulo de saída'), body: f.body, faces, neutral: { origin: nt.origin, normal: nt.normal }, angle: Math.max(-45, Math.min(45, num(f.angle, 3))) || 3 });
     } else if (f.type === 'replaceFace' && typeof f.body === 'string') {
       const face = faceRef(f.face); const w = f.with as Partial<ReplaceTarget & { dir: V3; radius: number; inside: boolean }> | undefined;
       const target: ReplaceTarget | null = !w || !isV3(w.origin) ? null : w.kind === 'plane' && isV3(w.normal) ? { kind: 'plane', origin: w.origin, normal: w.normal } : w.kind === 'cylinder' && isV3(w.dir) && typeof w.radius === 'number' && w.radius > 0 ? { kind: 'cylinder', origin: w.origin, dir: w.dir, radius: w.radius, inside: w.inside !== false } : null;
@@ -365,6 +371,10 @@ export function addImport(doc: ForjaDocument, name: string, step: string): Impor
   const f: ImportFeature = { id: newId('f'), type: 'import', name: name.slice(0, 80) || 'Importado', step }; doc.features.push(f); return f;
 }
 
+export function addDraft(doc: ForjaDocument, body: Id, faces: FaceRef[], neutral: { origin: V3; normal: V3 }, angle: number): DraftFeature {
+  const n = doc.features.filter((f) => f.type === 'draft').length + 1;
+  const f: DraftFeature = { id: newId('f'), type: 'draft', name: `Ângulo de saída ${n}`, body, faces, neutral, angle }; doc.features.push(f); return f;
+}
 export function addReplaceFace(doc: ForjaDocument, body: Id, face: FaceRef, target: ReplaceTarget): ReplaceFaceFeature {
   const n = doc.features.filter((f) => f.type === 'replaceFace').length + 1;
   const f: ReplaceFaceFeature = { id: newId('f'), type: 'replaceFace', name: `Substituir face ${n}`, body, face, with: target }; doc.features.push(f); return f;
