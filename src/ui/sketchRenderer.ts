@@ -37,9 +37,16 @@ export class SketchRenderer {
   /** Anel que mostra onde a caneta vai encaixar. */
   private snap = new THREE.LineLoop(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({ color: C_SEL, depthTest: false }));
   private snapMat = this.snap.material as THREE.LineBasicMaterial;
+  /** Trecho que a ferramenta Aparar vai tirar: linha laranja engrossada por pontos, com marcas nos cortes. */
+  private hint = new THREE.Line(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({ color: C_SEL, depthTest: false }));
+  private hintDots = new THREE.Points(new THREE.BufferGeometry(), new THREE.PointsMaterial({ color: C_SEL, size: 5, sizeAttenuation: false, depthTest: false }));
+  private hintEnds = new THREE.LineSegments(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({ color: C_SEL, depthTest: false }));
   labels: LabelDesc[] = [];
 
-  constructor() { this.group.add(this.lines, this.constr, this.dims, this.points, this.stroke, this.snap); this.group.renderOrder = 10; this.snap.visible = false; this.snap.renderOrder = 12; }
+  constructor() {
+    this.group.add(this.lines, this.constr, this.dims, this.points, this.stroke, this.snap, this.hint, this.hintDots, this.hintEnds); this.group.renderOrder = 10; this.snap.visible = false; this.snap.renderOrder = 12;
+    for (const o of [this.hint, this.hintDots, this.hintEnds]) { o.visible = false; o.renderOrder = 13; }
+  }
 
   /** Pontos 3D de uma entidade (polilinha), em coordenadas do plano. */
   static sample(s: Sketch, e: Entity, segs = 48): Vec2[] { return sampleEntity(s, e, segs).map((p) => v2(p.x, p.y)); }
@@ -123,6 +130,23 @@ export class SketchRenderer {
     }
     this.dims.geometry.setAttribute('position', new THREE.Float32BufferAttribute(dpos, 3)); this.dims.geometry.computeBoundingSphere();
     this.dims.visible = dpos.length > 0;
+  }
+
+  /** Realça o trecho a aparar (polilinha no plano) e marca com um tracinho cada ponto de corte. */
+  setHint(plane: Plane | null, poly: Vec2[] | null, ends: Vec2[], mmPerPx: number): void {
+    const on = !!plane && !!poly && poly.length >= 2;
+    this.hint.visible = this.hintDots.visible = this.hintEnds.visible = on;
+    if (!on || !plane || !poly) return;
+    for (const o of [this.hint, this.hintDots, this.hintEnds]) (o.material as THREE.LineBasicMaterial | THREE.PointsMaterial).color.copy(C_SEL);
+    const pos: number[] = []; for (const p of poly) pos.push(...planeToWorld(plane, p.x, p.y, 0.25));
+    this.hint.geometry.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3)); this.hint.geometry.computeBoundingSphere();
+    // Pontos a cada ~4 px engrossam a linha.
+    const step = mmPerPx * 4; const dpos: number[] = [];
+    for (let i = 1; i < poly.length; i++) { const a = poly[i - 1], b = poly[i]; const n = Math.max(1, Math.ceil(dist(a, b) / step)); for (let k = 0; k <= n; k++) { const q = add(a, scale(sub(b, a), k / n)); dpos.push(...planeToWorld(plane, q.x, q.y, 0.25)); } }
+    this.hintDots.geometry.setAttribute('position', new THREE.Float32BufferAttribute(dpos, 3)); this.hintDots.geometry.computeBoundingSphere();
+    const epos: number[] = []; const L = mmPerPx * 7;
+    for (const q of ends) { const i = poly.findIndex((p) => dist(p, q) < 1e-6); const nb = i <= 0 ? poly[1] : poly[i - 1]; const d = norm(sub(nb, q)); const nrm = perp(d); epos.push(...planeToWorld(plane, q.x - nrm.x * L, q.y - nrm.y * L, 0.3), ...planeToWorld(plane, q.x + nrm.x * L, q.y + nrm.y * L, 0.3)); }
+    this.hintEnds.geometry.setAttribute('position', new THREE.Float32BufferAttribute(epos, 3)); this.hintEnds.geometry.computeBoundingSphere(); this.hintEnds.visible = epos.length > 0;
   }
 
   /** Mostra (ou esconde, com null) o anel de encaixe em (u, v). */

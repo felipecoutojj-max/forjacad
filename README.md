@@ -19,7 +19,7 @@ npm run dev
 
 Abre em `http://localhost:5173`. Para abrir no iPad na mesma rede, use o endereço de rede que o Vite imprime.
 
-## Como usar (v0.13, modelagem direta)
+## Como usar (v0.14, modelagem direta)
 
 - **Caneta na peça.** Risque numa face plana: abre um esboço nela, na própria vista 3D (botão "Vista reta"
   se preferir de frente). Arraste uma região sombreada do esboço: extruda ao vivo; para fora adiciona, para
@@ -53,6 +53,10 @@ Abre em `http://localhost:5173`. Para abrir no iPad na mesma rede, use o endere�
   digitar os dois eixos). "Spline": toque ponto a ponto, a curva passa por todos; toque no primeiro ponto para
   fechar; arraste os pontos depois para ajustar. Na Caneta, um oval à mão livre vira elipse e uma curva ondulada
   sem cantos vira spline. Os dois extrudam, revolucionam e servem de caminho (spline) como qualquer contorno.
+- **Aparar.** Botão "Aparar" (tecla T): o trecho sob a caneta fica laranja com um tracinho em cada corte; toque e
+  ele some até os cruzamentos vizinhos (linha, círculo ou arco; spline e elipse cortam, mas ainda não se aparam).
+  Arraste a caneta por cima de vários trechos para tirar todos de uma vez. Círculo cortado vira arco, linha
+  cortada no meio vira duas, e a ponta nova fica presa na linha que a cortou. Sem cruzamento, some inteiro.
 - **Esboço vivo.** Linhas colam em horizontal, vertical e ângulo reto automaticamente. A caneta encaixa em
   cantos, cruzamentos de linhas (o centro de um X de construção), meios de linha e na origem do plano, com um
   anel mostrando onde vai grudar; linhas de construção são tracejadas e a origem tem uma cruz. Toque numa
@@ -73,7 +77,8 @@ Abre em `http://localhost:5173`. Para abrir no iPad na mesma rede, use o endere�
 
 Esboço: linha, arco, oval e curva livre à mão livre (reconhecimento do traço), linha, retângulo, círculo, elipse,
 spline, polígono, rasgo, cotas, restrições automáticas (horizontal, vertical, ângulo reto, tangente, concêntrico),
-deslocar contorno, espelhar, filete 2D, construção. Faltam ainda: texto, aparar, projetar arestas e padrão no esboço.
+deslocar contorno, espelhar, filete 2D, aparar (toque ou varredura), construção. Faltam ainda: texto, projetar arestas,
+padrão no esboço e aparar spline ou elipse.
 
 Sólidos: extrudar (novo, adicionar, cortar, por região, com padrão linear ou circular), puxar/empurrar face,
 revolução, varredura, loft, filete, chanfro (pelo sentido do arrasto), casca, espelho, mover/girar pelo gizmo

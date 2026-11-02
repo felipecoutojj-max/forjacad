@@ -14,6 +14,7 @@ import * as M from '../core/sketch/model';
 import type { Sketch, Entity, Id, ConstraintKind, DimensionKind } from '../core/sketch/model';
 import { solveSketch, type SolveResult, type SolveOptions } from '../core/sketch/solver';
 import { recognizeStroke, type Primitive } from '../core/sketch/recognizer';
+import { isTrimmable, trimSegmentAt, applyTrim, type TrimSegment, type Trimmable } from '../core/sketch/trim';
 import { buildAllBodies, buildExtrude, extractProfiles, profileInnerPoint, profileContainsPoint, profileToShape, planeMatrix } from '../core/kernel/preview';
 import { KernelClient, SupersededError } from '../core/kernel/occ/client';
 import type { BodyData, FeatureError, RebuildResult } from '../core/kernel/occ/types';
@@ -29,7 +30,7 @@ import type { ProjectedView, AssemblyPayload, InterferenceHit } from '../core/ke
 import { saveLocal, loadLocal, downloadFile, pickFile, safeFileName } from './storage';
 import { type Vec2, v2, dist, distPointSegment, distPointArc, closestOnSegment, sub, add, scale, norm, perp, angleOf, normAngle, TAU, round, intersectSegments, intersectLineCircle, intersectCircles } from '../core/geom';
 
-type Tool = 'select' | 'draw' | 'line' | 'rect' | 'circle' | 'ellipse' | 'spline' | 'polygon' | 'slot' | 'dimension' | 'erase';
+type Tool = 'select' | 'draw' | 'line' | 'rect' | 'circle' | 'ellipse' | 'spline' | 'polygon' | 'slot' | 'dimension' | 'trim' | 'erase';
 interface FormField { key: string; label: string; type: 'number' | 'text' | 'select' | 'check'; value: unknown; options?: [string, string][]; step?: number; }
 
 interface PointerInfo { id: number; type: string; x: number; y: number; startX: number; startY: number; moved: boolean; role: 'tool' | 'nav' | 'pan'; button: number; shift?: boolean; /** Toque longo já consumiu este ponteiro. */ handled?: boolean; }
@@ -100,6 +101,8 @@ export class App {
   private pointers = new Map<number, PointerInfo>();
   private pinch: { d0: number; mid: { x: number; y: number } } | null = null;
   private stroke: Vec2[] = [];
+  /** Varredura da ferramenta Aparar em andamento: quantos trechos já sumiram. */
+  private trimRun: { count: number } | null = null;
   private dragPoint: Id | null = null;
   private toolStart: { uv: Vec2; pid?: Id } | null = null;
   private previewSketchBackup: Sketch | null = null;
@@ -629,7 +632,7 @@ export class App {
     this.toolbar.innerHTML = ''; this.toolbar.append(this.toolbarGrip());
     const g1 = el('div', 'group'); const g2 = el('div', 'group'); const g3 = el('div', 'group');
     if (this.mode === 'sketch') {
-      const tools: [Tool, IconName, string][] = [['select', 'select', 'Selecionar'], ['draw', 'draw', 'Caneta'], ['line', 'line', 'Linha'], ['rect', 'rect', 'Retângulo'], ['circle', 'circle', 'Círculo'], ['ellipse', 'ellipse', 'Elipse'], ['spline', 'spline', 'Spline'], ['polygon', 'polygon', 'Polígono'], ['slot', 'slot', 'Rasgo'], ['dimension', 'dimension', 'Cota'], ['erase', 'erase', 'Apagar']];
+      const tools: [Tool, IconName, string][] = [['select', 'select', 'Selecionar'], ['draw', 'draw', 'Caneta'], ['line', 'line', 'Linha'], ['rect', 'rect', 'Retângulo'], ['circle', 'circle', 'Círculo'], ['ellipse', 'ellipse', 'Elipse'], ['spline', 'spline', 'Spline'], ['polygon', 'polygon', 'Polígono'], ['slot', 'slot', 'Rasgo'], ['dimension', 'dimension', 'Cota'], ['trim', 'trim', 'Aparar'], ['erase', 'erase', 'Apagar']];
       for (const [t, ic, label] of tools) { const b = this.iconButton(ic, label, () => { if (t === 'polygon' && this.tool !== 'polygon') this.valuePopover(this.vp.width / 2, 80, this.polygonSides, 'lados', (v) => { this.polygonSides = Math.max(3, Math.min(24, Math.round(v))); this.setTool('polygon'); }); else this.setTool(t); }); if (this.tool === t) b.classList.add('active'); g1.append(b); }
       const cons = this.iconButton('construction', 'Construção', () => { this.constructionMode = !this.constructionMode; this.renderToolbar(); this.toast(this.constructionMode ? 'Construção ligada: o que você riscar vira linha de referência tracejada (serve para centralizar e encaixar).' : 'Construção desligada.'); }); if (this.constructionMode) cons.classList.add('active'); g1.append(cons);
       const touch = this.iconButton('touch', 'Dedo desenha', () => { this.touchDraws = !this.touchDraws; this.renderToolbar(); }); if (this.touchDraws) touch.classList.add('active'); g2.append(touch);
@@ -895,6 +898,7 @@ export class App {
         : this.tool === 'ellipse' ? 'Arraste do centro: o arrasto dá o eixo maior e a inclinação. Toque na elipse para digitar os dois eixos.'
         : this.tool === 'dimension' ? (this.pendingDimRefs.length ? 'Toque no segundo elemento, ou em área vazia para cotar só este.' : 'Toque numa linha, círculo, arco ou ponto. Para ângulo, toque em duas linhas.')
         : this.tool === 'select' ? 'Toque para selecionar. Arraste pontos para ajustar. Selecione elementos para ver restrições possíveis.'
+        : this.tool === 'trim' ? 'Toque no trecho que quer tirar: ele some até os cruzamentos vizinhos. Arraste a caneta para aparar vários de uma vez.'
         : this.tool === 'erase' ? 'Toque no que quer apagar.' : 'Arraste para desenhar. Pontas próximas se juntam sozinhas.';
       p.append(hint);
       const cons = this.applicableConstraints();
@@ -1166,7 +1170,7 @@ export class App {
     this.activeSketch = null; this.mode = 'view'; this.sel = emptySelection(); this.pendingDimRefs = []; this.lastSolve = null;
     this.vp.exitSketch(); this.refreshAll(); this.vp.fitAll();
   }
-  setTool(t: Tool): void { if (this.splineDraft && t !== 'spline') this.finishSplineDraft(); this.tool = t; this.pendingDimRefs = []; if (t !== 'select') this.sel = emptySelection(); this.refreshAll(false); }
+  setTool(t: Tool): void { if (this.splineDraft && t !== 'spline') this.finishSplineDraft(); if (this.tool === 'trim') this.sk.setHint(null, null, [], 1); this.tool = t; this.pendingDimRefs = []; if (t !== 'select') this.sel = emptySelection(); this.refreshAll(false); }
 
   private solve(opts?: SolveOptions): SolveResult | null {
     const s = this.sketch; if (!s) return null;
@@ -1741,6 +1745,11 @@ export class App {
   private hideChip(): void { if (this.chipTimer) { clearTimeout(this.chipTimer); this.chipTimer = 0; } this.chipEl?.remove(); this.chipEl = null; }
 
   private hover(ev: PointerEvent): void {
+    if (this.mode === 'sketch') {
+      if (this.tool !== 'trim' || !this.sketch || this.trimRun) return;
+      const uv = this.uvOf(this.local(ev)); if (uv) this.trimHint(this.sketch, uv, this.tolMm(ev.pointerType));
+      return;
+    }
     if (this.mode !== 'view' || ev.pointerType === 'touch') return;
     const { x, y } = this.local(ev);
     let h: Hover = null;
@@ -1841,6 +1850,27 @@ export class App {
     this.menu(x + 10, y + 10, items); return true;
   }
 
+  // ---------- Aparar ----------
+  /** Trecho que sumiria ao aparar em `uv` (entidade mais próxima que dá para aparar). */
+  private trimTarget(s: Sketch, uv: Vec2, tol: number): TrimSegment | null {
+    let best: { e: Trimmable; d: number } | null = null;
+    for (const e of s.entities) { if (!isTrimmable(e)) continue; const d = this.entityDistance(uv, e, s); if (d < tol && (!best || d < best.d)) best = { e, d }; }
+    return best ? trimSegmentAt(s, best.e, uv) : null;
+  }
+  /** Realça o trecho sob a caneta, com as marcas de onde vai cortar. */
+  private trimHint(s: Sketch, uv: Vec2, tol: number): void {
+    const seg = this.trimTarget(s, uv, tol);
+    const poly = seg ? (seg.kind === 'all' ? M.sampleEntity(s, seg.entity) : seg.poly) : null;
+    const ends = seg?.kind === 'segment' ? [seg.lo?.q, seg.hi?.q].filter((q): q is Vec2 => !!q) : [];
+    this.sk.setHint(this.plane, poly, ends, this.vp.mmPerPixel()); this.vp.requestRender();
+  }
+  /** Apara o trecho sob a caneta (toque ou passagem da varredura). */
+  private trimUnder(s: Sketch, uv: Vec2, tol: number): void {
+    const seg = this.trimTarget(s, uv, tol); if (!seg) return;
+    applyTrim(s, seg); if (this.trimRun) this.trimRun.count += 1;
+    this.sk.setHint(null, null, [], 1); this.solve(); this.refreshSketch(); this.renderStatus();
+  }
+
   // ---------- Ferramentas de esboço ----------
   private uvOf(info: { x: number; y: number }): Vec2 | null { const p = this.plane; return p ? this.vp.screenToPlane(info.x, info.y, p) : null; }
 
@@ -1866,6 +1896,7 @@ export class App {
         this.pushUndo(); this.previewSketchBackup = M.cloneSketch(s);
         this.toolStart = { uv: this.showSnap(s, uv, tol) }; break;
       }
+      case 'trim': { this.pushUndo(); this.trimRun = { count: 0 }; this.trimHint(s, uv, tol); break; }
       case 'select': {
         const hit = this.hitTest(uv, tol, s);
         if (hit?.kind === 'point') { this.pushUndo(); this.dragPoint = hit.id; this.sel = emptySelection(); this.sel.points.add(hit.id); this.refreshSketch(); this.renderSidePanel(); }
@@ -1902,6 +1933,7 @@ export class App {
         if (this.dragPoint && info.moved) { this.solve({ drag: { point: this.dragPoint, x: uv.x, y: uv.y } }); this.refreshSketch(); this.renderStatus(); }
         break;
       }
+      case 'trim': { const tol = this.tolMm(info.type); if (info.moved && this.trimRun) this.trimUnder(s, uv, tol); else this.trimHint(s, uv, tol); break; }
       default: break;
     }
   }
@@ -1955,6 +1987,13 @@ export class App {
       case 'select': {
         if (this.dragPoint) { if (!info.moved) this.undoStack.pop(); this.dragPoint = null; this.solve(); this.refreshAll(false); return; }
         if (!info.moved) this.tapSelect(uv, tol, s);
+        break;
+      }
+      case 'trim': {
+        if (!cancelled && !info.moved) this.trimUnder(s, uv, tol);
+        const n = this.trimRun?.count ?? 0; this.trimRun = null; this.sk.setHint(null, null, [], 1);
+        if (!n) { this.undoStack.pop(); if (!cancelled) this.toast('Nada para aparar aqui: toque em cima de uma linha, círculo ou arco.'); }
+        this.solve(); this.refreshAll(false);
         break;
       }
       case 'erase': {
@@ -2992,7 +3031,7 @@ export class App {
         else if (!meta && !this.isAssembly && ['b', 'f', 'e', 'a'].includes(ev.key.toLowerCase())) { const k = ev.key.toLowerCase(); this.setFilter(k === 'b' ? 'bodies' : k === 'f' ? 'faces' : k === 'e' ? 'edges' : 'all'); }
         return;
       }
-      const map: Record<string, Tool> = { v: 'select', p: 'draw', l: 'line', r: 'rect', c: 'circle', g: 'polygon', o: 'slot', d: 'dimension', x: 'erase' };
+      const map: Record<string, Tool> = { v: 'select', p: 'draw', l: 'line', r: 'rect', c: 'circle', g: 'polygon', o: 'slot', d: 'dimension', t: 'trim', x: 'erase' };
       const k = ev.key.toLowerCase();
       if (map[k]) this.setTool(map[k]);
       else if (ev.key === 'Escape') { if (this.tool !== 'select') this.setTool('select'); else { this.sel = emptySelection(); this.refreshAll(false); } }
